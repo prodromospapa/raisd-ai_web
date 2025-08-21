@@ -332,42 +332,54 @@ if (form) {
           // continue polling for logs until done, then fetch final HTML from /runs/<run_id>/final
           let retries = 0;
           const maxRetries = 5;
+          let finalPoll = null;
+          let pageReplaced = false;
+          function stopAllPolling() {
+            if (poller) { clearInterval(poller); poller = null; }
+            if (finalPoll) { clearInterval(finalPoll); finalPoll = null; }
+          }
+          function replacePage(html) {
+            if (pageReplaced) return; // guard against multiple rewrites
+            pageReplaced = true;
+            stopAllPolling();
+            // Safer to navigate than to keep old JS intervals alive
+            // Use history.replaceState if same origin and we only change DOM
+            try {
+              document.open();
+              document.write(html);
+              document.close();
+            } catch (e) {
+              // fallback: full navigation
+              try { window.location.reload(); } catch (_) {}
+            }
+          }
           function fetchFinal() {
+            if (pageReplaced) { stopAllPolling(); return; }
             fetch(`/runs/${encodeURIComponent(runId)}/final`)
               .then(r => {
                 if (r.status === 202) {
-                  // not ready yet, wait and retry
-                  return null;
+                  return null; // still running
                 }
                 if (!r.ok) throw new Error('Server returned ' + r.status);
                 return r.text();
               })
               .then(html => {
                 if (html) {
-                  if (poller) { clearInterval(poller); poller = null; }
-                  document.open();
-                  document.write(html);
-                  document.close();
+                  replacePage(html);
                 }
               })
               .catch(err => {
-                // Network errors can happen; retry a few times before failing
+                if (pageReplaced) return;
                 retries += 1;
                 if (retries <= maxRetries) {
                   setTimeout(fetchFinal, 1000 * retries);
                 } else {
-                  if (poller) { clearInterval(poller); poller = null; }
+                  stopAllPolling();
                   alert('Analysis failed: ' + err + '. Check your network or server logs.');
                 }
               });
           }
-
-          // start a second-level poll that tries to fetch the final page every 2s
-          const finalPoll = setInterval(() => fetchFinal(), 2000);
-
-          // also ensure we stop the finalPoll when poller indicates done via /runs/<run_id>/tail
-          const origPoller = poller;
-          // fetchFinal will clear poller and replace the page when ready
+          finalPoll = setInterval(fetchFinal, 2000);
         })
         .catch(err => {
           if (poller) { clearInterval(poller); poller = null; }

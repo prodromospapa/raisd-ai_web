@@ -12,7 +12,7 @@
       </li>
       <li><span>Demographic model</span><strong>{{ match.demographic_model }}</strong></li>
       <li><span>Population</span><strong>{{ match.population }}</strong></li>
-      <li><span>JSD</span><strong>{{ '%.6f'|format(match.best_jsd) }}</strong></li>
+  <li><span>JSD</span><strong>{% if match.best_jsd is not none %}{{ '%.6f'|format(match.best_jsd) }}{% else %}n/a{% endif %}</strong></li>
     </ul>
   </div>
 
@@ -26,7 +26,13 @@
       <label for="plot-select">Show metric:</label>
       <select id="plot-select">
         {% for p in plots %}
-          <option value="{{ p.url }}">{{ p.metric }}</option>
+          {# Clean up metric label if it looks like a filename like 'plot_mu_var_png' or 'sweep_TR_plot.png' #}
+          {% set label = p.metric or '' %}
+          {% if label.endswith('.png') %}
+            {% set label = label.rsplit('/', 1)[-1] %}
+          {% endif %}
+          {% set label = label.replace('plot_', '').replace('_', ' ').replace('.png', '') %}
+          <option value="{{ p.url }}">{{ label }}</option>
         {% endfor %}
       </select>
       <div style="margin-top:8px;">
@@ -38,9 +44,11 @@
   </div>
 
   <p><a class="back" href="{{ url_for('index') }}">← Run another</a></p>
+  <span id="run-meta" data-run-id='{{ run_id|tojson }}' hidden></span>
 {% endblock %}
 
 {% block scripts %}
+ 
 <script>
 // Plot selector handling: switch the displayed image when the user selects
 // a different metric. Use a cache-busting query param to avoid stale images.
@@ -63,7 +71,11 @@
 // navigates away from the results page. Uses navigator.sendBeacon when
 // available (works even during unload); falls back to fetch with keepalive.
 (() => {
-  const runId = {{ run_id|tojson }};
+  const metaEl = document.getElementById('run-meta');
+  let runId = null;
+  if (metaEl) {
+    try { runId = JSON.parse(metaEl.dataset.runId); } catch (_) { runId = metaEl.dataset.runId || null; }
+  }
   if (!runId) return;
   const url = `/runs/${encodeURIComponent(runId)}/cleanup`;
 
