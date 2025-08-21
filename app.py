@@ -13,6 +13,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # headless servers
 import json
+import time
+import threading
 import matplotlib.pyplot as plt
 import pysam
 
@@ -35,10 +37,77 @@ MAX_CONTENT   = 2 * 1024 * 1024 * 1024  # 2 GB
 PLOTS_FILE    = "sweep_TR_plot.png"
 RAISD_REPORT  = "RAiSD_Report.results"
 RAISD_GRIDDIR = "RAiSD_Grid.results"
+# How long (seconds) to keep an unfinished run after the client last ping.
+# If the client leaves the page (stops polling / heartbeat), the background
+# cleaner will remove the run directory after this timeout. Default: 5 minutes.
+RUN_DIR_TIMEOUT_SECONDS = int(os.environ.get('RUN_DIR_TIMEOUT_SECONDS', '300'))
 
 app = Flask(__name__)
 app.config.update(MAX_CONTENT_LENGTH=MAX_CONTENT, SECRET_KEY=os.urandom(16))
 os.makedirs(RUNS_DIR, exist_ok=True)
+
+# In-memory map of run_id -> last_seen (epoch seconds). This is used by the
+# background cleaner to determine which run directories can be deleted when the
+# client abandons the page. We store timestamps here as a best-effort signal.
+# Note: on restart this map is empty; the cleanup thread will still remove
+# stale directories based on mtime if needed.
+_run_last_seen = {}
+
+
+def touch_run(run_id: str) -> None:
+    """Record that a client is still interested in the given run_id."""
+    _run_last_seen[run_id] = int(time.time())
+
+
+def _cleanup_worker():
+    """Background thread that removes run directories not seen recently.
+
+    It iterates RUNS_DIR every minute and removes any run directory whose
+    last-seen timestamp is older than RUN_DIR_TIMEOUT_SECONDS. If a run_id is
+    not present in the in-memory map, the directory's mtimes are used as a
+    fallback to estimate last activity.
+    """
+    while True:
+        try:
+            now = int(time.time())
+            for name in os.listdir(RUNS_DIR):
+                run_dir = os.path.join(RUNS_DIR, name)
+                if not os.path.isdir(run_dir):
+                    continue
+                last_seen = _run_last_seen.get(name)
+                if last_seen is None:
+                    # fallback: use latest mtime inside the directory
+                    try:
+                        mt = max(os.path.getmtime(os.path.join(run_dir, p))
+                                 for p in os.listdir(run_dir))
+                        last_seen = int(mt)
+                    except Exception:
+                        # if we can't stat contents, use dir mtime
+                        last_seen = int(os.path.getmtime(run_dir))
+
+                # If the run finished (RAiSD report present) don't clean up
+                # here; removal is left to the client or explicit cleanup.
+                if os.path.exists(os.path.join(run_dir, RAISD_REPORT)):
+                    continue
+
+                if (now - last_seen) > RUN_DIR_TIMEOUT_SECONDS:
+                    try:
+                        shutil.rmtree(run_dir)
+                        _run_last_seen.pop(name, None)
+                        app.logger.info(f"Cleaned stale run dir: {run_dir}")
+                    except Exception as e:
+                        app.logger.warning(f"Failed to remove stale run dir {run_dir}: {e}")
+        except Exception as e:
+            app.logger.exception(f"Run dir cleanup thread error: {e}")
+        time.sleep(60)
+
+
+# Start cleanup thread as a daemon so it doesn't block process exit.
+try:
+    t = threading.Thread(target=_cleanup_worker, daemon=True)
+    t.start()
+except Exception:
+    app.logger.warning("Failed to start run-dir cleanup thread")
 
 # Tools are expected inside the **conda env** PATH
 BCFTOOLS = shutil.which("bcftools") or "bcftools"
@@ -407,6 +476,7 @@ def analyze():
         filename = uploaded_filename
         vcf_path = os.path.join(run_dir, filename)
         append_log(run_dir, f"Using staged upload: {filename}")
+        touch_run(run_id)
     else:
         # create a new run dir and save the uploaded file
         run_id = uuid.uuid4().hex[:12]
@@ -417,116 +487,123 @@ def analyze():
         if file and getattr(file, 'filename', ''):
             file.save(vcf_path)
             append_log(run_dir, f"Uploaded file saved: {filename} ({os.path.getsize(vcf_path)} bytes)")
+            # record run seen right after creation
+            touch_run(run_id)
         else:
             # This shouldn't normally happen because earlier checks ensured a file is present
             flash("No file available for analysis.")
             return redirect(url_for('index'))
 
+    # Start the long-running analysis in a background thread and return
+    # immediately. This avoids HTTP timeouts (reverse proxies or browsers)
+    # when processing large uploads which can take many minutes.
+    def _analyze_worker(run_dir, filename, vcf_path, species, chromosome, grid):
+        meta = {
+            'run_id': os.path.basename(run_dir),
+            'species': species,
+            'chromosome': chromosome,
+            'grid': grid,
+            'uploaded_name': filename,
+            'uploaded_url': None,
+            'plot_url': None,
+            'report_url': None,
+            'match': None,
+            'error': None,
+        }
+        try:
+            if shutil.which(BCFTOOLS) is None and BCFTOOLS == "bcftools":
+                raise EnvironmentError("bcftools not found in PATH (activate your conda env)")
+            ra_exe = choose_raisd_exe(vcf_path)
+            append_log(run_dir, f"Selected RAiSD executable: {ra_exe}")
+            if not _exe_available(ra_exe):
+                exe_name = os.path.basename(ra_exe)
+                if exe_name.endswith("RAiSD-AI-ZLIB"):
+                    raise EnvironmentError("RAiSD-AI-ZLIB not found; build it and add to PATH or set RAISD_AI_ZLIB env var")
+                else:
+                    raise EnvironmentError("RAiSD-AI not found; build it and add to PATH or set RAISD_AI env var")
+
+            # Auto-index for BCF/VCF.GZ
+            try:
+                append_log(run_dir, "Checking/creating index for uploaded file if needed...")
+                idx_path = ensure_hts_index(vcf_path)
+                if idx_path:
+                    append_log(run_dir, f"Index present at: {idx_path}")
+                else:
+                    append_log(run_dir, "No index required for this file type.")
+            except Exception as ie:
+                if _needs_index(vcf_path)[0]:
+                    raise
+                append_log(run_dir, f"Indexing skipped (plain VCF) or warning: {ie}")
+
+            match = compute_best_match(species, vcf_path)
+            meta['match'] = match
+            append_log(run_dir, (
+                f"Best match -> model: {match['demographic_model']}, population: {match['population']}, "
+                f"JSD: {match['best_jsd']:.6f}, target chromosomes: {match['target']}, "
+                f"ploidy: {match['ploidy']}, mixed_ploidy: {match['mixed_ploidy']}"
+            ))
+            model_path = os.path.join(
+                DATA_DIR, species, match['demographic_model'], match['population'], str(chromosome), 'RAiSD_Model.model'
+            )
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Model file missing: {model_path}")
+
+            report_path = run_raisd(run_dir, model_path, vcf_path, chromosome, grid=grid, ra_exe=ra_exe)
+            df = read_raisd_report(report_path)
+            plot_path = os.path.join(run_dir, PLOTS_FILE)
+            plot_sweep_tr(df, plot_path)
+            append_log(run_dir, f"Generated plot: {PLOTS_FILE} and parsed report: {RAISD_REPORT}")
+
+            grid_dir = os.path.join(run_dir, RAISD_GRIDDIR)
+            if os.path.isdir(grid_dir):
+                shutil.rmtree(grid_dir, ignore_errors=True)
+                append_log(run_dir, f"Cleaned grid directory: {RAISD_GRIDDIR}")
+
+            # Build URLs that the result page will use
+            meta['plot_url'] = url_for('runs_file', run_id=meta['run_id'], filename=PLOTS_FILE)
+            meta['report_url'] = url_for('runs_file', run_id=meta['run_id'], filename=RAISD_REPORT)
+
+            # Remove some large temporary files to save space
+            try:
+                input_path = os.path.join(run_dir, filename)
+                for p in [input_path, input_path + '.csi', input_path + '.tbi']:
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
+                for p in ['raisd_stdout.log', 'raisd_stderr.log', 'RAiSD_Info.results']:
+                    try:
+                        fp = os.path.join(run_dir, p)
+                        if os.path.exists(fp):
+                            os.remove(fp)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        except Exception as e:
+            append_log(run_dir, f"Error: {e}")
+            meta['error'] = str(e)
+        finally:
+            # persist meta so the final-render endpoint can read it
+            try:
+                with open(os.path.join(run_dir, 'result_meta.json'), 'w', encoding='utf-8') as mf:
+                    mf.write(json.dumps(meta))
+            except Exception:
+                pass
+
+    # start background thread
     try:
-        if shutil.which(BCFTOOLS) is None and BCFTOOLS == "bcftools":
-            raise EnvironmentError("bcftools not found in PATH (activate your conda env)")
-        ra_exe = choose_raisd_exe(vcf_path)
-        append_log(run_dir, f"Selected RAiSD executable: {ra_exe}")
-        if not _exe_available(ra_exe):
-            exe_name = os.path.basename(ra_exe)
-            if exe_name.endswith("RAiSD-AI-ZLIB"):
-                raise EnvironmentError("RAiSD-AI-ZLIB not found; build it and add to PATH or set RAISD_AI_ZLIB env var")
-            else:
-                raise EnvironmentError("RAiSD-AI not found; build it and add to PATH or set RAISD_AI env var")
-
-        # Auto-index for BCF/VCF.GZ to ensure downstream tools can fetch efficiently
-        try:
-            append_log(run_dir, "Checking/creating index for uploaded file if needed...")
-            idx_path = ensure_hts_index(vcf_path)
-            if idx_path:
-                append_log(run_dir, f"Index present at: {idx_path}")
-            else:
-                append_log(run_dir, "No index required for this file type.")
-        except Exception as ie:
-            # Non-fatal for plain .vcf; re-raise only if it should have been indexed
-            if _needs_index(vcf_path)[0]:
-                raise
-            append_log(run_dir, f"Indexing skipped (plain VCF) or warning: {ie}")
-
-        match = compute_best_match(species, vcf_path)
-        append_log(run_dir, (
-            f"Best match -> model: {match['demographic_model']}, population: {match['population']}, "
-            f"JSD: {match['best_jsd']:.6f}, target chromosomes: {match['target']}, "
-            f"ploidy: {match['ploidy']}, mixed_ploidy: {match['mixed_ploidy']}"
-        ))
-        model_path = os.path.join(
-            DATA_DIR, species, match['demographic_model'], match['population'], str(chromosome), 'RAiSD_Model.model'
-        )
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file missing: {model_path}")
-
-        report_path = run_raisd(run_dir, model_path, vcf_path, chromosome, grid=grid, ra_exe=ra_exe)
-        df = read_raisd_report(report_path)
-        plot_path = os.path.join(run_dir, PLOTS_FILE)
-        plot_sweep_tr(df, plot_path)
-        append_log(run_dir, f"Generated plot: {PLOTS_FILE} and parsed report: {RAISD_REPORT}")
-
-        grid_dir = os.path.join(run_dir, RAISD_GRIDDIR)
-        if os.path.isdir(grid_dir):
-            shutil.rmtree(grid_dir, ignore_errors=True)
-            append_log(run_dir, f"Cleaned grid directory: {RAISD_GRIDDIR}")
-
-        # Remove run.log after successful analysis to avoid leaving logs around
-        log_path = os.path.join(run_dir, 'run.log')
-        try:
-            if os.path.exists(log_path):
-                os.remove(log_path)
-        except Exception:
-            # non-fatal: ignore failures to delete the log
-            pass
-
-        # Clean up temporary files that are no longer needed to save space.
-        # Assumption: keep RAiSD outputs (report + plot) but remove the large
-        # uploaded input file, any generated index files, and RAiSD temporary
-        # logs/info produced during the run. If you want to keep the uploaded
-        # input for download, remove this block.
-        try:
-            # uploaded input (vcf/bcf) and common index suffixes
-            input_path = os.path.join(run_dir, filename)
-            for p in [input_path, input_path + '.csi', input_path + '.tbi']:
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
-
-            # RAiSD temporary logs/info
-            for p in ['raisd_stdout.log', 'raisd_stderr.log', 'RAiSD_Info.results']:
-                try:
-                    fp = os.path.join(run_dir, p)
-                    if os.path.exists(fp):
-                        os.remove(fp)
-                except Exception:
-                    pass
-        except Exception:
-            # non-fatal: don't let cleanup failures break the successful result
-            pass
-
-        # We removed the uploaded input file above, so don't provide a download
-        # link for it in the result page to avoid broken links.
-        return render_template(
-            'result.html',
-            run_id=run_id,
-            species=species,
-            chromosome=chromosome,
-            grid=grid,
-            match=match,
-            plot_url=url_for('runs_file', run_id=run_id, filename=PLOTS_FILE),
-            report_url=url_for('runs_file', run_id=run_id, filename=RAISD_REPORT),
-            log_url=None,
-            uploaded_name=filename,
-            uploaded_url=None,
-        )
+        t = threading.Thread(target=_analyze_worker, args=(run_dir, filename, vcf_path, species, chromosome, grid), daemon=True)
+        t.start()
     except Exception as e:
-        append_log(run_dir, f"Error: {e}")
-        flash(str(e))
-        # Keep run directory to preserve logs
+        append_log(run_dir, f"Failed to start analysis thread: {e}")
+        flash("Failed to start analysis")
         return redirect(url_for('index'))
+
+    # Return JSON immediately with the run_id; the client will poll /runs/<run_id>/tail
+    return json.dumps({'run_id': run_id}), 200, {'Content-Type': 'application/json'}
 
 
 @app.route('/runs/<run_id>/<path:filename>')
@@ -543,6 +620,9 @@ def runs_tail(run_id):
     run_dir = os.path.join(RUNS_DIR, run_id)
     if not os.path.isdir(run_dir):
         return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
+
+    # mark as seen (client is polling the tail endpoint)
+    touch_run(run_id)
 
     # Prefer RAiSD_Info.results if present (it contains detailed pipeline output), otherwise run.log
     info_path = os.path.join(run_dir, 'RAiSD_Info.results')
@@ -583,9 +663,76 @@ def runs_cleanup(run_id):
         return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
     try:
         shutil.rmtree(run_dir)
+        _run_last_seen.pop(run_id, None)
         return json.dumps({'status': 'removed'}), 200, {'Content-Type': 'application/json'}
     except Exception as e:
         return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
+
+@app.route('/runs/<run_id>/final')
+def runs_final(run_id):
+    """Return the final rendered result page when analysis completes.
+
+    If the analysis is still running, return 202 Accepted with a short
+    JSON payload so the client can retry. When ready, render `result.html`.
+    """
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    if not os.path.isdir(run_dir):
+        return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
+
+    # Prefer result_meta.json written by the background worker
+    meta_path = os.path.join(run_dir, 'result_meta.json')
+    report_path = os.path.join(run_dir, RAISD_REPORT)
+
+    # mark as seen
+    touch_run(run_id)
+
+    meta = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as mf:
+                meta = json.load(mf)
+        except Exception:
+            meta = {}
+
+    # If report exists (analysis completed successfully) or meta has error/result, render final page
+    if os.path.exists(report_path) or meta.get('report_url') or meta.get('error'):
+        # If result_meta.json didn't include match/urls, try to synthesize
+        match = meta.get('match') or {}
+        uploaded_name = meta.get('uploaded_name') or ''
+        plot_url = meta.get('plot_url') or url_for('runs_file', run_id=run_id, filename=PLOTS_FILE)
+        report_url = meta.get('report_url') or url_for('runs_file', run_id=run_id, filename=RAISD_REPORT)
+        return render_template(
+            'result.html',
+            run_id=run_id,
+            species=meta.get('species', ''),
+            chromosome=meta.get('chromosome', ''),
+            grid=meta.get('grid', ''),
+            match=match or {},
+            plot_url=plot_url,
+            report_url=report_url,
+            log_url=None,
+            uploaded_name=uploaded_name,
+            uploaded_url=None,
+        )
+
+    # Still running
+    return json.dumps({'status': 'running'}), 202, {'Content-Type': 'application/json'}
+
+
+
+@app.route('/runs/<run_id>/heartbeat', methods=['POST'])
+def runs_heartbeat(run_id):
+    """Client should POST to this endpoint periodically while the results
+    page is open. That keeps the temporary run directory alive. If the
+    client leaves the page, the background cleaner will remove the run
+    after RUN_DIR_TIMEOUT_SECONDS.
+    """
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    if not os.path.isdir(run_dir):
+        return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
+    touch_run(run_id)
+    return json.dumps({'status': 'ok'}), 200, {'Content-Type': 'application/json'}
 
 
 @app.route('/healthz')
@@ -625,6 +772,8 @@ def upload():
     vcf_path = os.path.join(run_dir, fname)
     file.save(vcf_path)
     append_log(run_dir, f"Staged upload saved: {fname} ({os.path.getsize(vcf_path)} bytes)")
+    # record that the run was just created / seen
+    touch_run(run_id)
     return json.dumps({'run_id': run_id, 'filename': fname}), 200, {'Content-Type': 'application/json'}
 
 

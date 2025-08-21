@@ -316,22 +316,61 @@ if (form) {
       // start polling using the staged run id
       if (stagedRunId) startPolling(stagedRunId);
 
+      // POST to /analyze which now starts the background job and returns JSON
       fetch(form.action, { method: 'POST', body: fd })
-        .then(r => r.text())
-        .then(html => {
-          if (poller) {
-            clearInterval(poller);
-            poller = null;
+        .then(r => {
+          if (!r.ok) throw new Error('Server returned ' + r.status);
+          return r.json();
+        })
+        .then(data => {
+          if (!data || !data.run_id) throw new Error('Invalid response from server');
+          const runId = data.run_id;
+
+          // ensure polling is running
+          if (stagedRunId) stagedRunId = runId; else stagedRunId = runId;
+
+          // continue polling for logs until done, then fetch final HTML from /runs/<run_id>/final
+          let retries = 0;
+          const maxRetries = 5;
+          function fetchFinal() {
+            fetch(`/runs/${encodeURIComponent(runId)}/final`)
+              .then(r => {
+                if (r.status === 202) {
+                  // not ready yet, wait and retry
+                  return null;
+                }
+                if (!r.ok) throw new Error('Server returned ' + r.status);
+                return r.text();
+              })
+              .then(html => {
+                if (html) {
+                  if (poller) { clearInterval(poller); poller = null; }
+                  document.open();
+                  document.write(html);
+                  document.close();
+                }
+              })
+              .catch(err => {
+                // Network errors can happen; retry a few times before failing
+                retries += 1;
+                if (retries <= maxRetries) {
+                  setTimeout(fetchFinal, 1000 * retries);
+                } else {
+                  if (poller) { clearInterval(poller); poller = null; }
+                  alert('Analysis failed: ' + err + '. Check your network or server logs.');
+                }
+              });
           }
-          document.open();
-          document.write(html);
-          document.close();
+
+          // start a second-level poll that tries to fetch the final page every 2s
+          const finalPoll = setInterval(() => fetchFinal(), 2000);
+
+          // also ensure we stop the finalPoll when poller indicates done via /runs/<run_id>/tail
+          const origPoller = poller;
+          // fetchFinal will clear poller and replace the page when ready
         })
         .catch(err => {
-          if (poller) {
-            clearInterval(poller);
-            poller = null;
-          }
+          if (poller) { clearInterval(poller); poller = null; }
           alert('Analysis failed: ' + err);
         });
       return;
