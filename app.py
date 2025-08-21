@@ -778,4 +778,14 @@ def upload():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # When running via `python app.py` we enable threaded mode and read
+    # configuration from environment variables so the development entry
+    # point is less likely to drop long-running background work.
+    # For production use, prefer running under gunicorn/uwsgi with
+    # an appropriate timeout and worker configuration (see README).
+    host = os.environ.get('HOST', '0.0.0.0')
+    port = int(os.environ.get('PORT', '5000'))
+    debug = bool(os.environ.get('FLASK_DEBUG', '0') == '1')
+    threaded = bool(os.environ.get('FLASK_THREADED', '1') == '1')
+    # disable reloader to avoid accidental duplicate background threads
+    app.run(host=host, port=port, debug=debug, threaded=threaded, use_reloader=False)
