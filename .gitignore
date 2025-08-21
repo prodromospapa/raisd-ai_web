@@ -1,4 +1,8 @@
-/data
-/generate_pop_test.py
-/junk
-/runs
+*
+!static
+!template
+!app.py
+!install_dependencies.sh
+!raisd-ai.yml
+!sfs.py
+!train_models.py
