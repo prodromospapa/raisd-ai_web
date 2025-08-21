@@ -22,7 +22,19 @@
       <p>Uploaded file: <a href="{{ uploaded_url }}" target="_blank" rel="noopener">{{ uploaded_name }}</a></p>
     {% endif %}
     <p><a href="{{ report_url }}" download>Download RAiSD_Report.results</a></p>
-    <img class="plot" src="{{ plot_url }}" alt="μ_var^{sweep_TR} plot" />
+    {% if plots and plots|length > 0 %}
+      <label for="plot-select">Show metric:</label>
+      <select id="plot-select">
+        {% for p in plots %}
+          <option value="{{ p.url }}">{{ p.metric }}</option>
+        {% endfor %}
+      </select>
+      <div style="margin-top:8px;">
+        <img id="metric-plot" class="plot" src="{{ plots[0].url }}" alt="metric plot" />
+      </div>
+    {% else %}
+      <img class="plot" src="{{ plot_url }}" alt="μ_var^{sweep_TR} plot" />
+    {% endif %}
   </div>
 
   <p><a class="back" href="{{ url_for('index') }}">← Run another</a></p>
@@ -30,6 +42,23 @@
 
 {% block scripts %}
 <script>
+// Plot selector handling: switch the displayed image when the user selects
+// a different metric. Use a cache-busting query param to avoid stale images.
+(() => {
+  const sel = document.getElementById('plot-select');
+  const img = document.getElementById('metric-plot');
+  if (!sel || !img) return;
+  sel.addEventListener('change', (e) => {
+    try {
+      const url = e.target.value;
+      // add timestamp to avoid cached copies when same filename is regenerated
+      const sep = url.indexOf('?') === -1 ? '?' : '&';
+      img.src = url + sep + 'ts=' + Date.now();
+    } catch (err) {
+      // ignore
+    }
+  });
+})();
 // Ensure we attempt to remove the temporary run directory when the user
 // navigates away from the results page. Uses navigator.sendBeacon when
 // available (works even during unload); falls back to fetch with keepalive.

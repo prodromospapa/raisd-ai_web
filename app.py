@@ -15,11 +15,13 @@ matplotlib.use("Agg")  # headless servers
 import json
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import matplotlib.pyplot as plt
 import pysam
 
 from collections import Counter
 from math import lgamma
+from types import SimpleNamespace
 
 
 from flask import (
@@ -108,6 +110,14 @@ try:
     t.start()
 except Exception:
     app.logger.warning("Failed to start run-dir cleanup thread")
+
+# Executor for running analysis jobs concurrently. Default is number of CPUs
+# or 2 if unavailable. Can be overridden with MAX_CONCURRENT_ANALYSES env var.
+MAX_CONCURRENT = int(os.environ.get('MAX_CONCURRENT_ANALYSES', str(max(1, (os.cpu_count() or 2)))))
+_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
+# Map run_id -> Future so we can track running jobs (best-effort)
+_run_futures = {}
+_futures_lock = threading.Lock()
 
 # Tools are expected inside the **conda env** PATH
 BCFTOOLS = shutil.which("bcftools") or "bcftools"
@@ -341,6 +351,33 @@ def plot_sweep_tr(df: pd.DataFrame, out_png: str):
     plt.savefig(out_png, dpi=150)
     plt.close()
 
+
+def _sanitize_metric_name(m: str) -> str:
+    # make a filesystem- and url-safe short name for a metric header
+    # remove non-alphanumeric and collapse spaces/brace characters
+    import re
+    s = re.sub(r'[^0-9A-Za-z]+', '_', m)
+    s = re.sub(r'_+', '_', s).strip('_')
+    return s or 'metric'
+
+
+def plot_metric(df: pd.DataFrame, metric: str, out_png: str):
+    # Generic plotter for a single metric series in the RAiSD report
+    plt.figure(figsize=(10, 6))
+    if metric not in df.columns:
+        # nothing to plot
+        plt.text(0.5, 0.5, f'No data for {metric}', horizontalalignment='center', verticalalignment='center')
+    else:
+        plt.plot(df.index, df[metric], label=metric)
+        plt.xlabel('Position')
+        plt.ylabel(metric)
+        plt.title(metric)
+        plt.legend()
+        plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
 # ------------------------------ Pipeline ------------------------------
 
 def compute_best_match(species: str, vcf_path: str):
@@ -550,9 +587,30 @@ def analyze():
 
             report_path = run_raisd(run_dir, model_path, vcf_path, chromosome, grid=grid, ra_exe=ra_exe)
             df = read_raisd_report(report_path)
-            plot_path = os.path.join(run_dir, PLOTS_FILE)
-            plot_sweep_tr(df, plot_path)
-            append_log(run_dir, f"Generated plot: {PLOTS_FILE} and parsed report: {RAISD_REPORT}")
+            # Generate one plot per metric in HEADER and record their paths
+            plots = []
+            for h in HEADER:
+                short = _sanitize_metric_name(h)
+                fname = f"plot_{short}.png"
+                plot_path = os.path.join(run_dir, fname)
+                try:
+                    # prefer the specific metric plotter
+                    plot_metric(df, h, plot_path)
+                except Exception:
+                    try:
+                        plot_sweep_tr(df, plot_path)
+                    except Exception:
+                        # if plotting fails, create a placeholder PNG
+                        try:
+                            plt.figure(figsize=(6, 3))
+                            plt.text(0.5, 0.5, 'Plot failed', horizontalalignment='center', verticalalignment='center')
+                            plt.tight_layout()
+                            plt.savefig(plot_path, dpi=100)
+                            plt.close()
+                        except Exception:
+                            pass
+                plots.append({'metric': h, 'filename': fname})
+            append_log(run_dir, f"Generated plots and parsed report: {RAISD_REPORT}")
 
             grid_dir = os.path.join(run_dir, RAISD_GRIDDIR)
             if os.path.isdir(grid_dir):
@@ -560,8 +618,28 @@ def analyze():
                 append_log(run_dir, f"Cleaned grid directory: {RAISD_GRIDDIR}")
 
             # Build URLs that the result page will use
-            meta['plot_url'] = url_for('runs_file', run_id=meta['run_id'], filename=PLOTS_FILE)
-            meta['report_url'] = url_for('runs_file', run_id=meta['run_id'], filename=RAISD_REPORT)
+            # url_for needs an application context when called from a
+            # background thread; push one here so URL generation doesn't
+            # fail when multiple analyses run concurrently.
+            try:
+                with app.app_context():
+                    meta['plot_url'] = url_for('runs_file', run_id=meta['run_id'], filename=PLOTS_FILE)
+                    meta['report_url'] = url_for('runs_file', run_id=meta['run_id'], filename=RAISD_REPORT)
+                    # build per-metric plot URLs
+                    meta['plots'] = []
+                    try:
+                        for p in plots:
+                            fname = p.get('filename')
+                            if not fname:
+                                continue
+                            meta['plots'].append({'metric': p.get('metric'), 'url': url_for('runs_file', run_id=meta['run_id'], filename=fname)})
+                    except Exception:
+                        # if URL building fails here, final endpoint will synthesize
+                        pass
+            except Exception:
+                # fallback to None; final endpoint can synthesize URLs later
+                meta['plot_url'] = None
+                meta['report_url'] = None
 
             # Remove some large temporary files to save space
             try:
@@ -593,17 +671,24 @@ def analyze():
             except Exception:
                 pass
 
-    # start background thread
+    # submit the analysis to the shared executor so multiple analyses can
+    # run concurrently without spawning unbounded threads.
     try:
-        t = threading.Thread(target=_analyze_worker, args=(run_dir, filename, vcf_path, species, chromosome, grid), daemon=True)
-        t.start()
+        fut = _executor.submit(_analyze_worker, run_dir, filename, vcf_path, species, chromosome, grid)
+        with _futures_lock:
+            _run_futures[run_id] = fut
     except Exception as e:
-        append_log(run_dir, f"Failed to start analysis thread: {e}")
-        flash("Failed to start analysis")
-        return redirect(url_for('index'))
+        append_log(run_dir, f"Failed to submit analysis job: {e}")
+        app.logger.exception("Failed to submit analysis job")
+        # Prefer returning JSON so client-side JS gets a structured error.
+        return json.dumps({'error': f'Failed to start analysis: {e}'}), 500, {'Content-Type': 'application/json'}
 
     # Return JSON immediately with the run_id; the client will poll /runs/<run_id>/tail
-    return json.dumps({'run_id': run_id}), 200, {'Content-Type': 'application/json'}
+    try:
+        return json.dumps({'run_id': run_id}), 200, {'Content-Type': 'application/json'}
+    except Exception as e:
+        app.logger.exception("Failed to return analyze response")
+        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
 
 
 @app.route('/runs/<run_id>/<path:filename>')
@@ -699,22 +784,38 @@ def runs_final(run_id):
     if os.path.exists(report_path) or meta.get('report_url') or meta.get('error'):
         # If result_meta.json didn't include match/urls, try to synthesize
         match = meta.get('match') or {}
+        # Templates expect attribute access (match.best_jsd) — convert dict to
+        # a SimpleNamespace so dot-notation works when meta['match'] is a dict.
+        if isinstance(match, dict):
+            try:
+                match = SimpleNamespace(**match)
+            except Exception:
+                # Fallback: leave as dict if conversion fails
+                pass
         uploaded_name = meta.get('uploaded_name') or ''
         plot_url = meta.get('plot_url') or url_for('runs_file', run_id=run_id, filename=PLOTS_FILE)
         report_url = meta.get('report_url') or url_for('runs_file', run_id=run_id, filename=RAISD_REPORT)
-        return render_template(
-            'result.html',
-            run_id=run_id,
-            species=meta.get('species', ''),
-            chromosome=meta.get('chromosome', ''),
-            grid=meta.get('grid', ''),
-            match=match or {},
-            plot_url=plot_url,
-            report_url=report_url,
-            log_url=None,
-            uploaded_name=uploaded_name,
-            uploaded_url=None,
-        )
+        try:
+            return render_template(
+                'result.html',
+                run_id=run_id,
+                species=meta.get('species', ''),
+                chromosome=meta.get('chromosome', ''),
+                grid=meta.get('grid', ''),
+                match=match or {},
+                plot_url=plot_url,
+                report_url=report_url,
+                plots=meta.get('plots', []),
+                log_url=None,
+                uploaded_name=uploaded_name,
+                uploaded_url=None,
+            )
+        except Exception as e:
+            # Log and return a structured JSON error so client-side JS can
+            # report the problem instead of getting an HTML 500 that is
+            # harder to surface to the user.
+            app.logger.exception(f"Failed to render final result for run {run_id}: {e}")
+            return json.dumps({'error': f'Failed to render result: {e}'}), 500, {'Content-Type': 'application/json'}
 
     # Still running
     return json.dumps({'status': 'running'}), 202, {'Content-Type': 'application/json'}
