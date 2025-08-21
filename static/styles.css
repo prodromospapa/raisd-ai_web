@@ -1,0 +1,33 @@
+:root { --fg:#111; --bg:#fafafa; --muted:#6b7280; --accent:#2563eb; --warn:#b45309; }
+*{ box-sizing:border-box; }
+body{ font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial; margin:0; color:var(--fg); background:var(--bg); }
+header{ padding:16px 20px; border-bottom:1px solid #e5e7eb; }
+h1{ margin:0; font-size:22px; }
+main{ max-width:900px; margin:24px auto; padding:0 16px; }
+footer{ max-width:900px; margin:24px auto; padding:0 16px; color:var(--muted); font-size:14px; }
+.card{ background:#fff; border:1px solid #e5e7eb; border-radius:14px; padding:18px; margin-bottom:16px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+.grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+label span{ display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
+input[type=number], select{ width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:14px; }
+button{ background:var(--accent); color:white; border:none; padding:10px 14px; border-radius:10px; font-weight:600; cursor:pointer; }
+button:hover{ filter:brightness(0.95); }
+.dropzone{ margin-top:12px; position:relative; border:2px dashed #cbd5e1; border-radius:14px; padding:24px; text-align:center; background:#f8fafc; }
+.dropzone.drag{ background:#eef2ff; border-color:#a5b4fc; }
+.dropzone p{ margin:6px 0; }
+.dropzone .muted{ color:var(--muted); font-size:13px; }
+.dropzone input[type=file]{ position:absolute; inset:0; opacity:0; cursor:pointer; }
+.flash{ margin-bottom:16px; }
+.flash-item{ background:#fee2e2; color:#7f1d1d; border:1px solid #fecaca; padding:10px; border-radius:10px; }
+.kv{ list-style:none; padding:0; margin:0; display:grid; grid-template-columns:1fr 2fr; gap:8px 12px; }
+.kv li{ display:contents; }
+.kv span{ color:var(--muted); }
+.kv strong{ font-weight:600; }
+.warn{ color:var(--warn); margin-left:.5em; }
+.plot{ width:100%; height:auto; border:1px solid #e5e7eb; border-radius:12px; }
+.back{ text-decoration:none; }
+
+/* Upload progress */
+.upload-status{ margin-top:12px; }
+.upload-status .label{ font-size:14px; margin:6px 0; }
+.progress{ background:#e5e7eb; border-radius:10px; height:10px; overflow:hidden; }
+.progress-bar{ background:var(--accent); height:100%; width:0; transition:width .1s ease; }

@@ -1,0 +1,65 @@
+{% extends 'base.html' %}
+{% block content %}
+  <div class="card">
+    <h2>Best match</h2>
+    <ul class="kv">
+  <li><span>Species</span><strong>{{ species | replace('_', ' ') }}</strong></li>
+      <li><span>Chromosome</span><strong>{{ chromosome }}</strong></li>
+  <li><span>Grid</span><strong>{{ grid }}</strong></li>
+      <li><span>Target copies</span><strong>{{ match.target }}</strong></li>
+      <li><span>Ploidy</span><strong>{{ match.ploidy }}</strong>
+        {% if match.mixed_ploidy %}<em class="warn">(mixed: {{ match.ploidy_counts }})</em>{% endif %}
+      </li>
+      <li><span>Demographic model</span><strong>{{ match.demographic_model }}</strong></li>
+      <li><span>Population</span><strong>{{ match.population }}</strong></li>
+      <li><span>JSD</span><strong>{{ '%.6f'|format(match.best_jsd) }}</strong></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>RAiSD Report</h2>
+    {% if uploaded_url %}
+      <p>Uploaded file: <a href="{{ uploaded_url }}" target="_blank" rel="noopener">{{ uploaded_name }}</a></p>
+    {% endif %}
+    <p><a href="{{ report_url }}" download>Download RAiSD_Report.results</a></p>
+    <img class="plot" src="{{ plot_url }}" alt="μ_var^{sweep_TR} plot" />
+  </div>
+
+  <p><a class="back" href="{{ url_for('index') }}">← Run another</a></p>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Ensure we attempt to remove the temporary run directory when the user
+// navigates away from the results page. Uses navigator.sendBeacon when
+// available (works even during unload); falls back to fetch with keepalive.
+(() => {
+  const runId = {{ run_id|tojson }};
+  if (!runId) return;
+  const url = `/runs/${encodeURIComponent(runId)}/cleanup`;
+
+  function sendCleanup() {
+    try {
+      const payload = new Blob(['{}'], { type: 'application/json' });
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url, payload);
+        return;
+      }
+    } catch (e) {
+      // ignore and fall through to fetch
+    }
+    try {
+      fetch(url, { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: '{}' })
+        .catch(() => { /* ignore network errors during unload */ });
+    } catch (e) {
+      // last resort: synchronous XHR (deprecated) — avoid unless absolutely necessary
+    }
+  }
+
+  // use pagehide which is more reliable for unload semantics across browsers
+  window.addEventListener('pagehide', sendCleanup, { capture: false, passive: true });
+  // as a backup, also listen for unload
+  window.addEventListener('unload', sendCleanup, { capture: false, passive: true });
+})();
+</script>
+{% endblock %}
