@@ -515,6 +515,7 @@ def analyze():
             'uploaded_url': None,
             'report_url': None,
             'match': None,
+            'model_path': None,
             'error': None,
             'plots_ready': False,
             'plots': [],
@@ -552,6 +553,7 @@ def analyze():
             )
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Model file missing: {model_path}")
+            meta['model_path'] = model_path
 
             report_path = run_raisd(run_dir, model_path, vcf_path, chromosome, grid=grid, ra_exe=ra_exe)
             df = read_raisd_report(report_path)
@@ -738,13 +740,29 @@ def runs_final(run_id):
         if found:
             report_path = found
 
-    meta = {}
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, 'r', encoding='utf-8') as mf:
-                meta = json.load(mf)
-        except Exception:
-            meta = {}
+    def _load_meta(path: str, attempts: int = 3, delay: float = 0.05):
+        m = {}
+        for i in range(attempts):
+            if not os.path.exists(path):
+                break
+            try:
+                with open(path, 'r', encoding='utf-8') as mf:
+                    txt = mf.read().strip()
+                if not txt:
+                    raise ValueError('empty meta file')
+                m = json.loads(txt)
+                # basic sanity: species + grid keys expected
+                if 'species' in m and 'grid' in m:
+                    return m
+            except Exception as e:
+                if i == attempts - 1:
+                    append_log(run_dir, f"Meta load failed (final attempt): {e}")
+                time.sleep(delay)
+        return m
+
+    meta = _load_meta(meta_path)
+    if not meta:
+        append_log(run_dir, 'Meta data missing or unreadable; proceeding with defaults')
 
     raw_match = meta.get('match') or {}
 
@@ -820,6 +838,17 @@ def runs_final(run_id):
     if meta.get('error') and not os.path.exists(report_path):
         return json.dumps({'error': meta.get('error')}), 500, {'Content-Type': 'application/json'}
 
+    # Build ordered summary fields to guarantee visibility in template
+    summary_fields = [
+        ('Species', (meta.get('species') or '').replace('_', ' ') or 'n/a'),
+        ('Chromosome', meta.get('chromosome') if meta.get('chromosome') not in (None, '') else 'n/a'),
+        ('Grid', meta.get('grid') if meta.get('grid') not in (None, '') else 'n/a'),
+        ('Target copies', match.get('target') if match.get('target') not in (None, '') else 'n/a'),
+        ('Demographic model', match.get('demographic_model') or 'n/a'),
+        ('Population', match.get('population') or 'n/a'),
+        ('JSD', (f"{match.get('best_jsd'):.6f}" if isinstance(match.get('best_jsd'), (int,float)) else 'n/a')),
+    ]
+
     try:
         return render_template(
             'result.html',
@@ -828,12 +857,14 @@ def runs_final(run_id):
             chromosome=meta.get('chromosome', ''),
             grid=meta.get('grid', ''),
             match=match or {},
+            model_path=meta.get('model_path'),
             plot_url=plot_url,   # main plot is the first in `plots`
             report_url=meta.get('report_url') or url_for('runs_file', run_id=run_id, filename=RAISD_REPORT),
             plots=plots,
             log_url=None,
             uploaded_name=meta.get('uploaded_name') or '',
             uploaded_url=None,
+            summary_fields=summary_fields,
         )
     except Exception as e:
         app.logger.exception(f"Failed to render final result for run {run_id}: {e}")

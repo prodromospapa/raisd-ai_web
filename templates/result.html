@@ -3,16 +3,21 @@
   <div class="card">
     <h2>Best match</h2>
     <ul class="kv">
-  <li><span>Species</span><strong>{{ species | replace('_', ' ') }}</strong></li>
-      <li><span>Chromosome</span><strong>{{ chromosome }}</strong></li>
-  <li><span>Grid</span><strong>{{ grid }}</strong></li>
-      <li><span>Target copies</span><strong>{{ match.target }}</strong></li>
-      <li><span>Ploidy</span><strong>{{ match.ploidy }}</strong>
-        {% if match.mixed_ploidy %}<em class="warn">(mixed: {{ match.ploidy_counts }})</em>{% endif %}
-      </li>
-      <li><span>Demographic model</span><strong>{{ match.demographic_model }}</strong></li>
-      <li><span>Population</span><strong>{{ match.population }}</strong></li>
-  <li><span>JSD</span><strong>{% if match.best_jsd is not none %}{{ '%.6f'|format(match.best_jsd) }}{% else %}n/a{% endif %}</strong></li>
+      {% if summary_fields %}
+        {% for label, value in summary_fields %}
+          <li><span>{{ label }}</span><strong>{{ value }}</strong></li>
+        {% endfor %}
+      {% else %}
+        <li><span>Species</span><strong>{{ species|default('n/a')|replace('_', ' ') }}</strong></li>
+        <li><span>Chromosome</span><strong>{{ chromosome|default('n/a') }}</strong></li>
+        <li><span>Grid</span><strong>{{ grid|default('n/a') }}</strong></li>
+        <li><span>Target copies</span><strong>{{ match.target|default('n/a') }}</strong></li>
+        <li><span>Ploidy</span><strong>{{ match.ploidy|default('n/a') }}</strong>{% if match.mixed_ploidy %}<em class="warn"> (mixed)</em>{% endif %}</li>
+        <li><span>Demographic model</span><strong>{{ match.demographic_model|default('n/a') }}</strong></li>
+        <li><span>Population</span><strong>{{ match.population|default('n/a') }}</strong></li>
+        <li><span>JSD</span><strong>{% if match.best_jsd is not none %}{{ '%.6f'|format(match.best_jsd) }}{% else %}n/a{% endif %}</strong></li>
+      {% endif %}
+  {# Ploidy and model file intentionally removed per user request #}
     </ul>
   </div>
 
