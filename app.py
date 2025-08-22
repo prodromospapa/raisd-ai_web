@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from io import StringIO
 from typing import Optional, Tuple
+from functools import lru_cache
 from datetime import datetime
 import glob
 import gzip
@@ -225,6 +226,47 @@ def sfs_from_bcftools(vcf_path, samples, bcftools=BCFTOOLS):
     if p.returncode != 0:
         raise RuntimeError("bcftools pipeline failed; check bcftools and plugins path")
     return sfs
+
+# ---------------------- Gene annotation helpers ----------------------
+ANNOTATION_DIR_TMPL = os.path.join(DATA_DIR, "{species}", "annotation", "{chr}.tsv")
+
+@lru_cache(maxsize=64)
+def _load_annotation(species: str, chromosome: str) -> pd.DataFrame:
+    path = ANNOTATION_DIR_TMPL.format(species=species, chr=str(chromosome))
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Annotation file not found: {path}")
+    df = pd.read_csv(path, sep="\t", dtype={"chromosome": str})
+
+    def _first_non_null(s):
+        for v in s:
+            if pd.notna(v):
+                return v
+        return np.nan
+
+    gene_level = (
+        df.sort_values(["gene_id", "start"]).
+          groupby(["chromosome", "gene_id"], as_index=False).
+          agg(start=("start", "min"),
+               end=("end", "max"),
+               gene_name=("gene_name", _first_non_null),
+               strand=("strand", _first_non_null),
+               biotype=("biotype", _first_non_null))
+    )
+    gene_level["label"] = gene_level["gene_name"].fillna(gene_level["gene_id"]).astype(str)
+    gene_level["start"] = gene_level["start"].astype(int)
+    gene_level["end"]   = gene_level["end"].astype(int)
+    return gene_level
+
+def _genes_in_window(species: str, chromosome: str, start: int, end: int, biotype: Optional[str] = None) -> pd.DataFrame:
+    lo, hi = (int(start), int(end)) if start <= end else (int(end), int(start))
+    genes = _load_annotation(species, str(chromosome))
+    genes_chr = genes[genes["chromosome"].astype(str) == str(chromosome)].copy()
+    hits = genes_chr[(genes_chr["start"] <= hi) & (genes_chr["end"] >= lo)].copy()
+    if biotype:
+        hits = hits[hits["biotype"].astype(str).str.lower() == str(biotype).lower()]
+    hits["overlap_bp"] = (np.minimum(hits["end"], hi) - np.maximum(hits["start"], lo) + 1).clip(lower=0)
+    hits = hits.sort_values(["start", "end", "label"]).reset_index(drop=True)
+    return hits[["label", "start", "end", "strand", "biotype", "overlap_bp"]]
 
 # ------------------ projection helpers ------------------
 def _pre_lgamma(N):
@@ -895,6 +937,46 @@ def get_chromosomes():
     except Exception as e:
         return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
     return json.dumps({'species': species, 'chromosomes': chromosomes}), 200, {'Content-Type': 'application/json'}
+
+
+@app.route('/genes', methods=['GET'])
+def genes_endpoint():
+    """
+    GET /genes?species=HomSap&chromosome=15&start=42000000&end=43000000[&biotype=protein_coding]
+    """
+    species = (request.args.get('species') or '').strip()
+    chromosome = (request.args.get('chromosome') or '').strip()
+    start = request.args.get('start')
+    end   = request.args.get('end')
+    biotype = (request.args.get('biotype') or '').strip() or None
+
+    if not species or not chromosome or start is None or end is None:
+        return json.dumps({'error': 'species, chromosome, start, end are required'}), 400, {'Content-Type': 'application/json'}
+
+    try:
+        start_i = int(float(start))
+        end_i   = int(float(end))
+    except Exception:
+        return json.dumps({'error': 'start and end must be numbers'}), 400, {'Content-Type': 'application/json'}
+
+    try:
+        hits = _genes_in_window(species, chromosome, start_i, end_i, biotype=biotype)
+    except FileNotFoundError as e:
+        return json.dumps({'error': str(e)}), 404, {'Content-Type': 'application/json'}
+    except Exception as e:
+        app.logger.exception("genes_endpoint error")
+        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
+    payload = {
+        'species': species,
+        'chromosome': chromosome,
+        'start': min(start_i, end_i),
+        'end': max(start_i, end_i),
+        'biotype': biotype,
+        'count': int(hits.shape[0]),
+        'genes': hits.to_dict(orient='records'),
+    }
+    return json.dumps(payload), 200, {'Content-Type': 'application/json'}
 
 @app.route('/upload', methods=['POST'])
 def upload():

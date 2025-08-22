@@ -41,7 +41,26 @@
         {% endfor %}
       </select>
       <div style="margin-top:8px;">
-        <img id="metric-plot" class="plot" src="{{ plots[0].url }}" alt="metric plot" />
+        <div id="plotWrap" style="position:relative; display:inline-block;">
+          <img id="plotImg" class="plot" src="{{ plots[0].url }}" alt="metric plot" data-xmin="{{ (plots[0].xmin if plots[0].xmin is defined) | default('') }}" data-xmax="{{ (plots[0].xmax if plots[0].xmax is defined) | default('') }}" style="max-width:100%; display:block;">
+          <div id="selector"
+               style="position:absolute; top:0; left:0; height:100%; width:0;
+                      background:rgba(0,0,0,0.15); border:1px solid rgba(0,0,0,0.35); display:none;"></div>
+        </div>
+
+        <div style="margin-top:1rem;">
+          <label>Biotype (optional):</label>
+          <input id="biotype" placeholder="e.g. protein_coding">
+          <button id="clearSel">Clear selection</button>
+        </div>
+
+        <h3>Genes in selected window</h3>
+        <table id="genesTbl" border="1" cellpadding="4" cellspacing="0">
+          <thead><tr>
+            <th>Label</th><th>Start</th><th>End</th><th>Strand</th><th>Biotype</th><th>Overlap (bp)</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
     {% else %}
       <img class="plot" src="{{ plot_url }}" alt="μ_var^{sweep_TR} plot" />
@@ -59,14 +78,18 @@
 // a different metric. Use a cache-busting query param to avoid stale images.
 (() => {
   const sel = document.getElementById('plot-select');
-  const img = document.getElementById('metric-plot');
+  const img = document.getElementById('plotImg');
   if (!sel || !img) return;
   sel.addEventListener('change', (e) => {
     try {
       const url = e.target.value;
-      // add timestamp to avoid cached copies when same filename is regenerated
       const sep = url.indexOf('?') === -1 ? '?' : '&';
       img.src = url + sep + 'ts=' + Date.now();
+      // clear any selector overlay and genes table when switching plots
+      const selector = document.getElementById('selector');
+      if (selector) { selector.style.display = 'none'; selector.style.width = '0px'; }
+      const tbody = document.querySelector('#genesTbl tbody');
+      if (tbody) tbody.innerHTML = '';
     } catch (err) {
       // ignore
     }
@@ -106,6 +129,83 @@
   window.addEventListener('pagehide', sendCleanup, { capture: false, passive: true });
   // as a backup, also listen for unload
   window.addEventListener('unload', sendCleanup, { capture: false, passive: true });
+})();
+</script>
+
+<script>
+(function(){
+  const img   = document.getElementById('plotImg');
+  const wrap  = document.getElementById('plotWrap');
+  const sel   = document.getElementById('selector');
+  const tbody = document.querySelector('#genesTbl tbody');
+  const btnClear = document.getElementById('clearSel');
+  const biotypeInput = document.getElementById('biotype');
+
+  // infer x-min/x-max from data attributes on the img if present
+  const xMin = parseFloat(img.getAttribute('data-xmin')) || 37500000;
+  const xMax = parseFloat(img.getAttribute('data-xmax')) || 57500000;
+
+  let dragging = false, x0 = 0, x1 = 0;
+
+  function imgRect(){ return img.getBoundingClientRect(); }
+  function pxToGenome(px){
+    const r = imgRect();
+    const frac = (px - r.left) / r.width;
+    return xMin + frac * (xMax - xMin);
+  }
+
+  function showGenes(g0, g1){
+    const species    = "{{ species }}";
+    const chromosome = "{{ chromosome }}";
+    const bio = biotypeInput.value.trim();
+    const url = `/genes?species=${encodeURIComponent(species)}&chromosome=${encodeURIComponent(chromosome)}&start=${Math.floor(g0)}&end=${Math.floor(g1)}${bio ? `&biotype=${encodeURIComponent(bio)}` : ''}`;
+    fetch(url).then(r => r.json()).then(data => {
+      tbody.innerHTML = '';
+      (data.genes || []).forEach(row => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${row.label}</td><td>${row.start}</td><td>${row.end}</td><td>${row.strand ?? ''}</td><td>${row.biotype ?? ''}</td><td>${row.overlap_bp}</td>`;
+        tbody.appendChild(tr);
+      });
+    }).catch(err => {
+      console.error(err);
+      tbody.innerHTML = '<tr><td colspan="6">Error fetching genes</td></tr>';
+    });
+  }
+
+  img.addEventListener('mousedown', (e) => {
+    dragging = true;
+    x0 = e.clientX;
+    sel.style.display = 'block';
+    const r = imgRect();
+    sel.style.left = (x0 - r.left) + 'px';
+    sel.style.width = '0px';
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if(!dragging) return;
+    x1 = e.clientX;
+    const r = imgRect();
+    const left = Math.min(x0, x1) - r.left;
+    const width = Math.abs(x1 - x0);
+    sel.style.left = Math.max(0, left) + 'px';
+    sel.style.width = Math.min(width, r.width) + 'px';
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if(!dragging) return;
+    dragging = false;
+    const g0 = pxToGenome(Math.min(x0, x1));
+    const g1 = pxToGenome(Math.max(x0, x1));
+    if (Math.abs(g1 - g0) > 1) {
+      showGenes(g0, g1);
+    }
+  });
+
+  btnClear.addEventListener('click', () => {
+    sel.style.display = 'none';
+    sel.style.width = '0px';
+    tbody.innerHTML = '';
+  });
 })();
 </script>
 {% endblock %}
