@@ -82,16 +82,29 @@
   if (!sel || !img) return;
   sel.addEventListener('change', (e) => {
     try {
-      const url = e.target.value;
+      let url = e.target.value || '';
+      // make absolute if needed
+      if (url.startsWith('/')) {
+        url = window.location.origin + url;
+      }
+      // add timestamp to avoid cached copies
       const sep = url.indexOf('?') === -1 ? '?' : '&';
-      img.src = url + sep + 'ts=' + Date.now();
-      // clear any selector overlay and genes table when switching plots
-      const selector = document.getElementById('selector');
-      if (selector) { selector.style.display = 'none'; selector.style.width = '0px'; }
-      const tbody = document.querySelector('#genesTbl tbody');
-      if (tbody) tbody.innerHTML = '';
+      const full = url + sep + 'ts=' + Date.now();
+      // for debugging: show chosen url in console
+      console.debug('Switching plot to:', full);
+      // when the image loads, hide selector overlay and clear table
+      img.onload = function() {
+        const selector = document.getElementById('selector');
+        if (selector) { selector.style.display = 'none'; selector.style.width = '0px'; }
+        const tbody = document.querySelector('#genesTbl tbody');
+        if (tbody) tbody.innerHTML = '';
+      };
+      img.onerror = function() {
+        console.warn('Failed to load plot image:', full);
+      };
+      img.src = full;
     } catch (err) {
-      // ignore
+      console.error('plot-select change handler error', err);
     }
   });
 })();
