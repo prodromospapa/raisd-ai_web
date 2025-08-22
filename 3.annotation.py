@@ -14,7 +14,7 @@ except Exception:
         return iterable
 
 # Hard-code your inputs here
-species = "AraTha"
+species = "HomSap"
 
 
 HOSTS = [
@@ -82,6 +82,7 @@ if __name__=="__main__":
     def fetch_and_write(chrom_id: str):
         try:
             df = fetch(species_name, chrom_id)
+            df = df.drop(columns=["strand"])
             out = Path(annot_dir) / f"{chrom_id}.tsv"
             df.to_csv(out, sep="\t", index=False)
             return chrom_id, None

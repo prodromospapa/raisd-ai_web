@@ -37,12 +37,18 @@
             {% set label = label.rsplit('/', 1)[-1] %}
           {% endif %}
           {% set label = label.replace('plot_', '').replace('_', ' ').replace('.png', '') %}
-          <option value="{{ p.url }}">{{ label }}</option>
+          {# Use dynamic plot endpoint that reads RAiSD_Report.results so zooming comes from the report data #}
+          <option value="{{ url_for('runs_plot_dynamic', run_id=run_id) }}?metric={{ p.metric|urlencode }}" data-metric="{{ p.metric|e }}">{{ label }}</option>
         {% endfor %}
+      </select>
+      <label for="mode-select" style="margin-left:1rem;">Mode:</label>
+      <select id="mode-select">
+        <option value="window">Window (show genes)</option>
+        <option value="zoom">Zoom (and show genes)</option>
       </select>
       <div style="margin-top:8px;">
         <div id="plotWrap" style="position:relative; display:inline-block;">
-          <img id="plotImg" class="plot" src="{{ plots[0].url }}" alt="metric plot" data-xmin="{{ (plots[0].xmin if plots[0].xmin is defined) | default('') }}" data-xmax="{{ (plots[0].xmax if plots[0].xmax is defined) | default('') }}" style="max-width:100%; display:block;">
+          <img id="plotImg" class="plot" src="{{ url_for('runs_plot_dynamic', run_id=run_id) }}?metric={{ plots[0].metric|urlencode }}" alt="metric plot" data-xmin="{{ (plots[0].xmin if plots[0].xmin is defined) | default('') }}" data-xmax="{{ (plots[0].xmax if plots[0].xmax is defined) | default('') }}" data-metric="{{ plots[0].metric|e }}" style="max-width:100%; display:block;">
           <div id="selector"
                style="position:absolute; top:0; left:0; height:100%; width:0;
                       background:rgba(0,0,0,0.15); border:1px solid rgba(0,0,0,0.35); display:none;"></div>
@@ -52,6 +58,7 @@
           <label>Biotype (optional):</label>
           <input id="biotype" placeholder="e.g. protein_coding">
           <button id="clearSel">Clear selection</button>
+          <span style="margin-left:1rem;">Zoom: xmin <input id="zoom-xmin" style="width:110px;" placeholder="start"> xmax <input id="zoom-xmax" style="width:110px;" placeholder="end"> <button id="zoomBtn">Zoom</button> <button id="resetZoom">Reset</button></span>
         </div>
 
         <h3>Genes in selected window</h3>
@@ -98,6 +105,11 @@
         if (selector) { selector.style.display = 'none'; selector.style.width = '0px'; }
         const tbody = document.querySelector('#genesTbl tbody');
         if (tbody) tbody.innerHTML = '';
+        // update metric attribute from selected option
+        try {
+          const opt = sel.options[sel.selectedIndex];
+          if (opt && opt.dataset && opt.dataset.metric) img.setAttribute('data-metric', opt.dataset.metric);
+        } catch (e) { /* ignore */ }
       };
       img.onerror = function() {
         console.warn('Failed to load plot image:', full);
@@ -172,16 +184,18 @@
     const chromosome = "{{ chromosome }}";
     const bio = biotypeInput.value.trim();
     const url = `/genes?species=${encodeURIComponent(species)}&chromosome=${encodeURIComponent(chromosome)}&start=${Math.floor(g0)}&end=${Math.floor(g1)}${bio ? `&biotype=${encodeURIComponent(bio)}` : ''}`;
-    fetch(url).then(r => r.json()).then(data => {
+    return fetch(url).then(r => r.json()).then(data => {
       tbody.innerHTML = '';
       (data.genes || []).forEach(row => {
         const tr = document.createElement('tr');
         tr.innerHTML = `<td>${row.label}</td><td>${row.start}</td><td>${row.end}</td><td>${row.strand ?? ''}</td><td>${row.biotype ?? ''}</td><td>${row.overlap_bp}</td>`;
         tbody.appendChild(tr);
       });
+      return data;
     }).catch(err => {
       console.error(err);
       tbody.innerHTML = '<tr><td colspan="6">Error fetching genes</td></tr>';
+      return null;
     });
   }
 
@@ -209,15 +223,65 @@
     dragging = false;
     const g0 = pxToGenome(Math.min(x0, x1));
     const g1 = pxToGenome(Math.max(x0, x1));
-    if (Math.abs(g1 - g0) > 1) {
+    if (Math.abs(g1 - g0) <= 1) return;
+
+    const modeSel = document.getElementById('mode-select');
+    const mode = modeSel ? modeSel.value : 'window';
+
+    if (mode === 'window') {
       showGenes(g0, g1);
+      return;
     }
+
+    // Zoom mode: request dynamic zoomed plot and also fetch genes
+    const metric = img.getAttribute('data-metric') || '';
+    let url = `/runs/${encodeURIComponent('{{ run_id }}')}/plot?metric=${encodeURIComponent(metric)}&xmin=${Math.floor(g0)}&xmax=${Math.floor(g1)}`;
+    if (url.startsWith('/')) url = window.location.origin + url;
+    const sep = url.indexOf('?') === -1 ? '?' : '&';
+    img.onload = function(){
+      // after zoomed image loads, fetch genes for the same window
+      showGenes(g0, g1);
+      const selector = document.getElementById('selector');
+      if (selector) { selector.style.display = 'none'; selector.style.width = '0px'; }
+    };
+    img.onerror = function(){ console.warn('Failed to load zoomed image:', url); };
+    img.src = url + sep + 'ts=' + Date.now();
   });
 
   btnClear.addEventListener('click', () => {
     sel.style.display = 'none';
     sel.style.width = '0px';
     tbody.innerHTML = '';
+  });
+
+  // Zoom controls
+  const zoomBtn = document.getElementById('zoomBtn');
+  const resetZoom = document.getElementById('resetZoom');
+  const zxmin = document.getElementById('zoom-xmin');
+  const zxmax = document.getElementById('zoom-xmax');
+
+  function applyZoom(xmin, xmax){
+    const metric = img.getAttribute('data-metric') || '';
+    let url = `/runs/${encodeURIComponent('{{ run_id }}')}/plot?metric=${encodeURIComponent(metric)}`;
+    if (xmin != null && xmin !== '') url += `&xmin=${encodeURIComponent(xmin)}`;
+    if (xmax != null && xmax !== '') url += `&xmax=${encodeURIComponent(xmax)}`;
+    // make absolute
+    if (url.startsWith('/')) url = window.location.origin + url;
+    const sep = url.indexOf('?') === -1 ? '?' : '&';
+    img.src = url + sep + 'ts=' + Date.now();
+  }
+
+  if (zoomBtn) zoomBtn.addEventListener('click', () => {
+    applyZoom(zxmin.value.trim(), zxmax.value.trim());
+  });
+  if (resetZoom) resetZoom.addEventListener('click', () => {
+    // restore to original plot URL from the select's currently selected option
+    const selEl = document.getElementById('plot-select');
+    if (selEl) {
+      const url = selEl.value || '';
+      if (url.startsWith('/')) img.src = window.location.origin + url + (url.indexOf('?') === -1 ? '?' : '&') + 'ts=' + Date.now();
+      else img.src = url + (url.indexOf('?') === -1 ? '?' : '&') + 'ts=' + Date.now();
+    }
   });
 })();
 </script>

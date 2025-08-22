@@ -4,7 +4,7 @@ import uuid
 import shlex
 import shutil
 import subprocess
-from io import StringIO
+from io import StringIO, BytesIO
 from typing import Optional, Tuple
 from functools import lru_cache
 from datetime import datetime
@@ -355,6 +355,98 @@ def plot_metric(df: pd.DataFrame, metric: str, out_png: str):
     plt.tight_layout()
     plt.savefig(out_png, dpi=150)
     plt.close()
+
+def plot_metric_bytes(df: pd.DataFrame, metric: str, xmin: Optional[float] = None, xmax: Optional[float] = None) -> bytes:
+    """Render a single-metric plot to PNG bytes; optional x-range can be supplied."""
+    plt.figure(figsize=(10, 6))
+    try:
+        if metric not in df.columns:
+            plt.text(0.5, 0.5, f'No data for {metric}', ha='center', va='center')
+        else:
+            plt.plot(df.index, df[metric], label=metric)
+            plt.xlabel('Position')
+            plt.ylabel(metric)
+            plt.title(metric)
+            plt.legend()
+            plt.grid(True)
+            if xmin is not None or xmax is not None:
+                lo = xmin if xmin is not None else df.index.min()
+                hi = xmax if xmax is not None else df.index.max()
+                plt.xlim(lo, hi)
+        plt.tight_layout()
+        buf = BytesIO()
+        plt.savefig(buf, dpi=150, format='png')
+        buf.seek(0)
+        return buf.read()
+    finally:
+        plt.close()
+
+
+@app.route('/runs/<run_id>/plot')
+def runs_plot_dynamic(run_id):
+    """Serve a single-metric plot PNG for a run with optional ?metric=...&xmin=...&xmax=..."""
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    if not os.path.isdir(run_dir):
+        return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
+
+    metric = request.args.get('metric') or ''
+    xmin = request.args.get('xmin')
+    xmax = request.args.get('xmax')
+
+    report_path = os.path.join(run_dir, RAISD_REPORT)
+    if not os.path.exists(report_path):
+        found = _find_and_normalize_report(run_dir, prefix='results')
+        if found:
+            report_path = found
+    if not os.path.exists(report_path):
+        return json.dumps({'error': 'RAiSD report not found'}), 404, {'Content-Type': 'application/json'}
+
+    try:
+        df = read_raisd_report(report_path)
+    except Exception as e:
+        app.logger.exception('Failed to read RAiSD report for dynamic plot')
+        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
+    # normalize/resolve metric names: allow sanitized names (from filenames) to match report columns
+    metric_param = (metric or '').strip()
+    chosen_metric = None
+    # precompute sanitized map
+    san_map = { _sanitize_metric_name(col): col for col in df.columns }
+    # direct match
+    if metric_param in df.columns:
+        chosen_metric = metric_param
+    else:
+        # try exact sanitized match of the param
+        mnorm = _sanitize_metric_name(metric_param)
+        if mnorm in san_map:
+            chosen_metric = san_map[mnorm]
+        else:
+            # handle common filename forms like 'plot_mu_var' or 'plot_mu_var.png'
+            s = metric_param
+            if s.endswith('.png'):
+                s = s.rsplit('/', 1)[-1]
+            if s.startswith('plot_'):
+                s2 = s[len('plot_'):]
+            else:
+                s2 = s
+            s2norm = _sanitize_metric_name(s2)
+            if s2norm in san_map:
+                chosen_metric = san_map[s2norm]
+    if chosen_metric is None:
+        app.logger.debug(f"Dynamic plot: metric resolution failed. requested={metric_param}. available={list(df.columns)}. sanitized={list(san_map.keys())}")
+    try:
+        xmin_f = float(xmin) if xmin is not None and xmin != '' else None
+        xmax_f = float(xmax) if xmax is not None and xmax != '' else None
+    except Exception:
+        return json.dumps({'error': 'xmin/xmax must be numeric if provided'}), 400, {'Content-Type': 'application/json'}
+
+    try:
+        # If no column matched, pass the original metric (plot_metric_bytes will render a 'No data' image)
+        png = plot_metric_bytes(df, chosen_metric or metric_param, xmin=xmin_f, xmax=xmax_f)
+        return (png, 200, {'Content-Type': 'image/png'})
+    except Exception as e:
+        app.logger.exception('Dynamic plot generation failed')
+        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
 
 # Expected plots (we wait for all of them)
 def _expected_plot_filenames():
