@@ -840,7 +840,7 @@ def runs_final(run_id):
 
     # Build ordered summary fields to guarantee visibility in template
     summary_fields = [
-        ('Species', (meta.get('species') or '').replace('_', ' ') or 'n/a'),
+        ('Species', (str(meta.get('species') or '').replace('_', ' ') or 'n/a')),
         ('Chromosome', meta.get('chromosome') if meta.get('chromosome') not in (None, '') else 'n/a'),
         ('Grid', meta.get('grid') if meta.get('grid') not in (None, '') else 'n/a'),
         ('Target copies', match.get('target') if match.get('target') not in (None, '') else 'n/a'),
