@@ -9,13 +9,23 @@ import pandas as pd
 from tqdm.auto import tqdm
 import stdpopsim
 
+import argparse
+
 # Avoid thread oversubscription issues in child processes
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 warnings.simplefilter("ignore")
 
 # ---------------- user-configurable (kept same names) ----------------
-species = "MusMus"
+parser = argparse.ArgumentParser(description="Simulate allele frequency spectra.")
+parser.add_argument(
+    "--species",
+    type=str,
+    required=True,
+    help="Species name (e.g., 'MusMus')."
+)
+args = parser.parse_args()
+species = args.species
 pop_size = 10_000
 
 # control RAM / parallelism via env vars

@@ -12,12 +12,21 @@ import shutil
 import os, sys, contextlib, logging, warnings
 import multiprocessing as mp
 import traceback
+import argparse
 
 ########################################################################
 # --------------------
 # config
 # --------------------
-species = "MusMus"
+parser = argparse.ArgumentParser(description="Simulate allele frequency spectra.")
+parser.add_argument(
+    "--species",
+    type=str,
+    required=True,
+    help="Species name (e.g., 'MusMus')."
+)
+args = parser.parse_args()
+species = args.species
 pop_size = 1_000
 n_simulations = 10
 decrease_factor = 0.9

@@ -12,9 +12,19 @@ except Exception:
         if iterable is None:
             return []
         return iterable
+    
+import argparse
 
 # Hard-code your inputs here
-species = "HomSap"
+parser = argparse.ArgumentParser(description="Simulate allele frequency spectra.")
+parser.add_argument(
+    "--species",
+    type=str,
+    required=True,
+    help="Species name (e.g., 'MusMus')."
+)
+args = parser.parse_args()
+species = args.species
 
 
 HOSTS = [
