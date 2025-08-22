@@ -224,3 +224,4 @@ dependencies:
     - stdpopsim==0.3.0
     - pysam
     - Flask
+    - biomart
