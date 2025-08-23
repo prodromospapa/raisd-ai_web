@@ -237,24 +237,23 @@ def _load_annotation(species: str, chromosome: str) -> pd.DataFrame:
         raise FileNotFoundError(f"Annotation file not found: {path}")
     df = pd.read_csv(path, sep="\t", dtype={"chromosome": str})
 
-    def _first_non_null(s):
-        for v in s:
+    def _first_non_null(series):
+        for v in series:
             if pd.notna(v):
                 return v
-                return np.nan
+        return np.nan
 
-        # Aggregate to a single record per gene (strand removed per user request)
-        gene_level = (
-                df.sort_values(["gene_id", "start"]).
-                    groupby(["chromosome", "gene_id"], as_index=False).
-                    agg(start=("start", "min"),
-                             end=("end", "max"),
-                             gene_name=("gene_name", _first_non_null),
-                             biotype=("biotype", _first_non_null))
-        )
+    gene_level = (
+        df.sort_values(["gene_id", "start"]).
+          groupby(["chromosome", "gene_id"], as_index=False).
+          agg(start=("start", "min"),
+               end=("end", "max"),
+               gene_name=("gene_name", _first_non_null),
+               biotype=("biotype", _first_non_null))
+    )
     gene_level["label"] = gene_level["gene_name"].fillna(gene_level["gene_id"]).astype(str)
     gene_level["start"] = gene_level["start"].astype(int)
-    gene_level["end"]   = gene_level["end"].astype(int)
+    gene_level["end"] = gene_level["end"].astype(int)
     return gene_level
 
 def _genes_in_window(species: str, chromosome: str, start: int, end: int, biotype: Optional[str] = None) -> pd.DataFrame:
