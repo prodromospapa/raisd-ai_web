@@ -119,8 +119,7 @@ def simulate_worker(
             samples_per_pop,
             slim_scaling_factor=slim_scaling_factor,
             slim_burn_in=1,
-            extended_events=events,
-            #verbosity=False
+            extended_events=events
         )
         return None
 
