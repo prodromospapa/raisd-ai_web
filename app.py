@@ -241,17 +241,17 @@ def _load_annotation(species: str, chromosome: str) -> pd.DataFrame:
         for v in s:
             if pd.notna(v):
                 return v
-        return np.nan
+                return np.nan
 
-    gene_level = (
-        df.sort_values(["gene_id", "start"]).
-          groupby(["chromosome", "gene_id"], as_index=False).
-          agg(start=("start", "min"),
-               end=("end", "max"),
-               gene_name=("gene_name", _first_non_null),
-               strand=("strand", _first_non_null),
-               biotype=("biotype", _first_non_null))
-    )
+        # Aggregate to a single record per gene (strand removed per user request)
+        gene_level = (
+                df.sort_values(["gene_id", "start"]).
+                    groupby(["chromosome", "gene_id"], as_index=False).
+                    agg(start=("start", "min"),
+                             end=("end", "max"),
+                             gene_name=("gene_name", _first_non_null),
+                             biotype=("biotype", _first_non_null))
+        )
     gene_level["label"] = gene_level["gene_name"].fillna(gene_level["gene_id"]).astype(str)
     gene_level["start"] = gene_level["start"].astype(int)
     gene_level["end"]   = gene_level["end"].astype(int)
@@ -266,7 +266,8 @@ def _genes_in_window(species: str, chromosome: str, start: int, end: int, biotyp
         hits = hits[hits["biotype"].astype(str).str.lower() == str(biotype).lower()]
     hits["overlap_bp"] = (np.minimum(hits["end"], hi) - np.maximum(hits["start"], lo) + 1).clip(lower=0)
     hits = hits.sort_values(["start", "end", "label"]).reset_index(drop=True)
-    return hits[["label", "start", "end", "strand", "biotype", "overlap_bp"]]
+    # Strand removed from output
+    return hits[["label", "start", "end", "biotype", "overlap_bp"]]
 
 # ------------------ projection helpers ------------------
 def _pre_lgamma(N):

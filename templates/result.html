@@ -64,7 +64,7 @@
         <h3>Genes in selected window</h3>
         <table id="genesTbl" border="1" cellpadding="4" cellspacing="0">
           <thead><tr>
-            <th>Label</th><th>Start</th><th>End</th><th>Strand</th><th>Biotype</th><th>Overlap (bp)</th>
+            <th>Label</th><th>Start</th><th>End</th><th>Biotype</th><th>Overlap (bp)</th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -188,13 +188,13 @@
       tbody.innerHTML = '';
       (data.genes || []).forEach(row => {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${row.label}</td><td>${row.start}</td><td>${row.end}</td><td>${row.strand ?? ''}</td><td>${row.biotype ?? ''}</td><td>${row.overlap_bp}</td>`;
+  tr.innerHTML = `<td>${row.label}</td><td>${row.start}</td><td>${row.end}</td><td>${row.biotype ?? ''}</td><td>${row.overlap_bp}</td>`;
         tbody.appendChild(tr);
       });
       return data;
     }).catch(err => {
       console.error(err);
-      tbody.innerHTML = '<tr><td colspan="6">Error fetching genes</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="5">Error fetching genes</td></tr>';
       return null;
     });
   }
