@@ -27,7 +27,7 @@ from math import lgamma
 
 from flask import (
     Flask, render_template, request, redirect, url_for,
-    send_from_directory, flash
+    send_from_directory, flash, Response
 )
 from werkzeug.utils import secure_filename
 
@@ -540,6 +540,35 @@ def runs_metric_data(run_id):
         'values': [float(v) for v in ys.tolist()],
     }
     return json.dumps(payload), 200, {'Content-Type': 'application/json'}
+
+@app.route('/runs/<run_id>/report_csv')
+def runs_report_csv(run_id):
+    """Serve the parsed RAiSD report (the DataFrame used for plotting) as a CSV file.
+    Columns are the original metric headers; index is genomic position.
+    """
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    if not os.path.isdir(run_dir):
+        return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
+    report_path = os.path.join(run_dir, RAISD_REPORT)
+    if not os.path.exists(report_path):
+        found = _find_and_normalize_report(run_dir, prefix='results')
+        if found:
+            report_path = found
+    if not os.path.exists(report_path):
+        return json.dumps({'error': 'report not found'}), 404, {'Content-Type': 'application/json'}
+    try:
+        df = _cached_report(report_path)
+    except Exception as e:
+        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
+    # Prepare CSV: include index label
+    buf = StringIO()
+    try:
+        df.to_csv(buf, index_label='Position')
+    except Exception as e:
+        return json.dumps({'error': f'failed to serialize csv: {e}'}), 500, {'Content-Type': 'application/json'}
+    csv_data = buf.getvalue()
+    return Response(csv_data, mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=RAiSD_Report.csv'})
 
 # Expected plots (we wait for all of them)
 def _expected_plot_filenames():

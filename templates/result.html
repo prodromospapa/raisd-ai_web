@@ -26,7 +26,7 @@
     {% if uploaded_url %}
       <p>Uploaded file: <a href="{{ uploaded_url }}" target="_blank" rel="noopener">{{ uploaded_name }}</a></p>
     {% endif %}
-    <p><a href="{{ report_url }}" download>Download RAiSD_Report.results</a></p>
+  <p><a href="{{ url_for('runs_report_csv', run_id=run_id) }}">Download RAiSD_Report.csv</a></p>
     {% if plots and plots|length > 0 %}
       <label for="plot-select">Metric:</label>
       <select id="plot-select">
