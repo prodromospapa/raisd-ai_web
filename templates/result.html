@@ -35,11 +35,6 @@
           <option value="{{ raw|e }}">{{ raw|replace('plot_', '') }}</option>
         {% endfor %}
       </select>
-      <label for="mode-select" style="margin-left:1rem;">Mode:</label>
-      <select id="mode-select">
-        <option value="window">Window (show genes)</option>
-        <option value="zoom" selected>Zoom (and show genes)</option>
-      </select>
       <div style="margin-top:0.75rem;">
         <label>Biotype:</label> <input id="biotype" placeholder="e.g. protein_coding" style="width:160px;">
         <button id="clearSel">Clear genes</button>
@@ -73,7 +68,7 @@
   const speciesConst = metaEl ? metaEl.getAttribute('data-species') : null;
   const chromosomeConst = metaEl ? metaEl.getAttribute('data-chromosome') : null;
   const selMetric = document.getElementById('plot-select');
-  const modeSel = document.getElementById('mode-select');
+  // Removed mode selector; always use drag zoom
   const chartDiv = document.getElementById('plotlyChart');
   const tbody = document.querySelector('#genesTbl tbody');
   const biotypeInput = document.getElementById('biotype');
@@ -103,32 +98,17 @@
       });
   }
 
-  let interactionsBound = false;
   function bindInteractions(){
-    if(interactionsBound) return;
-    if(!(chartDiv && chartDiv.on)) return; // Plotly not ready yet
-    interactionsBound = true;
-    chartDiv.on('plotly_relayout', (d) => {
-      const mode = modeSel ? modeSel.value : 'zoom';
-      if(mode !== 'zoom') return;
+    if(!(chartDiv && chartDiv.on)) return; // Plot not ready
+    // Remove previous handlers by re-creating noop clone (Plotly lacks off helper); simplest is to rely on newPlot clearing old ones.
+  chartDiv.on('plotly_relayout', (d) => {
+      if(!d) return;
       const xr0 = d['xaxis.range[0]'];
       const xr1 = d['xaxis.range[1]'];
       if(Number.isFinite(xr0)&&Number.isFinite(xr1)&&xr1>xr0){
-        showGenesWindow(xr0, xr1);
         zxmin.value = Math.floor(xr0);
         zxmax.value = Math.floor(xr1);
-      }
-    });
-    chartDiv.on('plotly_selected', (ev) => {
-      const mode = modeSel ? modeSel.value : 'window';
-      if(mode !== 'window') return;
-      const pts = (ev && ev.points) || [];
-      if(!pts.length) return;
-      const xs = pts.map(p=>p.x).filter(v=>Number.isFinite(v));
-      if(xs.length){
-        const a = Math.min(...xs); const b = Math.max(...xs);
-        zxmin.value = Math.floor(a); zxmax.value = Math.floor(b);
-        showGenesWindow(a,b);
+        showGenesWindow(xr0, xr1);
       }
     });
   }
@@ -137,16 +117,39 @@
     currentMetric = metric;
     fetchMetric(metric, xmin, xmax).then(data => {
       const trace = { x: data.positions, y: data.values, mode: 'lines', name: data.metric };
+      // Convert metric name to math formatting if recognized
+      function normKey(s){ return (s||'').replace(/[^0-9A-Za-z]+/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'').toLowerCase(); }
+      const MATH_TITLES = {
+        'mu_var': 'μVar',
+        'mu_sfs': 'μSFS',
+        'mu_ld': 'μLD',
+        'mu': 'μ',
+        'sweep_tr': 'sweep_TR',
+        'mu_var_sweep_tr': 'μVar (sweep_TR)'
+      };
+      let titleText = data.metric || '';
+      const k = normKey(titleText);
+      if(MATH_TITLES[k]) titleText = MATH_TITLES[k];
       const layout = {
-        title: data.metric,
+        title: { text: titleText },
         margin: { t: 40, r: 20, b: 50, l: 60 },
         xaxis: { title: 'Position', range: (xmin && xmax) ? [xmin, xmax] : undefined },
-        yaxis: { title: data.metric },
-        dragmode: modeSel && modeSel.value === 'window' ? 'select' : 'zoom'
+        yaxis: { title: { text: '' } },
+	dragmode: 'zoom'
       };
-      return Plotly.newPlot(chartDiv, [trace], layout, {displaylogo:false,responsive:true});
+      return Plotly.newPlot(chartDiv, [trace], layout, {
+        displaylogo:false,
+        responsive:true,
+        modeBarButtonsToRemove:['select2d','lasso2d']
+      });
     }).then(()=>{
       bindInteractions();
+      // If a range was provided, also refresh genes table automatically
+      if(Number.isFinite(parseFloat(zxmin.value)) && Number.isFinite(parseFloat(zxmax.value)) && parseFloat(zxmax.value) > parseFloat(zxmin.value)){
+        showGenesWindow(parseFloat(zxmin.value), parseFloat(zxmax.value));
+      } else {
+        tbody.innerHTML='';
+      }
     }).catch(err => {
       chartDiv.innerHTML = '<div style="color:#b00;">Failed to load metric: '+ err +'</div>';
     });
@@ -171,15 +174,14 @@
   }
 
   // Event handlers
-  if(selMetric){ selMetric.addEventListener('change', ()=>{ tbody.innerHTML=''; renderMetric(selMetric.value); }); }
-  if(modeSel){ modeSel.addEventListener('change', ()=>{ renderMetric(currentMetric); }); }
-  if(zoomBtn){ zoomBtn.addEventListener('click', ()=>{ const a=parseFloat(zxmin.value); const b=parseFloat(zxmax.value); if(Number.isFinite(a)&&Number.isFinite(b)&&b>a) renderMetric(currentMetric,a,b); }); }
+  if(selMetric){ selMetric.addEventListener('change', ()=>{ tbody.innerHTML=''; zxmin.value=''; zxmax.value=''; renderMetric(selMetric.value); }); }
+  if(zoomBtn){ zoomBtn.addEventListener('click', ()=>{ const a=parseFloat(zxmin.value); const b=parseFloat(zxmax.value); if(Number.isFinite(a)&&Number.isFinite(b)&&b>a){ renderMetric(currentMetric,a,b); } else { alert('Provide valid numeric start/end (start < end)'); } }); }
   if(resetBtn){ resetBtn.addEventListener('click', ()=>{ zxmin.value=''; zxmax.value=''; renderMetric(currentMetric, globalRange.xmin, globalRange.xmax); }); }
   if(clearBtn){ clearBtn.addEventListener('click', ()=>{ tbody.innerHTML=''; lastGenesWindow=null; }); }
 
   function start(){
     if(!window.Plotly){ return; }
-    if(currentMetric) renderMetric(currentMetric);
+  if(currentMetric) renderMetric(currentMetric);
   }
 
   // Wait for Plotly (in case CDN blocked, retry a few times)
