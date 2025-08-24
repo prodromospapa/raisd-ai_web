@@ -381,6 +381,11 @@ def plot_metric_bytes(df: pd.DataFrame, metric: str, xmin: Optional[float] = Non
     finally:
         plt.close()
 
+# ----------------- Cached report loader for interactive JSON plotting ---------
+@lru_cache(maxsize=256)
+def _cached_report(report_path: str) -> pd.DataFrame:
+    return read_raisd_report(report_path)
+
 
 @app.route('/runs/<run_id>/plot')
 def runs_plot_dynamic(run_id):
@@ -448,6 +453,94 @@ def runs_plot_dynamic(run_id):
         app.logger.exception('Dynamic plot generation failed')
         return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
 
+@app.route('/runs/<run_id>/metric_data')
+def runs_metric_data(run_id):
+    """Return JSON series data for a metric: positions (index) and values.
+    Optional query params: metric=, xmin=, xmax=, maxpoints= (downsample if large).
+    """
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    if not os.path.isdir(run_dir):
+        return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
+    report_path = os.path.join(run_dir, RAISD_REPORT)
+    if not os.path.exists(report_path):
+        found = _find_and_normalize_report(run_dir, prefix='results')
+        if found:
+            report_path = found
+    if not os.path.exists(report_path):
+        return json.dumps({'error': 'report not found'}), 404, {'Content-Type': 'application/json'}
+    metric = (request.args.get('metric') or '').strip()
+    xmin = request.args.get('xmin')
+    xmax = request.args.get('xmax')
+    maxpoints = request.args.get('maxpoints')
+    try:
+        df = _cached_report(report_path)
+    except Exception as e:
+        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
+
+    # resolve metric similar to runs_plot_dynamic
+    metric_param = metric
+    chosen_metric = None
+    san_map = { _sanitize_metric_name(col): col for col in df.columns }
+    if metric_param in df.columns:
+        chosen_metric = metric_param
+    else:
+        mnorm = _sanitize_metric_name(metric_param)
+        if mnorm in san_map:
+            chosen_metric = san_map[mnorm]
+        else:
+            s = metric_param
+            if s.endswith('.png'):
+                s = s.rsplit('/', 1)[-1]
+            if s.startswith('plot_'):
+                s2 = s[len('plot_'):]
+            else:
+                s2 = s
+            s2norm = _sanitize_metric_name(s2)
+            if s2norm in san_map:
+                chosen_metric = san_map[s2norm]
+    if chosen_metric is None:
+        # default to first column
+        chosen_metric = df.columns[0]
+
+    # slice by xmin/xmax if provided
+    sub = df
+    try:
+        if xmin is not None and xmin != '':
+            xmin_f = float(xmin)
+            sub = sub[sub.index >= xmin_f]
+        if xmax is not None and xmax != '':
+            xmax_f = float(xmax)
+            sub = sub[sub.index <= xmax_f]
+    except Exception:
+        pass
+
+    xs = sub.index.values
+    ys = sub[chosen_metric].values
+    # Downsample if needed
+    try:
+        mp = int(maxpoints) if maxpoints else None
+    except Exception:
+        mp = None
+    if mp and mp > 0 and xs.shape[0] > mp:
+        # simple stride subsampling
+        stride = max(1, xs.shape[0] // mp)
+        xs = xs[::stride]
+        ys = ys[::stride]
+
+    payload = {
+        'metric_requested': metric_param,
+        'metric': chosen_metric,
+        'sanitized_metric': _sanitize_metric_name(chosen_metric),
+        'count': int(xs.shape[0]),
+        'xmin': float(sub.index.min()) if sub.shape[0] else None,
+        'xmax': float(sub.index.max()) if sub.shape[0] else None,
+        'global_xmin': float(df.index.min()),
+        'global_xmax': float(df.index.max()),
+        'positions': xs.tolist(),
+        'values': [float(v) for v in ys.tolist()],
+    }
+    return json.dumps(payload), 200, {'Content-Type': 'application/json'}
+
 # Expected plots (we wait for all of them)
 def _expected_plot_filenames():
     return [f"plot_{_sanitize_metric_name(h)}.png" for h in HEADER]
@@ -503,8 +596,8 @@ def _find_and_normalize_report(run_dir: str, prefix: str = "results") -> Optiona
     src = candidates[0][1]
     dst = os.path.join(run_dir, RAISD_REPORT)
     if src.endswith(".gz"):
-        with gzip.open(src, "rb") as f_in, open(dst, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+        with gzip.open(src, "rb") as f_in, open(dst, "wb") as f_out:  # type: ignore[assignment]
+            shutil.copyfileobj(f_in, f_out)  # type: ignore[arg-type]
         return dst
     if os.path.abspath(src) != os.path.abspath(dst):
         shutil.copyfile(src, dst)

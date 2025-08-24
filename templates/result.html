@@ -28,97 +28,181 @@
     {% endif %}
     <p><a href="{{ report_url }}" download>Download RAiSD_Report.results</a></p>
     {% if plots and plots|length > 0 %}
-      <label for="plot-select">Show metric:</label>
+      <label for="plot-select">Metric:</label>
       <select id="plot-select">
         {% for p in plots %}
-          {# Clean up metric label if it looks like a filename like 'plot_mu_var_png' or 'sweep_TR_plot.png' #}
-          {% set label = p.metric or '' %}
-          {% if label.endswith('.png') %}
-            {% set label = label.rsplit('/', 1)[-1] %}
-          {% endif %}
-          {% set label = label.replace('plot_', '').replace('_', ' ').replace('.png', '') %}
-          {# Use dynamic plot endpoint that reads RAiSD_Report.results so zooming comes from the report data #}
-          <option value="{{ url_for('runs_plot_dynamic', run_id=run_id) }}?metric={{ p.metric|urlencode }}" data-metric="{{ p.metric|e }}">{{ label }}</option>
+          {% set raw = p.metric or '' %}
+          <option value="{{ raw|e }}">{{ raw|replace('plot_', '') }}</option>
         {% endfor %}
       </select>
       <label for="mode-select" style="margin-left:1rem;">Mode:</label>
       <select id="mode-select">
         <option value="window">Window (show genes)</option>
-        <option value="zoom">Zoom (and show genes)</option>
+        <option value="zoom" selected>Zoom (and show genes)</option>
       </select>
-      <div style="margin-top:8px;">
-        <div id="plotWrap" style="position:relative; display:inline-block;">
-          <img id="plotImg" class="plot" src="{{ url_for('runs_plot_dynamic', run_id=run_id) }}?metric={{ plots[0].metric|urlencode }}" alt="metric plot" data-xmin="{{ (plots[0].xmin if plots[0].xmin is defined) | default('') }}" data-xmax="{{ (plots[0].xmax if plots[0].xmax is defined) | default('') }}" data-metric="{{ plots[0].metric|e }}" style="max-width:100%; display:block;">
-          <div id="selector"
-               style="position:absolute; top:0; left:0; height:100%; width:0;
-                      background:rgba(0,0,0,0.15); border:1px solid rgba(0,0,0,0.35); display:none;"></div>
-        </div>
-
-        <div style="margin-top:1rem;">
-          <label>Biotype (optional):</label>
-          <input id="biotype" placeholder="e.g. protein_coding">
-          <button id="clearSel">Clear selection</button>
-          <span style="margin-left:1rem;">Zoom: xmin <input id="zoom-xmin" style="width:110px;" placeholder="start"> xmax <input id="zoom-xmax" style="width:110px;" placeholder="end"> <button id="zoomBtn">Zoom</button> <button id="resetZoom">Reset</button></span>
-        </div>
-
-        <h3>Genes in selected window</h3>
-        <table id="genesTbl" border="1" cellpadding="4" cellspacing="0">
-          <thead><tr>
-            <th>Label</th><th>Start</th><th>End</th><th>Biotype</th><th>Overlap (bp)</th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
+      <div style="margin-top:0.75rem;">
+        <label>Biotype:</label> <input id="biotype" placeholder="e.g. protein_coding" style="width:160px;">
+        <button id="clearSel">Clear genes</button>
+        <span style="margin-left:1rem;">Manual range: <input id="zoom-xmin" style="width:120px;" placeholder="start"> - <input id="zoom-xmax" style="width:120px;" placeholder="end"> <button id="zoomBtn">Go</button> <button id="resetZoom">Full</button></span>
       </div>
+      <div id="plotlyChart" style="width:100%; max-width:100%; height:480px; margin-top:10px;"></div>
+      <h3>Genes in selected window</h3>
+      <table id="genesTbl" border="1" cellpadding="4" cellspacing="0">
+        <thead><tr>
+          <th>Label</th><th>Start</th><th>End</th><th>Biotype</th><th>Overlap (bp)</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
     {% else %}
-      <img class="plot" src="{{ plot_url }}" alt="μ_var^{sweep_TR} plot" />
+      <p>No plots available.</p>
     {% endif %}
   </div>
 
   <p><a class="back" href="{{ url_for('index') }}">← Run another</a></p>
-  <span id="run-meta" data-run-id='{{ run_id|tojson }}' hidden></span>
+  <span id="run-meta" data-run-id="{{ run_id }}" data-species="{{ species }}" data-chromosome="{{ chromosome }}" hidden></span>
 {% endblock %}
 
 {% block scripts %}
- 
+
+<script id="plotly-cdn" src="https://cdn.jsdelivr.net/npm/plotly.js-dist@2.32.0/plotly.min.js" crossorigin="anonymous"></script>
 <script>
-// Plot selector handling: switch the displayed image when the user selects
-// a different metric. Use a cache-busting query param to avoid stale images.
-(() => {
-  const sel = document.getElementById('plot-select');
-  const img = document.getElementById('plotImg');
-  if (!sel || !img) return;
-  sel.addEventListener('change', (e) => {
-    try {
-      let url = e.target.value || '';
-      // make absolute if needed
-      if (url.startsWith('/')) {
-        url = window.location.origin + url;
+// Interactive Plotly-based metric viewer with accurate coordinate → genome mapping, with CDN fallback & delayed init.
+(function(){
+  const metaEl = document.getElementById('run-meta');
+  const runId = metaEl ? metaEl.getAttribute('data-run-id') : null;
+  const speciesConst = metaEl ? metaEl.getAttribute('data-species') : null;
+  const chromosomeConst = metaEl ? metaEl.getAttribute('data-chromosome') : null;
+  const selMetric = document.getElementById('plot-select');
+  const modeSel = document.getElementById('mode-select');
+  const chartDiv = document.getElementById('plotlyChart');
+  const tbody = document.querySelector('#genesTbl tbody');
+  const biotypeInput = document.getElementById('biotype');
+  const zxmin = document.getElementById('zoom-xmin');
+  const zxmax = document.getElementById('zoom-xmax');
+  const zoomBtn = document.getElementById('zoomBtn');
+  const resetBtn = document.getElementById('resetZoom');
+  const clearBtn = document.getElementById('clearSel');
+
+  let globalRange = { xmin: null, xmax: null };
+  let currentMetric = selMetric ? selMetric.value : null;
+  let lastGenesWindow = null;
+
+  function sanitizeMetric(m){ return (m||'').trim(); }
+
+  function fetchMetric(metric, xmin=null, xmax=null){
+    if(!metric) return Promise.reject('metric missing');
+    const params = new URLSearchParams({ metric: metric });
+    if (xmin != null && xmin !== '') params.append('xmin', xmin);
+    if (xmax != null && xmax !== '') params.append('xmax', xmax);
+    return fetch(`/runs/${encodeURIComponent(runId)}/metric_data?` + params.toString())
+      .then(r => r.json())
+      .then(data => {
+        if(data.error) throw new Error(data.error);
+        if(globalRange.xmin === null){ globalRange.xmin = data.global_xmin; globalRange.xmax = data.global_xmax; }
+        return data;
+      });
+  }
+
+  let interactionsBound = false;
+  function bindInteractions(){
+    if(interactionsBound) return;
+    if(!(chartDiv && chartDiv.on)) return; // Plotly not ready yet
+    interactionsBound = true;
+    chartDiv.on('plotly_relayout', (d) => {
+      const mode = modeSel ? modeSel.value : 'zoom';
+      if(mode !== 'zoom') return;
+      const xr0 = d['xaxis.range[0]'];
+      const xr1 = d['xaxis.range[1]'];
+      if(Number.isFinite(xr0)&&Number.isFinite(xr1)&&xr1>xr0){
+        showGenesWindow(xr0, xr1);
+        zxmin.value = Math.floor(xr0);
+        zxmax.value = Math.floor(xr1);
       }
-      // add timestamp to avoid cached copies
-      const sep = url.indexOf('?') === -1 ? '?' : '&';
-      const full = url + sep + 'ts=' + Date.now();
-      // for debugging: show chosen url in console
-      console.debug('Switching plot to:', full);
-      // when the image loads, hide selector overlay and clear table
-      img.onload = function() {
-        const selector = document.getElementById('selector');
-        if (selector) { selector.style.display = 'none'; selector.style.width = '0px'; }
-        const tbody = document.querySelector('#genesTbl tbody');
-        if (tbody) tbody.innerHTML = '';
-        // update metric attribute from selected option
-        try {
-          const opt = sel.options[sel.selectedIndex];
-          if (opt && opt.dataset && opt.dataset.metric) img.setAttribute('data-metric', opt.dataset.metric);
-        } catch (e) { /* ignore */ }
+    });
+    chartDiv.on('plotly_selected', (ev) => {
+      const mode = modeSel ? modeSel.value : 'window';
+      if(mode !== 'window') return;
+      const pts = (ev && ev.points) || [];
+      if(!pts.length) return;
+      const xs = pts.map(p=>p.x).filter(v=>Number.isFinite(v));
+      if(xs.length){
+        const a = Math.min(...xs); const b = Math.max(...xs);
+        zxmin.value = Math.floor(a); zxmax.value = Math.floor(b);
+        showGenesWindow(a,b);
+      }
+    });
+  }
+
+  function renderMetric(metric, xmin=null, xmax=null){
+    currentMetric = metric;
+    fetchMetric(metric, xmin, xmax).then(data => {
+      const trace = { x: data.positions, y: data.values, mode: 'lines', name: data.metric };
+      const layout = {
+        title: data.metric,
+        margin: { t: 40, r: 20, b: 50, l: 60 },
+        xaxis: { title: 'Position', range: (xmin && xmax) ? [xmin, xmax] : undefined },
+        yaxis: { title: data.metric },
+        dragmode: modeSel && modeSel.value === 'window' ? 'select' : 'zoom'
       };
-      img.onerror = function() {
-        console.warn('Failed to load plot image:', full);
-      };
-      img.src = full;
-    } catch (err) {
-      console.error('plot-select change handler error', err);
+      return Plotly.newPlot(chartDiv, [trace], layout, {displaylogo:false,responsive:true});
+    }).then(()=>{
+      bindInteractions();
+    }).catch(err => {
+      chartDiv.innerHTML = '<div style="color:#b00;">Failed to load metric: '+ err +'</div>';
+    });
+  }
+
+  function showGenesWindow(start, end){
+    if(!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+  const species = speciesConst;
+  const chromosome = chromosomeConst;
+    const bio = biotypeInput.value.trim();
+    const url = `/genes?species=${encodeURIComponent(species)}&chromosome=${encodeURIComponent(chromosome)}&start=${Math.floor(start)}&end=${Math.floor(end)}${bio?`&biotype=${encodeURIComponent(bio)}`:''}`;
+    lastGenesWindow = {start, end};
+    return fetch(url).then(r=>r.json()).then(data => {
+      tbody.innerHTML='';
+      (data.genes||[]).forEach(g => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${g.label}</td><td>${g.start}</td><td>${g.end}</td><td>${g.biotype||''}</td><td>${g.overlap_bp}</td>`;
+        tbody.appendChild(tr);
+      });
+      if((data.genes||[]).length===0){ tbody.innerHTML='<tr><td colspan="5">No genes</td></tr>'; }
+    }).catch(e => { tbody.innerHTML = '<tr><td colspan="5">Gene fetch error</td></tr>'; });
+  }
+
+  // Event handlers
+  if(selMetric){ selMetric.addEventListener('change', ()=>{ tbody.innerHTML=''; renderMetric(selMetric.value); }); }
+  if(modeSel){ modeSel.addEventListener('change', ()=>{ renderMetric(currentMetric); }); }
+  if(zoomBtn){ zoomBtn.addEventListener('click', ()=>{ const a=parseFloat(zxmin.value); const b=parseFloat(zxmax.value); if(Number.isFinite(a)&&Number.isFinite(b)&&b>a) renderMetric(currentMetric,a,b); }); }
+  if(resetBtn){ resetBtn.addEventListener('click', ()=>{ zxmin.value=''; zxmax.value=''; renderMetric(currentMetric, globalRange.xmin, globalRange.xmax); }); }
+  if(clearBtn){ clearBtn.addEventListener('click', ()=>{ tbody.innerHTML=''; lastGenesWindow=null; }); }
+
+  function start(){
+    if(!window.Plotly){ return; }
+    if(currentMetric) renderMetric(currentMetric);
+  }
+
+  // Wait for Plotly (in case CDN blocked, retry a few times)
+  let attempts = 0;
+  (function waitForPlotly(){
+    if(window.Plotly){ start(); return; }
+    attempts += 1;
+    if(attempts === 3){
+      // attempt manual load fallback by injecting alt CDN
+      if(!document.getElementById('plotly-fallback')){
+        const s = document.createElement('script');
+        s.id='plotly-fallback';
+        s.src='https://cdn.plot.ly/plotly-2.32.0.min.js';
+        s.onload = start;
+        document.head.appendChild(s);
+      }
     }
-  });
+    if(attempts > 10){
+      chartDiv.innerHTML = '<div style="color:#b00;">Plotly failed to load (offline?). Falling back to static images is recommended.</div>';
+      return;
+    }
+    setTimeout(waitForPlotly, 400);
+  })();
 })();
 // Ensure we attempt to remove the temporary run directory when the user
 // navigates away from the results page. Uses navigator.sendBeacon when
@@ -154,135 +238,6 @@
   window.addEventListener('pagehide', sendCleanup, { capture: false, passive: true });
   // as a backup, also listen for unload
   window.addEventListener('unload', sendCleanup, { capture: false, passive: true });
-})();
-</script>
-
-<script>
-(function(){
-  const img   = document.getElementById('plotImg');
-  const wrap  = document.getElementById('plotWrap');
-  const sel   = document.getElementById('selector');
-  const tbody = document.querySelector('#genesTbl tbody');
-  const btnClear = document.getElementById('clearSel');
-  const biotypeInput = document.getElementById('biotype');
-
-  // infer x-min/x-max from data attributes on the img if present
-  const xMin = parseFloat(img.getAttribute('data-xmin')) || 37500000;
-  const xMax = parseFloat(img.getAttribute('data-xmax')) || 57500000;
-
-  let dragging = false, x0 = 0, x1 = 0;
-
-  function imgRect(){ return img.getBoundingClientRect(); }
-  function pxToGenome(px){
-    const r = imgRect();
-    const frac = (px - r.left) / r.width;
-    return xMin + frac * (xMax - xMin);
-  }
-
-  function showGenes(g0, g1){
-    const species    = "{{ species }}";
-    const chromosome = "{{ chromosome }}";
-    const bio = biotypeInput.value.trim();
-    const url = `/genes?species=${encodeURIComponent(species)}&chromosome=${encodeURIComponent(chromosome)}&start=${Math.floor(g0)}&end=${Math.floor(g1)}${bio ? `&biotype=${encodeURIComponent(bio)}` : ''}`;
-    return fetch(url).then(r => r.json()).then(data => {
-      tbody.innerHTML = '';
-      (data.genes || []).forEach(row => {
-        const tr = document.createElement('tr');
-  tr.innerHTML = `<td>${row.label}</td><td>${row.start}</td><td>${row.end}</td><td>${row.biotype ?? ''}</td><td>${row.overlap_bp}</td>`;
-        tbody.appendChild(tr);
-      });
-      return data;
-    }).catch(err => {
-      console.error(err);
-  tbody.innerHTML = '<tr><td colspan="5">Error fetching genes</td></tr>';
-      return null;
-    });
-  }
-
-  img.addEventListener('mousedown', (e) => {
-    dragging = true;
-    x0 = e.clientX;
-    sel.style.display = 'block';
-    const r = imgRect();
-    sel.style.left = (x0 - r.left) + 'px';
-    sel.style.width = '0px';
-  });
-
-  window.addEventListener('mousemove', (e) => {
-    if(!dragging) return;
-    x1 = e.clientX;
-    const r = imgRect();
-    const left = Math.min(x0, x1) - r.left;
-    const width = Math.abs(x1 - x0);
-    sel.style.left = Math.max(0, left) + 'px';
-    sel.style.width = Math.min(width, r.width) + 'px';
-  });
-
-  window.addEventListener('mouseup', (e) => {
-    if(!dragging) return;
-    dragging = false;
-    const g0 = pxToGenome(Math.min(x0, x1));
-    const g1 = pxToGenome(Math.max(x0, x1));
-    if (Math.abs(g1 - g0) <= 1) return;
-
-    const modeSel = document.getElementById('mode-select');
-    const mode = modeSel ? modeSel.value : 'window';
-
-    if (mode === 'window') {
-      showGenes(g0, g1);
-      return;
-    }
-
-    // Zoom mode: request dynamic zoomed plot and also fetch genes
-    const metric = img.getAttribute('data-metric') || '';
-    let url = `/runs/${encodeURIComponent('{{ run_id }}')}/plot?metric=${encodeURIComponent(metric)}&xmin=${Math.floor(g0)}&xmax=${Math.floor(g1)}`;
-    if (url.startsWith('/')) url = window.location.origin + url;
-    const sep = url.indexOf('?') === -1 ? '?' : '&';
-    img.onload = function(){
-      // after zoomed image loads, fetch genes for the same window
-      showGenes(g0, g1);
-      const selector = document.getElementById('selector');
-      if (selector) { selector.style.display = 'none'; selector.style.width = '0px'; }
-    };
-    img.onerror = function(){ console.warn('Failed to load zoomed image:', url); };
-    img.src = url + sep + 'ts=' + Date.now();
-  });
-
-  btnClear.addEventListener('click', () => {
-    sel.style.display = 'none';
-    sel.style.width = '0px';
-    tbody.innerHTML = '';
-  });
-
-  // Zoom controls
-  const zoomBtn = document.getElementById('zoomBtn');
-  const resetZoom = document.getElementById('resetZoom');
-  const zxmin = document.getElementById('zoom-xmin');
-  const zxmax = document.getElementById('zoom-xmax');
-
-  function applyZoom(xmin, xmax){
-    const metric = img.getAttribute('data-metric') || '';
-    let url = `/runs/${encodeURIComponent('{{ run_id }}')}/plot?metric=${encodeURIComponent(metric)}`;
-    if (xmin != null && xmin !== '') url += `&xmin=${encodeURIComponent(xmin)}`;
-    if (xmax != null && xmax !== '') url += `&xmax=${encodeURIComponent(xmax)}`;
-    // make absolute
-    if (url.startsWith('/')) url = window.location.origin + url;
-    const sep = url.indexOf('?') === -1 ? '?' : '&';
-    img.src = url + sep + 'ts=' + Date.now();
-  }
-
-  if (zoomBtn) zoomBtn.addEventListener('click', () => {
-    applyZoom(zxmin.value.trim(), zxmax.value.trim());
-  });
-  if (resetZoom) resetZoom.addEventListener('click', () => {
-    // restore to original plot URL from the select's currently selected option
-    const selEl = document.getElementById('plot-select');
-    if (selEl) {
-      const url = selEl.value || '';
-      if (url.startsWith('/')) img.src = window.location.origin + url + (url.indexOf('?') === -1 ? '?' : '&') + 'ts=' + Date.now();
-      else img.src = url + (url.indexOf('?') === -1 ? '?' : '&') + 'ts=' + Date.now();
-    }
-  });
 })();
 </script>
 {% endblock %}
