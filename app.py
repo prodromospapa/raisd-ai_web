@@ -973,15 +973,28 @@ def runs_final(run_id):
         return json.dumps({'error': meta.get('error')}), 500, {'Content-Type': 'application/json'}
 
     # Build ordered summary fields to guarantee visibility in template
-    summary_fields = [
-        ('Species', (str(meta.get('species') or '').replace('_', ' ') or 'n/a')),
-        ('Chromosome', meta.get('chromosome') if meta.get('chromosome') not in (None, '') else 'n/a'),
-        ('Grid', meta.get('grid') if meta.get('grid') not in (None, '') else 'n/a'),
-        ('Target copies', match.get('target') if match.get('target') not in (None, '') else 'n/a'),
-        ('Demographic model', match.get('demographic_model') or 'n/a'),
-        ('Population', match.get('population') or 'n/a'),
-        ('JSD', (f"{match.get('best_jsd'):.6f}" if isinstance(match.get('best_jsd'), (int,float)) else 'n/a')),
-    ]
+    summary_fields = []
+    s = str(meta.get('species') or '').replace('_', ' ').strip()
+    if s:
+        summary_fields.append(('Species', s))
+    chrom = meta.get('chromosome')
+    if chrom not in (None, ''):
+        summary_fields.append(('Chromosome', chrom))
+    grid = meta.get('grid')
+    if grid not in (None, ''):
+        summary_fields.append(('Grid', grid))
+    target = match.get('target')
+    if target not in (None, ''):
+        summary_fields.append(('Target copies', target))
+    dm = match.get('demographic_model')
+    if dm:
+        summary_fields.append(('Demographic model', dm))
+    pop = match.get('population')
+    if pop:
+        summary_fields.append(('Population', pop))
+    jsd_v = match.get('best_jsd')
+    if isinstance(jsd_v, (int, float)):
+        summary_fields.append(('JSD', f"{jsd_v:.6f}"))
 
     try:
         return render_template(
