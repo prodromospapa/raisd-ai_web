@@ -62,9 +62,8 @@ function updateUploadStatus(file, loaded, total) {
     if (bar) bar.style.width = percent + '%';
     if (bytes) bytes.textContent = (loaded / (1024*1024)).toFixed(1) + ' / ' + (total / (1024*1024)).toFixed(1) + ' MB';
     if (bar) {
-      if (percent >= 100) {
-        bar.classList.remove('animate');
-      } else if (!bar.classList.contains('animate')) {
+      // Keep animation active even at 100% until XHR onload/onerror explicitly removes it.
+      if (!bar.classList.contains('animate')) {
         bar.classList.add('animate');
       }
     }
@@ -127,9 +126,16 @@ function handleFile(file) {
         const fnameEl = document.getElementById('upload-filename');
         if (fnameEl) fnameEl.textContent = stagedFilename + ' (staged)';
         updateUploadStatus(file, file.size, file.size);
-        try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
+        try {
+          const bar = document.getElementById('upload-bar');
+          if (bar) {
+            bar.classList.remove('animate');
+            bar.classList.add('completed');
+            setTimeout(()=>{ bar.classList.remove('completed'); }, 1200);
+          }
+        } catch(_) {}
       } else if (data && data.error) {
-        alert('Upload failed: ' + data.error);
+  alert('Upload failed: ' + data.error);
         resetDropzone();
         try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
       } else if (xhr.status < 200 || xhr.status >= 300) {

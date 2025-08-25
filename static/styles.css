@@ -11,6 +11,9 @@ footer{ max-width:900px; margin:24px auto; padding:0 16px; color:var(--muted); f
 label span{ display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
 input[type=number], select{ width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:14px; }
 input[type=text], input[type=number], select { background:var(--field); color:var(--fg); }
+/* Inputs without explicit type attribute (default text) */
+#biotype, #zoom-xmin, #zoom-xmax { background:var(--field); color:var(--fg); border:1px solid var(--border); border-radius:10px; padding:6px 10px; font-size:14px; }
+body.dark #biotype, body.dark #zoom-xmin, body.dark #zoom-xmax { border-color:var(--border); }
 input[type=text]:focus, input[type=number]:focus, select:focus { outline:2px solid var(--accent); outline-offset:1px; }
 body.dark input[type=text], body.dark input[type=number], body.dark select { border-color:var(--border); }
 button{ background:var(--accent); color:white; border:none; padding:10px 14px; border-radius:10px; font-weight:600; cursor:pointer; }
@@ -54,12 +57,16 @@ body.dark .theme-toggle{ box-shadow:0 0 0 1px #475569; }
 /* Upload progress */
 .upload-status{ margin-top:12px; }
 .upload-status .label{ font-size:14px; margin:6px 0; }
-.progress{ position:relative; background:linear-gradient(135deg,#e5e7eb 25%,#f3f4f6 25%,#f3f4f6 50%,#e5e7eb 50%,#e5e7eb 75%,#f3f4f6 75%,#f3f4f6 100%); background-size:24px 24px; border:1px solid var(--border); border-radius:10px; height:12px; overflow:hidden; }
-.progress-bar{ position:absolute; inset:0; background:repeating-linear-gradient(45deg, color-mix(in srgb,var(--accent) 92%,#ffffff 8%) 0 14px, color-mix(in srgb,var(--accent) 75%,#ffffff 25%) 14px 28px); filter:saturate(1.1); height:100%; width:0; transition:width .2s ease; box-shadow:0 0 0 1px rgba(0,0,0,.05) inset, 0 0 4px -1px rgba(0,0,0,.25); }
-.progress-bar.animate{ animation:progressStripes 1.1s linear infinite; }
-@keyframes progressStripes { from { background-position:0 0; } to { background-position:56px 0; } }
-body.dark .progress{ background:linear-gradient(135deg,#1e293b 25%,#162132 25%,#162132 50%,#1e293b 50%,#1e293b 75%,#162132 75%,#162132 100%); background-size:24px 24px; border-color:var(--border); }
-body.dark .progress-bar{ box-shadow:0 0 0 1px rgba(255,255,255,.05) inset,0 0 6px -1px rgba(0,0,0,.6); }
+.progress{ position:relative; background:color-mix(in srgb,var(--bg) 80%, #ffffff 20%); border:1px solid var(--border); border-radius:10px; height:14px; overflow:hidden; }
+.progress-bar{ position:absolute; inset:0; background:linear-gradient(90deg, color-mix(in srgb,var(--accent) 85%, #ffffff 15%) 0%, var(--accent) 60%, color-mix(in srgb,var(--accent) 80%, #000 20%) 100%); height:100%; width:0; transition:width .35s cubic-bezier(.4,.0,.2,1); will-change:width; box-shadow:0 0 0 1px rgba(0,0,0,.08) inset, 0 1px 2px rgba(0,0,0,.25); overflow:hidden; }
+.progress-bar.animate::after{ content:""; position:absolute; top:0; bottom:0; left:0; width:40%; background:linear-gradient(110deg, transparent 0%, rgba(255,255,255,.55) 45%, rgba(255,255,255,.55) 55%, transparent 100%); animation:pbShimmer 1.1s linear infinite; mix-blend-mode:overlay; }
+.progress-bar.completed{ box-shadow:0 0 0 1px rgba(0,0,0,.12) inset, 0 0 0 2px rgba(255,255,255,.35), 0 2px 6px -1px rgba(0,0,0,.35); }
+body.dark .progress-bar.completed{ box-shadow:0 0 0 1px rgba(255,255,255,.15) inset, 0 0 0 2px rgba(255,255,255,.25), 0 2px 6px -1px rgba(0,0,0,.75); }
+@keyframes pbShimmer { from { transform:translateX(-100%); } to { transform:translateX(250%); } }
+@media (prefers-reduced-motion: reduce){ .progress-bar.animate::after{ animation:pbShimmer 3s linear infinite; } }
+body.dark .progress{ background:color-mix(in srgb,var(--bg) 60%, var(--card) 40%); }
+body.dark .progress-bar{ box-shadow:0 0 0 1px rgba(255,255,255,.05) inset, 0 1px 3px rgba(0,0,0,.6); }
+body.dark .progress-bar.animate::after{ background:linear-gradient(110deg, transparent 0%, rgba(255,255,255,.30) 45%, rgba(255,255,255,.30) 55%, transparent 100%); }
 
 /* Text selection colors */
 ::selection { background:color-mix(in srgb, var(--accent) 55%, #ffffff 45%); color:var(--bg); }
