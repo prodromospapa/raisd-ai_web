@@ -93,6 +93,7 @@ if __name__=="__main__":
         try:
             df = fetch(species_name, chrom_id)
             df = df.drop(columns=["strand"])
+            df['biotype'] = df['biotype'].replace('_', ' ')
             out = Path(annot_dir) / f"{chrom_id}.tsv"
             df.to_csv(out, sep="\t", index=False)
             return chrom_id, None
