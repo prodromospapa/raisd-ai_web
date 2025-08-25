@@ -120,7 +120,7 @@
   function bindInteractions(){
     if(!(chartDiv && chartDiv.on)) return; // Plot not ready
     // Remove previous handlers by re-creating noop clone (Plotly lacks off helper); simplest is to rely on newPlot clearing old ones.
-  chartDiv.on('plotly_relayout', (d) => {
+    chartDiv.on('plotly_relayout', (d) => {
       if(!d) return;
       const xr0 = d['xaxis.range[0]'];
       const xr1 = d['xaxis.range[1]'];
@@ -128,8 +128,20 @@
         zxmin.value = Math.floor(xr0);
         zxmax.value = Math.floor(xr1);
         showGenesWindow(xr0, xr1);
+        // If user zoomed back to near-full range (>=99% coverage) clear filters
+        if(globalRange.xmin!=null && globalRange.xmax!=null){
+          const fullSpan = globalRange.xmax - globalRange.xmin;
+          const curSpan = xr1 - xr0;
+            if(fullSpan>0 && curSpan/fullSpan >= 0.99){
+              clearFilters(false); // false => don't refetch metric (already full)
+            }
+        }
+      }
+      if(d['xaxis.autorange']){
+        clearFilters();
       }
     });
+    chartDiv.on('plotly_doubleclick', ()=>{ clearFilters(); });
   }
 
   function renderMetric(metric, xmin=null, xmax=null){
@@ -244,7 +256,15 @@
   // Event handlers
   if(selMetric){ selMetric.addEventListener('change', ()=>{ tbody.innerHTML=''; zxmin.value=''; zxmax.value=''; renderMetric(selMetric.value); }); }
   if(zoomBtn){ zoomBtn.addEventListener('click', ()=>{ const a=parseFloat(zxmin.value); const b=parseFloat(zxmax.value); if(Number.isFinite(a)&&Number.isFinite(b)&&b>a){ renderMetric(currentMetric,a,b); } else { alert('Provide valid numeric start/end (start < end)'); } }); }
-  if(resetBtn){ resetBtn.addEventListener('click', ()=>{ zxmin.value=''; zxmax.value=''; renderMetric(currentMetric, globalRange.xmin, globalRange.xmax); }); }
+  function clearFilters(refetch=true){
+    zxmin.value='';
+    zxmax.value='';
+    if(biotypeBox){ biotypeBox.querySelectorAll('input[type=checkbox]').forEach(cb=>cb.checked=false); }
+    lastGenesWindow=null;
+    tbody.innerHTML='';
+    if(refetch && currentMetric){ renderMetric(currentMetric, globalRange.xmin, globalRange.xmax); }
+  }
+  if(resetBtn){ resetBtn.addEventListener('click', ()=>{ clearFilters(); }); }
   // Removed clear genes button handler
 
   function attachGeneHoverHandlers(){
