@@ -1168,14 +1168,21 @@ def get_chromosomes():
 
 @app.route('/genes', methods=['GET'])
 def genes_endpoint():
-    """
-    GET /genes?species=HomSap&chromosome=15&start=42000000&end=43000000[&biotype=protein_coding]
+    """Genes overlapping window.
+    Supports multi-biotype filtering via biotypes=bt1,bt2 (legacy 'biotype' kept for backward compatibility).
+    Returns list of available_biotypes (unfiltered) for UI checkbox population.
     """
     species = (request.args.get('species') or '').strip()
     chromosome = (request.args.get('chromosome') or '').strip()
     start = request.args.get('start')
     end   = request.args.get('end')
-    biotype = (request.args.get('biotype') or '').strip() or None
+    # Accept plural param first, else fallback to single
+    biotypes_param = request.args.get('biotypes')
+    if biotypes_param:
+        biotypes = [b.strip() for b in biotypes_param.split(',') if b.strip()]
+    else:
+        bt_single = (request.args.get('biotype') or '').strip()
+        biotypes = [bt_single] if bt_single else []
 
     if not species or not chromosome or start is None or end is None:
         return json.dumps({'error': 'species, chromosome, start, end are required'}), 400, {'Content-Type': 'application/json'}
@@ -1187,7 +1194,13 @@ def genes_endpoint():
         return json.dumps({'error': 'start and end must be numbers'}), 400, {'Content-Type': 'application/json'}
 
     try:
-        hits = _genes_in_window(species, chromosome, start_i, end_i, biotype=biotype)
+        # Load all hits first to derive available biotypes, then filter locally
+        all_hits = _genes_in_window(species, chromosome, start_i, end_i, biotype=None)
+        available_biotypes = sorted(set(str(b) for b in all_hits['biotype'] if pd.notna(b)))
+        if biotypes:
+            hits = all_hits[all_hits['biotype'].isin(biotypes)].copy()
+        else:
+            hits = all_hits
     except FileNotFoundError as e:
         return json.dumps({'error': str(e)}), 404, {'Content-Type': 'application/json'}
     except Exception as e:
@@ -1199,7 +1212,8 @@ def genes_endpoint():
         'chromosome': chromosome,
         'start': min(start_i, end_i),
         'end': max(start_i, end_i),
-        'biotype': biotype,
+        'biotypes': biotypes,
+        'available_biotypes': available_biotypes,
         'count': int(hits.shape[0]),
         'genes': hits.to_dict(orient='records'),
     }

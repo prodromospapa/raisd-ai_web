@@ -53,8 +53,8 @@
         {% endfor %}
       </select>
       <div style="margin-top:0.75rem;">
-        <label>Biotype:</label> <input id="biotype" placeholder="e.g. protein_coding" style="width:160px;">
-        <button id="clearSel">Clear genes</button>
+  <label style="vertical-align:top;">Biotypes:</label>
+  <span id="biotypeBox" style="display:inline-block; max-width:260px; vertical-align:top;"></span>
         <span style="margin-left:1rem;">Manual range: <input id="zoom-xmin" style="width:120px;" placeholder="start"> - <input id="zoom-xmax" style="width:120px;" placeholder="end"> <button id="zoomBtn">Go</button> <button id="resetZoom">Full</button></span>
       </div>
       <div id="plotlyChart" style="width:100%; max-width:100%; height:480px; margin-top:10px;"></div>
@@ -90,12 +90,12 @@
   // Removed mode selector; always use drag zoom
   const chartDiv = document.getElementById('plotlyChart');
   const tbody = document.querySelector('#genesTbl tbody');
-  const biotypeInput = document.getElementById('biotype');
+  const biotypeBox = document.getElementById('biotypeBox');
   const zxmin = document.getElementById('zoom-xmin');
   const zxmax = document.getElementById('zoom-xmax');
   const zoomBtn = document.getElementById('zoomBtn');
   const resetBtn = document.getElementById('resetZoom');
-  const clearBtn = document.getElementById('clearSel');
+  // Clear genes button removed per request
 
   let globalRange = { xmin: null, xmax: null };
   let currentMetric = selMetric ? selMetric.value : null;
@@ -180,15 +180,43 @@
     });
   }
 
+  function selectedBiotypes(){
+    if(!biotypeBox) return [];
+    return Array.from(biotypeBox.querySelectorAll('input[type=checkbox]:checked')).map(cb=>cb.value);
+  }
+
+  function ensureBiotypeCheckboxes(list){
+    if(!biotypeBox) return;
+    const existing = new Set(Array.from(biotypeBox.querySelectorAll('input[type=checkbox]')).map(cb=>cb.value));
+    let changed = false;
+    list.forEach(bt => { if(!existing.has(bt)){ changed=true; } });
+    if(!changed && existing.size === list.length) return; // no update needed
+    biotypeBox.innerHTML = '';
+    if(list.length === 0){ biotypeBox.textContent='(none)'; return; }
+    list.forEach(bt => {
+      const id = 'bt_' + bt.replace(/[^A-Za-z0-9_\-]+/g,'_');
+      const lbl = document.createElement('label');
+      lbl.style.display='inline-flex';
+      lbl.style.alignItems='center';
+      lbl.style.margin='0 6px 4px 0';
+      lbl.style.fontSize='12px';
+      lbl.innerHTML = `<input type="checkbox" value="${bt}" id="${id}" style="margin-right:4px;">${bt}`;
+      biotypeBox.appendChild(lbl);
+    });
+    biotypeBox.addEventListener('change', () => { if(lastGenesWindow){ showGenesWindow(lastGenesWindow.start, lastGenesWindow.end); } });
+  }
+
   function showGenesWindow(start, end){
     if(!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
   const species = speciesConst;
   const chromosome = chromosomeConst;
-    const bio = biotypeInput.value.trim();
-    const url = `/genes?species=${encodeURIComponent(species)}&chromosome=${encodeURIComponent(chromosome)}&start=${Math.floor(start)}&end=${Math.floor(end)}${bio?`&biotype=${encodeURIComponent(bio)}`:''}`;
+    const selBts = selectedBiotypes();
+    const btParam = selBts.length ? `&biotypes=${encodeURIComponent(selBts.join(','))}` : '';
+    const url = `/genes?species=${encodeURIComponent(species)}&chromosome=${encodeURIComponent(chromosome)}&start=${Math.floor(start)}&end=${Math.floor(end)}${btParam}`;
     lastGenesWindow = {start, end};
     return fetch(url).then(r=>r.json()).then(data => {
       tbody.innerHTML='';
+      if(data.available_biotypes){ ensureBiotypeCheckboxes(data.available_biotypes); }
       const UCSC_ASSEMBLY = {
         'Homo_sapiens': 'hg38',
         'Mus_musculus': 'mm39',
@@ -217,7 +245,7 @@
   if(selMetric){ selMetric.addEventListener('change', ()=>{ tbody.innerHTML=''; zxmin.value=''; zxmax.value=''; renderMetric(selMetric.value); }); }
   if(zoomBtn){ zoomBtn.addEventListener('click', ()=>{ const a=parseFloat(zxmin.value); const b=parseFloat(zxmax.value); if(Number.isFinite(a)&&Number.isFinite(b)&&b>a){ renderMetric(currentMetric,a,b); } else { alert('Provide valid numeric start/end (start < end)'); } }); }
   if(resetBtn){ resetBtn.addEventListener('click', ()=>{ zxmin.value=''; zxmax.value=''; renderMetric(currentMetric, globalRange.xmin, globalRange.xmax); }); }
-  if(clearBtn){ clearBtn.addEventListener('click', ()=>{ tbody.innerHTML=''; lastGenesWindow=null; }); }
+  // Removed clear genes button handler
 
   function attachGeneHoverHandlers(){
     const links = tbody.querySelectorAll('a.gene-link[data-start][data-end]');
