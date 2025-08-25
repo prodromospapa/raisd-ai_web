@@ -28,6 +28,12 @@ args = parser.parse_args()
 species = args.species
 pop_size = 10_000
 
+# SLiM scaling factor (mirrors usage in 2.train_models.py for neutral sims)
+SLIM_SCALING_FACTOR = int(os.getenv("SLIM_SCALING_FACTOR", "1000000"))
+TUNE_MAX_ATTEMPTS = int(os.getenv("TUNE_MAX_ATTEMPTS", "12"))
+TUNE_CONTIG_BP = int(os.getenv("TUNE_CONTIG_BP", "10000"))  # small test region
+TUNE_TIMEOUT = int(os.getenv("TUNE_TIMEOUT", "120"))  # seconds (not enforced strictly, just guidance)
+
 # control RAM / parallelism via env vars
 WINDOW_BP = int(os.getenv("WINDOW_BP", 5_000_000))   # slice size on the largest chrom
 MAX_PROCS = int(os.getenv("MAX_PROCS", 0))           # 0 => all cores
@@ -47,9 +53,76 @@ def average_dist(ts):
 
 # kept for structure; main run uses the parallel window worker below
 def simulate(samples_per_pop, model, contig):
-    engine = stdpopsim.get_engine("msprime")
-    ts = engine.simulate(model, contig, samples_per_pop)
+    """(Unused helper) Run a single neutral simulation (SLiM)."""
+    engine = stdpopsim.get_engine("slim")
+    ts = engine.simulate(
+        model,
+        contig,
+        samples_per_pop,
+        slim_scaling_factor=SLIM_SCALING_FACTOR,
+        slim_burn_in=1,
+        extended_events=None,
+    )
     return ts.allele_frequency_spectrum(polarised=True, span_normalise=False), average_dist(ts)
+
+
+def _try_simulation(species_name, demog_id, population, chrom_id, scaling_factor, pop_size_local, length):
+    """Run a very small neutral SLiM simulation to test a scaling_factor.
+    Returns True on success, False on recoverable error, raises on fatal errors."""
+    species_std_local = stdpopsim.get_species(species_name)
+    model = species_std_local.get_demographic_model(demog_id)
+    engine = stdpopsim.get_engine("slim")
+    # Use a tiny slice from start of chromosome
+    contig = species_std_local.get_contig(
+        chrom_id,
+        left=0,
+        right=length,
+        mutation_rate=model.mutation_rate,
+    )
+    try:
+        engine.simulate(
+            model,
+            contig,
+            {population: pop_size_local},
+            slim_scaling_factor=scaling_factor,
+            slim_burn_in=1,
+            extended_events=None,
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        # Patterns indicating we should reduce scaling_factor
+        if (
+            "zero at tick" in msg
+            or "only" in msg and "individuals" in msg
+            or "not enough individuals" in msg
+            or "cannot find individual" in msg
+        ):
+            return False
+        # Unknown error -> re-raise
+        raise
+
+
+def tune_scaling_factor(species_name, demog_id, population, chrom_id, start_scaling, pop_size_local):
+    """Tune SLiM scaling factor by progressively shrinking until a test sim succeeds.
+
+    Strategy: Try start_scaling, then halves until success or 1. Returns working factor.
+    """
+    scaling = max(1, int(start_scaling))
+    attempts = 0
+    while attempts < TUNE_MAX_ATTEMPTS and scaling >= 1:
+        success = _try_simulation(
+            species_name, demog_id, population, chrom_id, scaling, pop_size_local, TUNE_CONTIG_BP
+        )
+        if success:
+            return scaling
+        # reduce (geometric) if failed; ensure at least 1
+        new_scaling = scaling // 2
+        if new_scaling == scaling:
+            new_scaling = scaling - 1
+        scaling = max(1, new_scaling)
+        attempts += 1
+    return scaling  # may be 1
 
 
 # -------------------- per-window worker --------------------
@@ -58,10 +131,11 @@ def _window_job(args):
     Simulate one (model, population, window) chunk.
     Returns raw SFS (not per-bp), and stats to compute mean SNP spacing.
     """
-    species_name, demog_id, population, pop_size_local, chrom_id, left, right = args
+    species_name, demog_id, population, pop_size_local, chrom_id, left, right, slim_scaling_factor = args
 
     species_std_local = stdpopsim.get_species(species_name)
-    engine_local = stdpopsim.get_engine("msprime")
+    # Use SLiM engine for neutral simulations (mirrors neutral path in 2.train_models.py)
+    engine_local = stdpopsim.get_engine("slim")
     model = species_std_local.get_demographic_model(demog_id)
 
     contig = species_std_local.get_contig(
@@ -71,7 +145,14 @@ def _window_job(args):
         mutation_rate=model.mutation_rate,  # model-specific mutation rate
     )
 
-    ts = engine_local.simulate(model, contig, {population: pop_size_local})
+    ts = engine_local.simulate(
+        model,
+        contig,
+        {population: pop_size_local},
+        slim_scaling_factor=slim_scaling_factor,
+        slim_burn_in=1,
+        extended_events=None,
+    )
 
     sfs_raw = ts.allele_frequency_spectrum(polarised=True, span_normalise=False)
 
@@ -126,12 +207,29 @@ if __name__ == "__main__":
     n_windows = max(1, math.ceil(L / WINDOW_BP))
     windows = [(w * WINDOW_BP, min(L, (w + 1) * WINDOW_BP)) for w in range(n_windows)]
 
+    # Tune scaling factor per (model, population)
+    scaling_factors = {}
+    for demographic_model, populations in demographic_models_pass.items():
+        for population in populations:
+            scaling_factors[(demographic_model, population)] = tune_scaling_factor(
+                species, demographic_model, population, biggest_chromosome, SLIM_SCALING_FACTOR, pop_size
+            )
+
     # Prepare window-level jobs (balances load; avoids last-2-straggler hang)
     jobs = []
     for demographic_model, populations in demographic_models_pass.items():
         for population in populations:
             for left, right in windows:
-                jobs.append((species, demographic_model, population, pop_size, biggest_chromosome, left, right))
+                jobs.append((
+                    species,
+                    demographic_model,
+                    population,
+                    pop_size,
+                    biggest_chromosome,
+                    left,
+                    right,
+                    scaling_factors[(demographic_model, population)],
+                ))
 
     # Accumulators per key
     sfs_len = species_std.ploidy * pop_size + 1

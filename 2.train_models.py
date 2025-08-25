@@ -71,11 +71,6 @@ def hard_silence():
 
 warnings.simplefilter("ignore")
 # mute warnings and errors
-
-
-# --------------------
-# utils
-# --------------------
 def run(cmd, cwd=None, quiet=True):
     stdout = subprocess.DEVNULL if quiet else None
     stderr = subprocess.DEVNULL if quiet else None
@@ -104,16 +99,17 @@ def simulate_worker(
     type_, workdir, vcf_i=None, sweep_pos=None, window=None, mean_snp=None,
     slim_scaling_factor=None, event_time=None
 ):
+    """Run a single replicate; returns written VCF basename or None for test runs."""
     species_std = stdpopsim.get_species(species)
     model = species_std.get_demographic_model(demographic_model)
     os.makedirs(workdir, exist_ok=True)
     samples_per_pop = {population: pop_size}
 
     if type_ == "test":
-        contig = species_std.get_contig(chromosome, mutation_rate=model.mutation_rate, right=10)
-        events = sweep_def(contig, 5, population, event_time)
+        contig = species_std.get_contig(chromosome, mutation_rate=model.mutation_rate, right=1_000)
+        events = sweep_def(contig, 500, population, event_time)
         engine = stdpopsim.get_engine("slim")
-        _ = engine.simulate(
+        engine.simulate(
             model,
             contig,
             samples_per_pop,
@@ -123,24 +119,33 @@ def simulate_worker(
         )
         return None
 
-    # Expand genomic span until ≥ window/2 SNPs on each side of sweep_pos
+    if window is None or sweep_pos is None:
+        raise ValueError("window and sweep_pos are required for non-test simulations")
+
     left_snps = 0
     right_snps = 0
-    multipier = 1.0
+    multiplier = 1.0
     m_snp = max(float(mean_snp or 1), 1.0)
+    ts = None
 
     while left_snps <= (window // 2) or right_snps <= (window // 2):
-        left = max(0, int(sweep_pos - (multipier * (window * m_snp) // 2)))
-        right = int(sweep_pos + (multipier * (window * m_snp) // 2))
+        left = max(0, int(sweep_pos - (multiplier * (window * m_snp) // 2)))
+        right = int(sweep_pos + (multiplier * (window * m_snp) // 2))
         contig = species_std.get_contig(chromosome, mutation_rate=model.mutation_rate, left=left, right=right)
-        multipier += 0.1
+        multiplier += 0.1
 
+        engine = stdpopsim.get_engine("slim")
         if type_ == 'neutral':
-            engine = stdpopsim.get_engine("msprime")
-            ts = engine.simulate(model, contig, samples_per_pop)
+            ts = engine.simulate(
+                model,
+                contig,
+                samples_per_pop,
+                slim_scaling_factor=slim_scaling_factor,
+                slim_burn_in=1,
+                extended_events=None
+            )
         elif type_ == 'sweep':
             events = sweep_def(contig, sweep_pos, population, event_time)
-            engine = stdpopsim.get_engine("slim")
             ts = engine.simulate(
                 model,
                 contig,
@@ -152,7 +157,7 @@ def simulate_worker(
         else:
             raise ValueError(f"Unknown type_: {type_}")
 
-        positions = [variant.position for variant in ts.variants()]
+        positions = [v.position for v in ts.variants()]
         if not positions:
             continue
         closest = min(positions, key=lambda x: abs(x - sweep_pos))
@@ -161,6 +166,8 @@ def simulate_worker(
 
     vcf_path = os.path.join(workdir, f"{type_}_{vcf_i}.vcf.gz")
     with gzip.open(vcf_path, 'wt') as f:
+        if ts is None:
+            raise RuntimeError("Simulation did not produce a tree sequence (ts is None)")
         ts.write_vcf(f, contig_id=f"{chromosome}_{vcf_i}")
     return os.path.basename(vcf_path)
 
@@ -239,6 +246,11 @@ def tune_parameters(model, population, chromosome):
             if re.search(r'zero at tick', x): s=max(1, s//2); continue
             m=re.search(r'only\s+(\d+)\s+individuals', x)
             if m: s=max(1, int(int(m.group(1))*s/pop_size)); continue
+            # SLiM error when trying to target a population that does not yet exist at the chosen event_time.
+            # This manifests as: 'undefined identifier p2' (or p3, etc.). In this case just try a smaller event_time.
+            if re.search(r'undefined identifier p\d+', x):
+                # Simply continue to the next (smaller) event_time candidate
+                continue
             raise
     return et_out, s
 # tune parameters
@@ -310,7 +322,14 @@ if __name__ == "__main__":
                 sfs.to_csv(f"data/{species_std.name.replace(' ','_')}/sfs.csv")
                 continue
 
-            mean_snp = float(mean_snp_df.loc[f"{demographic_model}_{population}"].iloc[0])
+            # Extract scalar mean_snp robustly (row could be Series/DataFrame/scalar)
+            mr = mean_snp_df.loc[f"{demographic_model}_{population}"]
+            if isinstance(mr, pd.DataFrame):
+                mean_snp = float(mr.values.ravel()[0])
+            elif isinstance(mr, pd.Series):
+                mean_snp = float(mr.iloc[0])
+            else:
+                mean_snp = float(mr)
             for chromosome in chromosomes:
                 workdir = f"data/{species_std.name.replace(' ','_')}/{demographic_model}/{population}/{chromosome}"
                 # Skip if already trained; otherwise wipe and start fresh
@@ -324,6 +343,7 @@ if __name__ == "__main__":
                 os.makedirs(workdir, exist_ok=True)
                 
                 # ---------- SWEEP (parallel) ----------
+                sweep_attempts = 0
                 while True:
                     try:
                         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -343,10 +363,14 @@ if __name__ == "__main__":
                         vcf2bin(workdir, "sweep", window, sweep_pos)
                         break
                     except Exception:
+                        sweep_attempts += 1
+                        if sweep_attempts > 5:
+                            raise
                         continue
 
 
                 # ---------- NEUTRAL (parallel) ----------
+                neutral_attempts = 0
                 while True:
                     try:
                         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -355,7 +379,7 @@ if __name__ == "__main__":
                                     simulate_worker,
                                     species, demographic_model, population, chromosome,
                                     "neutral", workdir, rep, sweep_pos, window, mean_snp,
-                                    None, None
+                                    slim_scaling_factor, None
                                 )
                                 for rep in range(n_simulations)
                             ]
@@ -366,6 +390,9 @@ if __name__ == "__main__":
                         vcf2bin(workdir, "neutral", window, sweep_pos)
                         break
                     except Exception:
+                        neutral_attempts += 1
+                        if neutral_attempts > 5:
+                            raise
                         continue
             
                 # Train once per chromosome (sequential)
