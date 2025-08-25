@@ -164,9 +164,24 @@
     lastGenesWindow = {start, end};
     return fetch(url).then(r=>r.json()).then(data => {
       tbody.innerHTML='';
+      const UCSC_ASSEMBLY = {
+        'Homo_sapiens': 'hg38',
+        'Mus_musculus': 'mm39',
+        'Arabidopsis_thaliana': 'araTha1'
+      };
+      const assembly = UCSC_ASSEMBLY[species];
+      const chrName = (chromosome||'').startsWith('chr') ? chromosome : `chr${chromosome}`;
       (data.genes||[]).forEach(g => {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${g.label}</td><td>${g.start}</td><td>${g.end}</td><td>${g.biotype||''}</td><td>${g.overlap_bp}</td>`;
+          let link = g.label;
+          if (assembly && Number.isFinite(g.start) && Number.isFinite(g.end)) {
+            const geneId = encodeURIComponent(g.label);
+            // Prefer direct gene details page (hgGene); include coords as hints; fallback to region if symbol lookup fails client-side
+            const geneUrl = `https://genome.ucsc.edu/cgi-bin/hgGene?db=${assembly}&hgg_gene=${geneId}&hgg_chrom=${chrName}&hgg_start=${g.start}&hgg_end=${g.end}`;
+            const regionUrl = `https://genome.ucsc.edu/cgi-bin/hgTracks?db=${assembly}&position=${chrName}:${g.start}-${g.end}`;
+            link = `<a href="${geneUrl}" target="_blank" rel="noopener" title="Open gene detail page on UCSC; if it fails, region: ${chrName}:${g.start}-${g.end}" onerror="this.href='${regionUrl}'">${g.label}</a>`;
+        }
+        tr.innerHTML = `<td>${link}</td><td>${g.start}</td><td>${g.end}</td><td>${g.biotype||''}</td><td>${g.overlap_bp}</td>`;
         tbody.appendChild(tr);
       });
       if((data.genes||[]).length===0){ tbody.innerHTML='<tr><td colspan="5">No genes</td></tr>'; }
