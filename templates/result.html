@@ -7,8 +7,8 @@
         {% set species_code_map = {'Homo_sapiens':'homsap','Mus_musculus':'musmus','Arabidopsis_thaliana':'aratha'} %}
         {% set spec_code = species_code_map.get(species, (species or '')|lower) %}
         {% for label, value in summary_fields %}
-          {% if label|lower == 'target copies' %}
-            {# skip target copies per user request #}
+          {% if label|lower in ['target copies','grid'] %}
+            {# skip target copies and grid per user request #}
           {% elif label|lower == 'demographic model' and value %}
             {% set model_anchor = value|lower %}
             {% set doc_url = 'https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html#sec_catalog_' ~ spec_code ~ '_models_' ~ model_anchor %}
@@ -20,7 +20,7 @@
       {% else %}
         <li><span>Species</span><strong>{{ species|default('n/a')|replace('_', ' ') }}</strong></li>
         <li><span>Chromosome</span><strong>{{ chromosome|default('n/a') }}</strong></li>
-        <li><span>Grid</span><strong>{{ grid|default('n/a') }}</strong></li>
+  {# Grid removed per user request #}
         <li><span>Ploidy</span><strong>{{ match.ploidy|default('n/a') }}</strong>{% if match.mixed_ploidy %}<em class="warn"> (mixed)</em>{% endif %}</li>
         {% set species_code_map = {'Homo_sapiens':'homsap','Mus_musculus':'musmus','Arabidopsis_thaliana':'aratha'} %}
         {% set spec_code = species_code_map.get(species, (species or '')|lower) %}
