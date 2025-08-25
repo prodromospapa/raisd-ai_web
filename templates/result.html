@@ -53,8 +53,10 @@
         {% endfor %}
       </select>
       <div style="margin-top:0.75rem;">
-  <label style="vertical-align:top;">Biotypes:</label>
-  <span id="biotypeBox" style="display:inline-block; max-width:260px; vertical-align:top;"></span>
+        <span id="biotypeFilter" style="display:none;">
+          <label style="vertical-align:top;">Biotypes:</label>
+          <span id="biotypeBox" style="display:inline-block; max-width:260px; vertical-align:top;"></span>
+        </span>
         <span style="margin-left:1rem;">Manual range: <input id="zoom-xmin" style="width:120px;" placeholder="start"> - <input id="zoom-xmax" style="width:120px;" placeholder="end"> <button id="zoomBtn">Go</button> <button id="resetZoom">Full</button></span>
       </div>
       <div id="plotlyChart" style="width:100%; max-width:100%; height:480px; margin-top:10px;"></div>
@@ -134,11 +136,15 @@
           const curSpan = xr1 - xr0;
             if(fullSpan>0 && curSpan/fullSpan >= 0.99){
               clearFilters(false); // false => don't refetch metric (already full)
+              hideBiotypeFilter();
+            } else {
+              showBiotypeFilter();
             }
         }
       }
       if(d['xaxis.autorange']){
         clearFilters();
+        hideBiotypeFilter();
       }
     });
     chartDiv.on('plotly_doubleclick', ()=>{ clearFilters(); });
@@ -263,8 +269,11 @@
     lastGenesWindow=null;
     tbody.innerHTML='';
     if(refetch && currentMetric){ renderMetric(currentMetric, globalRange.xmin, globalRange.xmax); }
+  hideBiotypeFilter();
   }
   if(resetBtn){ resetBtn.addEventListener('click', ()=>{ clearFilters(); }); }
+  function hideBiotypeFilter(){ const f = document.getElementById('biotypeFilter'); if(f) f.style.display='none'; }
+  function showBiotypeFilter(){ const f = document.getElementById('biotypeFilter'); if(f) f.style.display='inline-block'; }
   // Removed clear genes button handler
 
   function attachGeneHoverHandlers(){
