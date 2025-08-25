@@ -4,16 +4,33 @@
     <h2>Best match</h2>
     <ul class="kv">
       {% if summary_fields %}
+        {% set species_code_map = {'Homo_sapiens':'homsap','Mus_musculus':'musmus','Arabidopsis_thaliana':'aratha'} %}
+        {% set spec_code = species_code_map.get(species, (species or '')|lower) %}
         {% for label, value in summary_fields %}
-          <li><span>{{ label }}</span><strong>{{ value }}</strong></li>
+          {% if label|lower == 'target copies' %}
+            {# skip target copies per user request #}
+          {% elif label|lower == 'demographic model' and value %}
+            {% set model_anchor = value|lower %}
+            {% set doc_url = 'https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html#sec_catalog_' ~ spec_code ~ '_models_' ~ model_anchor %}
+            <li><span>{{ label }}</span><strong><a href="{{ doc_url }}" target="_blank" rel="noopener">{{ value }}</a></strong></li>
+          {% else %}
+            <li><span>{{ label }}</span><strong>{{ value }}</strong></li>
+          {% endif %}
         {% endfor %}
       {% else %}
         <li><span>Species</span><strong>{{ species|default('n/a')|replace('_', ' ') }}</strong></li>
         <li><span>Chromosome</span><strong>{{ chromosome|default('n/a') }}</strong></li>
         <li><span>Grid</span><strong>{{ grid|default('n/a') }}</strong></li>
-        <li><span>Target copies</span><strong>{{ match.target|default('n/a') }}</strong></li>
         <li><span>Ploidy</span><strong>{{ match.ploidy|default('n/a') }}</strong>{% if match.mixed_ploidy %}<em class="warn"> (mixed)</em>{% endif %}</li>
-        <li><span>Demographic model</span><strong>{{ match.demographic_model|default('n/a') }}</strong></li>
+        {% set species_code_map = {'Homo_sapiens':'homsap','Mus_musculus':'musmus','Arabidopsis_thaliana':'aratha'} %}
+        {% set spec_code = species_code_map.get(species, (species or '')|lower) %}
+        {% if match.demographic_model %}
+          {% set model_anchor = match.demographic_model|lower %}
+          {% set doc_url = 'https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html#sec_catalog_' ~ spec_code ~ '_models_' ~ model_anchor %}
+          <li><span>Demographic model</span><strong><a href="{{ doc_url }}" target="_blank" rel="noopener">{{ match.demographic_model }}</a></strong></li>
+        {% else %}
+          <li><span>Demographic model</span><strong>n/a</strong></li>
+        {% endif %}
         <li><span>Population</span><strong>{{ match.population|default('n/a') }}</strong></li>
         <li><span>JSD</span><strong>{% if match.best_jsd is not none %}{{ '%.6f'|format(match.best_jsd) }}{% else %}n/a{% endif %}</strong></li>
       {% endif %}
@@ -42,12 +59,14 @@
       </div>
       <div id="plotlyChart" style="width:100%; max-width:100%; height:480px; margin-top:10px;"></div>
       <h3>Genes in selected window</h3>
-      <table id="genesTbl" border="1" cellpadding="4" cellspacing="0">
-        <thead><tr>
-          <th>Label</th><th>Start</th><th>End</th><th>Biotype</th><th>Overlap (bp)</th>
-        </tr></thead>
-        <tbody></tbody>
-      </table>
+      <div class="genes-scroll">
+        <table id="genesTbl" border="0" cellpadding="4" cellspacing="0">
+          <thead><tr>
+            <th>Label</th><th>Start</th><th>End</th><th>Biotype</th><th>Overlap (bp)</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
     {% else %}
       <p>No plots available.</p>
     {% endif %}
@@ -133,8 +152,14 @@
       const layout = {
         title: { text: titleText },
         margin: { t: 40, r: 20, b: 50, l: 60 },
-        xaxis: { title: 'Position', range: (xmin && xmax) ? [xmin, xmax] : undefined },
-        yaxis: { title: { text: '' } },
+  xaxis: { title: 'Position', range: (xmin && xmax) ? [xmin, xmax] : undefined },
+  yaxis: { title: { text: '' } },
+
+  paper_bgcolor: getComputedStyle(document.body).getPropertyValue('--card').trim(),
+  plot_bgcolor: getComputedStyle(document.body).getPropertyValue('--card').trim(),
+  font: { color: getComputedStyle(document.body).getPropertyValue('--fg').trim() },
+  xaxis: { title: 'Position', range: (xmin && xmax) ? [xmin, xmax] : undefined, color: getComputedStyle(document.body).getPropertyValue('--fg').trim(), gridcolor: getComputedStyle(document.body).getPropertyValue('--border').trim() },
+  yaxis: { title: { text: '' }, color: getComputedStyle(document.body).getPropertyValue('--fg').trim(), gridcolor: getComputedStyle(document.body).getPropertyValue('--border').trim() },
 	dragmode: 'zoom'
       };
       return Plotly.newPlot(chartDiv, [trace], layout, {
@@ -175,16 +200,16 @@
         const tr = document.createElement('tr');
           let link = g.label;
           if (assembly && Number.isFinite(g.start) && Number.isFinite(g.end)) {
-            const geneId = encodeURIComponent(g.label);
-            // Prefer direct gene details page (hgGene); include coords as hints; fallback to region if symbol lookup fails client-side
-            const geneUrl = `https://genome.ucsc.edu/cgi-bin/hgGene?db=${assembly}&hgg_gene=${geneId}&hgg_chrom=${chrName}&hgg_start=${g.start}&hgg_end=${g.end}`;
-            const regionUrl = `https://genome.ucsc.edu/cgi-bin/hgTracks?db=${assembly}&position=${chrName}:${g.start}-${g.end}`;
-            link = `<a href="${geneUrl}" target="_blank" rel="noopener" title="Open gene detail page on UCSC; if it fails, region: ${chrName}:${g.start}-${g.end}" onerror="this.href='${regionUrl}'">${g.label}</a>`;
-        }
-        tr.innerHTML = `<td>${link}</td><td>${g.start}</td><td>${g.end}</td><td>${g.biotype||''}</td><td>${g.overlap_bp}</td>`;
+              const geneId = encodeURIComponent(g.label);
+              const geneUrl = `https://genome.ucsc.edu/cgi-bin/hgGene?db=${assembly}&hgg_gene=${geneId}&hgg_chrom=${chrName}&hgg_start=${g.start}&hgg_end=${g.end}`;
+              const regionUrl = `https://genome.ucsc.edu/cgi-bin/hgTracks?db=${assembly}&position=${chrName}:${g.start}-${g.end}`;
+              link = `<a class="gene-link" data-start="${g.start}" data-end="${g.end}" href="${geneUrl}" target="_blank" rel="noopener" title="Open gene detail page on UCSC; if it fails, region: ${chrName}:${g.start}-${g.end}" onerror="this.href='${regionUrl}'">${g.label}</a>`;
+           }
+          tr.innerHTML = `<td>${link}</td><td>${g.start}</td><td>${g.end}</td><td>${g.biotype||''}</td><td>${g.overlap_bp}</td>`;
         tbody.appendChild(tr);
       });
       if((data.genes||[]).length===0){ tbody.innerHTML='<tr><td colspan="5">No genes</td></tr>'; }
+        attachGeneHoverHandlers();
     }).catch(e => { tbody.innerHTML = '<tr><td colspan="5">Gene fetch error</td></tr>'; });
   }
 
@@ -193,6 +218,55 @@
   if(zoomBtn){ zoomBtn.addEventListener('click', ()=>{ const a=parseFloat(zxmin.value); const b=parseFloat(zxmax.value); if(Number.isFinite(a)&&Number.isFinite(b)&&b>a){ renderMetric(currentMetric,a,b); } else { alert('Provide valid numeric start/end (start < end)'); } }); }
   if(resetBtn){ resetBtn.addEventListener('click', ()=>{ zxmin.value=''; zxmax.value=''; renderMetric(currentMetric, globalRange.xmin, globalRange.xmax); }); }
   if(clearBtn){ clearBtn.addEventListener('click', ()=>{ tbody.innerHTML=''; lastGenesWindow=null; }); }
+
+  function attachGeneHoverHandlers(){
+    const links = tbody.querySelectorAll('a.gene-link[data-start][data-end]');
+    links.forEach(a => {
+      a.addEventListener('mouseenter', () => {
+        const s = parseFloat(a.getAttribute('data-start'));
+        const e = parseFloat(a.getAttribute('data-end'));
+        if(!Number.isFinite(s)||!Number.isFinite(e)||e<=s) return;
+        highlightRange(s,e,a.textContent);
+      });
+      a.addEventListener('mouseleave', () => { clearHighlight(); });
+      // Optional: focus/blur for accessibility
+      a.addEventListener('focus', () => {
+        const s = parseFloat(a.getAttribute('data-start'));
+        const e = parseFloat(a.getAttribute('data-end'));
+        if(!Number.isFinite(s)||!Number.isFinite(e)||e<=s) return;
+        highlightRange(s,e,a.textContent);
+      });
+      a.addEventListener('blur', () => { clearHighlight(); });
+    });
+  }
+
+  function highlightRange(start,end,label){
+    if(!chartDiv || !window.Plotly) return;
+    const shape = {
+      type: 'rect',
+      xref: 'x', yref: 'paper',
+      x0: start, x1: end,
+      y0: 0, y1: 1,
+      fillcolor: 'rgba(255,165,0,0.18)',
+      line: {color: 'rgba(255,140,0,0.9)', width: 1},
+      layer: 'below'
+    };
+    const ann = {
+      x: (start+end)/2, y: 1, xref: 'x', yref: 'paper',
+      text: label || '',
+      showarrow: false,
+      yanchor: 'bottom',
+      font: {size: 10, color: '#d2691e'}
+    };
+    // Replace shapes/annotations arrays with single highlight
+    Plotly.relayout(chartDiv, { shapes: [shape], annotations: (chartDiv.layout.annotations||[]).filter(a=>!a._geneTmp).concat([{...ann,_geneTmp:true}]) });
+  }
+
+  function clearHighlight(){
+    if(!chartDiv || !window.Plotly) return;
+    const anns = (chartDiv.layout.annotations||[]).filter(a=>!a._geneTmp);
+    Plotly.relayout(chartDiv, { shapes: [], annotations: anns });
+  }
 
   function start(){
     if(!window.Plotly){ return; }

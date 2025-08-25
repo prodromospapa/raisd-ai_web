@@ -61,6 +61,13 @@ function updateUploadStatus(file, loaded, total) {
     pct.textContent = percent + '%';
     if (bar) bar.style.width = percent + '%';
     if (bytes) bytes.textContent = (loaded / (1024*1024)).toFixed(1) + ' / ' + (total / (1024*1024)).toFixed(1) + ' MB';
+    if (bar) {
+      if (percent >= 100) {
+        bar.classList.remove('animate');
+      } else if (!bar.classList.contains('animate')) {
+        bar.classList.add('animate');
+      }
+    }
   }
   if (submitBtn) submitBtn.disabled = isUploading;
 }
@@ -90,6 +97,7 @@ function handleFile(file) {
   fd.append('vcf', file);
   isUploading = true;
   updateUploadStatus(file, 0, file.size);
+  try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.add('animate'); } catch(_) {}
 
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/upload', true);
@@ -103,9 +111,10 @@ function handleFile(file) {
     isUploading = false;
     alert('Upload failed. Please try again.');
     resetDropzone();
+    try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
   };
   xhr.onload = function () {
-    isUploading = false;
+  isUploading = false;
     try {
       const data = xhr.response;
       if (!data && xhr.responseText) {
@@ -118,16 +127,20 @@ function handleFile(file) {
         const fnameEl = document.getElementById('upload-filename');
         if (fnameEl) fnameEl.textContent = stagedFilename + ' (staged)';
         updateUploadStatus(file, file.size, file.size);
+        try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
       } else if (data && data.error) {
         alert('Upload failed: ' + data.error);
         resetDropzone();
+        try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
       } else if (xhr.status < 200 || xhr.status >= 300) {
         alert('Upload failed: server returned ' + xhr.status);
         resetDropzone();
+        try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
       }
     } catch (e) {
       alert('Upload failed: ' + e);
       resetDropzone();
+      try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
     }
   };
   xhr.send(fd);
