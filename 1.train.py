@@ -3,14 +3,14 @@ import stdpopsim as sps
 import subprocess
 
 species = "Homo sapiens"
-sample_individuals = 1_000
+sample_individuals = 100
 replicates = 1_000
 sel_2Ns = 500
 
 window = 500
 ips = 11
 iws = 10
-epochs = 100
+epochs = 10
 
 
 def run_simulation(engine,species_id,model_id,pop_order,sample_individuals,window,ips,iws,chromosome,replicates,sfs=True,sel_2Ns=None):
@@ -34,7 +34,8 @@ def run_simulation(engine,species_id,model_id,pop_order,sample_individuals,windo
         "--target-snps-tol", "0.1",
         "--paired-neutral",
         "--neutral-output", "neutral.ms",
-        "--neutral-same-seed"
+        "--neutral-same-seed",
+        "--sweep-time", "0.002"
         ]
 
     if sfs:
@@ -45,8 +46,9 @@ def run_simulation(engine,species_id,model_id,pop_order,sample_individuals,windo
     args += [
         "--progress"
     ]
-    print(subprocess.list2cmdline(args))
-    exit()
+
+    #print(subprocess.list2cmdline(args))
+    #exit()
     # run inside the target directory
     try:
         subprocess.run(args, cwd=out_dir, check=True)
@@ -87,8 +89,8 @@ def ms2bin(model_id,pop_order,window,ips,iws,chromosome,type_,sweep_pos,length):
         subprocess.run(args, cwd=out_dir, check=True)
     except subprocess.CalledProcessError as e:
         print(f"Simulation failed in {out_dir}: {e}")
-    os.remove(f"{out_dir}/{type_}.ms")
-    os.remove(f"{out_dir}/RAiSD_Info.bin.{type_}TR")
+    #os.remove(f"{out_dir}/{type_}.ms")
+    #os.remove(f"{out_dir}/RAiSD_Info.bin.{type_}TR")
 
 
 def train_model(model_id, pop_order, chromosome, epochs):
@@ -143,10 +145,13 @@ for model_id, populations in demographic_models.items():
     for population in populations:
         for chromosome in chromosomes:
             #for engine in ["msms", "dicoal"]:
-            engine = "msms"
+            engine = "discoal"
             run_simulation(engine, species_id, model_id, population, sample_individuals, window, ips, iws, chromosome, replicates, sel_2Ns=sel_2Ns)
             params, selection = get_info(model_id, population, chromosome)
             for type_ in ["sweep","neutral"]:
                 ms2bin(model_id, population, window, ips, iws, chromosome, type_, selection["sweep_bp"],params["length"])
             train_model(model_id, population, chromosome, epochs)
             exit()
+
+# RAiSD-AI -n test -mdl data/Homo_sapiens/OutOfAfricaExtendedNeandertalAdmixturePulse_3I21/YRI/1/RAiSD_Model.model -op SWP-SCN -I test.ms -L 10000000 -frm -G 300 -pci 1 1 -R
+# RAiSD-AI -n ms -f -op RSD-DEF -I test.ms -frm -G 300 -R -L 1000000

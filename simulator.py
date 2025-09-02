@@ -982,13 +982,18 @@ def parse_args():
         raise SystemExit('ERROR: engine=discoal uses --sweep-time; do not use --fixation-time.')
     # Required selection params
     if engine == 'discoal':
-        if args.a is None or args.x is None or args.sweep_time is None:
-            raise SystemExit('ERROR: discoal requires --sel-2Ns, --sweep-pos, and --sweep-time.')
+        # Neutral discoal run permitted when all selection params omitted.
+        have_any = any(v is not None for v in (args.a, args.x, args.sweep_time))
+        have_all = all(v is not None for v in (args.a, args.x, args.sweep_time))
+        if have_any and not have_all:
+            raise SystemExit('ERROR: discoal selection requires all of --sel-2Ns, --sweep-pos, --sweep-time or none (neutral).')
     elif engine == 'msms':
-        if args.a is None or args.x is None:
-            raise SystemExit('ERROR: msms requires --sel-2Ns and --sweep-pos.')
+        have_any = any(v is not None for v in (args.a, args.x))
+        have_all = all(v is not None for v in (args.a, args.x))
         if args.sweep_time is not None:
             raise SystemExit('ERROR: msms uses --fixation-time not --sweep-time.')
+        if have_any and not have_all:
+            raise SystemExit('ERROR: msms selection requires both --sel-2Ns and --sweep-pos or neither (neutral).')
     else:  # ms
         sel_flags = ['--sweep-pos', '--sel-2Ns', '--sweep-time', '--fixation-time', '--sweep-pop']
         provided = [fl for fl in sel_flags if any(a == fl or a.startswith(fl + '=') for a in argv_full)]
@@ -1086,19 +1091,16 @@ def main():
 
     # sweep flag validation (engine specific)
     if engine == 'discoal':
+        # Only enforce if user attempted selection
         if any(getattr(args, n) is not None for n in ('sweep_time','a','x')):
-            if args.sweep_time is None or args.a is None:
-                sys.exit('ERROR: discoal sweep requires --sweep-time and --sel-2Ns.')
-            if args.x is None:
-                args.x = 0.5
+            if args.sweep_time is None or args.a is None or args.x is None:
+                sys.exit('ERROR: discoal sweep requires --sweep-time, --sel-2Ns, and --sweep-pos.')
             if args.sweep_time < 0:
                 sys.exit('ERROR: --sweep-time must be >= 0.')
     elif engine == 'msms':
         if any(getattr(args, n) is not None for n in ('fix_time','a','x')):
-            if args.a is None:
-                sys.exit('ERROR: msms sweep requires --sel-2Ns (and optionally --sweep-pos).')
-            if args.x is None:
-                args.x = 0.5
+            if args.a is None or args.x is None:
+                sys.exit('ERROR: msms sweep requires both --sel-2Ns and --sweep-pos.')
             if args.fix_time is not None and args.fix_time < 0:
                 sys.exit('ERROR: --fixation-time must be >= 0 (time back in 4N units).')
 
@@ -1413,6 +1415,9 @@ def main():
                 hi_len = args.length
                 hi_stdout = concatenated_stdout
                 hi_meta = meta
+                # Track the corresponding command line for the current 'hi' candidate.
+                # raw_cmd_line at this point reflects the last simulation before shrink attempts.
+                hi_raw_cmd_line = raw_cmd_line
                 hi_seg_list = seg_list_curr
                 lo_len = None
                 lo_seg_list = None
@@ -1430,6 +1435,7 @@ def main():
                         break
                     if min(seg_list_trial) >= target_snps:
                         hi_len, hi_stdout, hi_meta, hi_seg_list = trial_len, stdout_trial, meta_trial, seg_list_trial
+                        hi_raw_cmd_line = raw_cmd_line_trial
                         attempts += 1
                         shrink_bracket_attempts = attempts
                         continue
@@ -1447,6 +1453,7 @@ def main():
                             break
                         if min(seg_list_trial) >= target_snps:
                             hi_len, hi_stdout, hi_meta, hi_seg_list = probe_len, stdout_trial, meta_trial, seg_list_trial
+                            hi_raw_cmd_line = raw_cmd_line_trial
                             probe_len = int(probe_len * 0.85)
                             shrink_extra_reductions = extra + 1
                         else:
@@ -1466,6 +1473,7 @@ def main():
                             break
                         if min(seg_list_mid) >= target_snps:
                             hi_len, hi_stdout, hi_meta, hi_seg_list = mid, stdout_mid, meta_mid, seg_list_mid
+                            hi_raw_cmd_line = raw_cmd_line_mid
                         else:
                             lo_len = mid
                         bs_iter += 1
@@ -1473,6 +1481,8 @@ def main():
                 args.length = hi_len
                 concatenated_stdout = hi_stdout
                 meta = hi_meta
+                # Update the raw command line to remain consistent with the final (possibly shrunken) length.
+                raw_cmd_line = hi_raw_cmd_line
                 max_final = max(hi_seg_list)
                 if max_final <= target_snps * (1.0 + tol_internal):
                     overshoot_status = 'met'
@@ -1945,7 +1955,7 @@ def main():
                         vcf_text_neut_final = '\n'.join(vcf_lines_neut) + ('\n' if not vcf_lines_neut[-1].endswith('\n') else '')
                         if fmt == 'vcf.gz':
                             with gzip.open(neut_out_path, 'wt') as f2:
-                                f2.write(vcf_text_neut_final)
+                                f2.write(vcf_text_neut_final)  # type: ignore[arg-type]
                         else:
                             with open(neut_out_path, 'w') as f2:
                                 f2.write(vcf_text_neut_final)
@@ -1954,7 +1964,7 @@ def main():
                         f_open_neut = gzip.open if fmt == 'ms.gz' else open
                         mode_neut = 'wt' if fmt == 'ms.gz' else 'w'
                         with f_open_neut(neut_out_path, mode_neut) as f2:
-                            f2.write(raw_neut + '\n')
+                            f2.write(raw_neut + '\n')  # type: ignore[arg-type]
                             info_pairs_n = []
                             info_pairs_n.append(('engine', neut_meta.get('engine', neut_engine)))
                             info_pairs_n.append(('species', neut_meta.get('species_id')))
@@ -1994,13 +2004,13 @@ def main():
                             for grp_n, keys_n in (('core', core_keys_n), ('params', param_keys_n)):
                                 ln_n = build_line_n(grp_n, keys_n)
                                 if ln_n:
-                                    f2.write(ln_n + '\n')
+                                    f2.write(ln_n + '\n')  # type: ignore[arg-type]
                             for ln2 in neut_out_txt.splitlines(True):
                                 if ln2.startswith(neut_engine+' '):
                                     continue
                                 if neut_engine == 'msms' and ln2.startswith('ms '):
                                     continue
-                                f2.write(ln2)
+                                f2.write(ln2)  # type: ignore[arg-type]
                     sys.stderr.write(f"# INFO: wrote paired neutral output to {neut_out_path}\n")
                     if getattr(args, 'sfs', False):
                         try:
