@@ -1757,6 +1757,27 @@ def main():
                     if engine == 'msms' and ln.startswith('ms '):
                         continue
                     f.write(ln)
+    # If a paired neutral run is requested, release large primary output buffers now to free RAM before neutral simulation.
+    if getattr(args, 'paired_neutral', False):
+        try:
+            # Keep raw_cmd_line and meta (needed for deriving neutral command), drop bulky stdout/stderr strings.
+            concatenated_stdout = None  # type: ignore
+            concatenated_stderr = None  # type: ignore
+            # Also drop any intermediate oversized variables if present.
+            if 'hi_stdout' in locals():
+                hi_stdout = None  # type: ignore
+            if 'lo_seg_list' in locals():
+                lo_seg_list = None  # type: ignore
+            if 'hi_seg_list' in locals():
+                hi_seg_list = None  # type: ignore
+            if 'final_seg_list' in locals():
+                final_seg_list = None  # type: ignore
+            import gc as _gc
+            _gc.collect()
+            if args.debug:
+                sys.stderr.write('# DEBUG: released primary sweep output buffers before neutral run.\n')
+        except Exception:
+            pass
     # Optional paired neutral run
     if getattr(args, 'paired_neutral', False):
         fmt = args.format  # ensure available for neutral output generation
@@ -1865,14 +1886,103 @@ def main():
         if raw_neut is None:
             sys.stderr.write('# ERROR: failed to extract neutral command line; skipping neutral run.\n')
         else:
+            # Run neutral simulation with its own progress bar if requested
             try:
-                rN = subprocess.run(shlex.split(raw_neut), capture_output=True, text=True, check=True)
-                neut_out_txt = rN.stdout; neut_err_txt = rN.stderr
-            except subprocess.CalledProcessError as e:
-                sys.stderr.write(f"# ERROR: neutral {neut_engine} exited code {e.returncode}.\n")
-                if e.stdout: sys.stderr.write(e.stdout)
-                if e.stderr: sys.stderr.write(e.stderr)
-                neut_out_txt = ''; neut_err_txt = ''
+                neut_tokens = shlex.split(raw_neut)
+                total_reps_neut = int(neut_tokens[2])
+            except Exception:
+                # Fallback: treat as single run
+                total_reps_neut = 1
+            neut_threads = max(1, min(int(getattr(args, 'threads', 1)), total_reps_neut))
+            per_rep_mode_neut = bool(getattr(args, 'progress', False) and total_reps_neut > 1)
+            # Chunking logic mirrors primary run
+            if per_rep_mode_neut:
+                neut_chunks = [1] * total_reps_neut
+            else:
+                if neut_threads == 1 or total_reps_neut == 1:
+                    neut_chunks = [total_reps_neut]
+                else:
+                    base = total_reps_neut // neut_threads
+                    rem = total_reps_neut % neut_threads
+                    neut_chunks = [base + (1 if i < rem else 0) for i in range(neut_threads) if base + (1 if i < rem else 0) > 0]
+            # Unique seeds per chunk for discoal/msms if not already provided
+            if neut_engine in ('discoal', 'msms'):
+                try:
+                    import random as _rndN
+                    unique_seeds_n = set(); seeds_for_chunks_n = []
+                    while len(seeds_for_chunks_n) < len(neut_chunks):
+                        sN = _rndN.randint(1, 2**31 - 1)
+                        if sN in unique_seeds_n: continue
+                        unique_seeds_n.add(sN); seeds_for_chunks_n.append(sN)
+                except Exception:
+                    seeds_for_chunks_n = [None] * len(neut_chunks)
+            else:
+                seeds_for_chunks_n = [None] * len(neut_chunks)
+            # Prepare progress bar
+            neut_bar = None
+            neut_progress_done = 0
+            if getattr(args, 'progress', False):
+                if tqdm is not None:
+                    neut_bar = tqdm(total=total_reps_neut, desc='neutral', unit='rep')
+                else:
+                    sys.stderr.write('# neutral progress: 0/' + str(total_reps_neut) + '\n')
+            def run_neut_chunk(rc, chunk_idx=None, rep_index=None):
+                toks_loc = neut_tokens[:]; toks_loc[2] = str(rc)
+                # Add seed if chunk-specific and not already present
+                if neut_engine in ('discoal','msms'):
+                    seed_val_n = seeds_for_chunks_n[chunk_idx] if chunk_idx is not None and chunk_idx < len(seeds_for_chunks_n) else None
+                    if seed_val_n is not None and '-seed' not in toks_loc:
+                        toks_loc.extend(['-seed', str(seed_val_n)])
+                try:
+                    rloc = subprocess.run(toks_loc, capture_output=True, text=True, check=True)
+                    return (rc, rloc.stdout, rloc.stderr, None, rep_index)
+                except subprocess.CalledProcessError as e_c:
+                    return (rc, e_c.stdout, e_c.stderr, e_c.returncode, rep_index)
+            neut_results = []
+            if len(neut_chunks) == 1 and not per_rep_mode_neut:
+                rc, out, err, code, rep_idx = run_neut_chunk(neut_chunks[0], 0, 0)
+                neut_results.append((rc, out, err, code, rep_idx))
+                if neut_bar is not None:
+                    neut_bar.update(total_reps_neut)
+                elif getattr(args, 'progress', False) and total_reps_neut == 1 and tqdm is None:
+                    sys.stderr.write('# neutral progress: 1/1\n')
+            else:
+                # Parallel execution
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(neut_chunks) if not per_rep_mode_neut else neut_threads) as ex_n:
+                    futs_n = []
+                    if per_rep_mode_neut:
+                        rep_counter_n = 0
+                        for idxN, cN in enumerate(neut_chunks):
+                            futs_n.append(ex_n.submit(run_neut_chunk, cN, idxN, rep_counter_n))
+                            rep_counter_n += 1
+                    else:
+                        for idxN, cN in enumerate(neut_chunks):
+                            futs_n.append(ex_n.submit(run_neut_chunk, cN, idxN, idxN))
+                    for fut_n in concurrent.futures.as_completed(futs_n):
+                        rcN, outN, errN, codeN, rep_idxN = fut_n.result()
+                        neut_results.append((rcN, outN, errN, codeN, rep_idxN))
+                        if neut_bar is not None:
+                            try:
+                                neut_bar.update(int(rcN if not per_rep_mode_neut else 1))
+                            except Exception:
+                                neut_bar.update(1)
+                        elif getattr(args, 'progress', False):
+                            neut_progress_done += (rcN if not per_rep_mode_neut else 1)
+                            sys.stderr.write(f'# neutral progress: {neut_progress_done}/{total_reps_neut}\n')
+            if neut_bar is not None:
+                neut_bar.close()
+            # Sort and concatenate stdout in replicate order
+            try:
+                neut_results.sort(key=lambda x: (x[4] if x[4] is not None else 0))
+            except Exception:
+                pass
+            # Aggregate stdout / stderr
+            neut_out_txt = ''.join([r[1] for r in neut_results])
+            neut_err_txt = ''.join([r[2] for r in neut_results if r[2]])
+            # Report any non-zero return codes
+            for r in neut_results:
+                if r[3]:
+                    sys.stderr.write(f"# ERROR: neutral replicate returned code {r[3]} (engine={neut_engine}).\n")
             neut_out_path = getattr(args,'neutral_out', None)
             if neut_out_path is None and args.out and args.out != '-':
                 main_out = args.out

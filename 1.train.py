@@ -7,10 +7,12 @@ sample_individuals = 100
 replicates = 1_000
 sel_2Ns = 500
 
-window = 500
-ips = 11
-iws = 10
-epochs = 10
+window = 250
+ips = 499 # odd
+iws = 1
+epochs = 3
+
+engine = "msms"
 
 
 def run_simulation(engine,species_id,model_id,pop_order,sample_individuals,window,ips,iws,chromosome,replicates,sfs=True,sel_2Ns=None):
@@ -24,7 +26,7 @@ def run_simulation(engine,species_id,model_id,pop_order,sample_individuals,windo
         "--model-id", str(model_id),
         "--pop-order", str(pop_order),
         "--sample-individuals", str(sample_individuals),
-        "--target-snps", str(window + ips * iws),
+        "--target-snps", str(int(window + ((ips/2) * iws))),
         "--chromosome", str(chromosome),
         "--replicates", str(replicates),
         "--output", "sweep.ms",
@@ -34,8 +36,7 @@ def run_simulation(engine,species_id,model_id,pop_order,sample_individuals,windo
         "--target-snps-tol", "0.1",
         "--paired-neutral",
         "--neutral-output", "neutral.ms",
-        "--neutral-same-seed",
-        "--sweep-time", "0.002"
+        "--neutral-same-seed"
         ]
 
     if sfs:
@@ -71,18 +72,17 @@ def ms2bin(model_id,pop_order,window,ips,iws,chromosome,type_,sweep_pos,length):
     args = [
         "RAiSD-AI",
         "-n", "bin",
-    "-I", f"{type_}.ms",
-    # cast numeric values explicitly to str to avoid TypeError in subprocess for int arguments
-    "-w", str(window),
-    "-ips", str(ips),
-    "-iws", str(iws),
-    "-its", str(sweep_pos),
-    "-op", "IMG-GEN",
-    "-icl", f"{type_}TR",
-    "-bin",
-    "-typ", "1",
-    "-L", str(length),
-    "-f"
+        "-I", f"{type_}.ms",
+        "-w", str(window),
+        "-ips", str(ips),
+        "-iws", str(iws),
+        "-its", str(sweep_pos),
+        "-op", "IMG-GEN",
+        "-icl", f"{type_}TR",
+        "-bin",
+        "-typ", "1",
+        "-L", str(length),
+        "-f"
     ]
 
     try:
@@ -145,7 +145,6 @@ for model_id, populations in demographic_models.items():
     for population in populations:
         for chromosome in chromosomes:
             #for engine in ["msms", "dicoal"]:
-            engine = "discoal"
             run_simulation(engine, species_id, model_id, population, sample_individuals, window, ips, iws, chromosome, replicates, sel_2Ns=sel_2Ns)
             params, selection = get_info(model_id, population, chromosome)
             for type_ in ["sweep","neutral"]:
