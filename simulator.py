@@ -1603,8 +1603,16 @@ def main():
             info_pairs.append(('pop0', meta.get('pop0')))
             if meta.get('pop_order'):
                 info_pairs.append(('order', '|'.join(map(str, meta.get('pop_order')))))
+            # Emit sample (individual) counts and haplotype counts separately.
             if meta.get('counts_disc'):
-                info_pairs.append(('sample_counts', '|'.join(map(str, meta.get('counts_disc')))))
+                hap_list = meta.get('counts_disc') or []
+                pl = meta.get('ploidy', 1) or 1
+                try:
+                    sample_list = [int(h // pl) for h in hap_list]
+                except Exception:
+                    sample_list = hap_list  # fallback
+                info_pairs.append(('sample_counts', '|'.join(map(str, sample_list))))
+                info_pairs.append(('hap_counts', '|'.join(map(str, hap_list))))
             theta_val = rho_val = None
             try:
                 toks_tmp = raw_cmd_line.split()
@@ -1642,7 +1650,7 @@ def main():
             enf_stats = meta.get('enforcement_stats') or {}
             for k,v in enf_stats.items():
                 kv_dict[k] = v
-            core_keys = ['engine','species','model','pop0','order','sample_counts']
+            core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
             param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
             sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
             def build_group_line(prefix, keys):
@@ -1685,7 +1693,14 @@ def main():
                 if meta.get('pop_order'):
                     info_pairs.append(('order', '|'.join(map(str, meta.get('pop_order')))))
                 if meta.get('counts_disc'):
-                    info_pairs.append(('sample_counts', '|'.join(map(str, meta.get('counts_disc')))))
+                    hap_list = meta.get('counts_disc') or []
+                    pl = meta.get('ploidy', 1) or 1
+                    try:
+                        sample_list = [int(h // pl) for h in hap_list]
+                    except Exception:
+                        sample_list = hap_list
+                    info_pairs.append(('sample_counts', '|'.join(map(str, sample_list))))
+                    info_pairs.append(('hap_counts', '|'.join(map(str, hap_list))))
                 # parse theta/rho from command
                 theta_val = rho_val = None
                 try:
@@ -1721,7 +1736,7 @@ def main():
                     info_pairs.append(('fixation_time', meta.get('fixation_time')))
                 # demog intentionally omitted from metadata output per user request
                 # Group related keys: core, params, selection (enforcement line removed per user request)
-                core_keys = ['engine','species','model','pop0','order','sample_counts']
+                core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
                 param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
                 sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
                 # Enforcement diagnostics retained internally but not emitted.
@@ -2022,7 +2037,13 @@ def main():
                             info_pairs_n.append(('order', '|'.join(map(str, pop_order_n))))
                         counts_disc_n = neut_meta.get('counts_disc') or []
                         if counts_disc_n:
-                            info_pairs_n.append(('sample_counts', '|'.join(map(str, counts_disc_n))))
+                            pl_n = neut_meta.get('ploidy', 1) or 1
+                            try:
+                                sample_list_n = [int(h // pl_n) for h in counts_disc_n]
+                            except Exception:
+                                sample_list_n = counts_disc_n
+                            info_pairs_n.append(('sample_counts', '|'.join(map(str, sample_list_n))))
+                            info_pairs_n.append(('hap_counts', '|'.join(map(str, counts_disc_n))))
                         theta_val_n = rho_val_n = None
                         try:
                             toks_nt = raw_neut.split()
@@ -2042,7 +2063,7 @@ def main():
                         if neut_meta.get('chromosome') is not None:
                             info_pairs_n.append(('chromosome', neut_meta.get('chromosome')))
                         kvn = {k:v for k,v in info_pairs_n if v is not None}
-                        core_keys_n = ['engine','species','model','pop0','order','sample_counts']
+                        core_keys_n = ['engine','species','model','pop0','order','sample_counts','hap_counts']
                         param_keys_n = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
                         def build_line_n_vcf(group_name, keys):
                             vals = [f"{k}={kvn[k]}" for k in keys if k in kvn]
@@ -2085,7 +2106,13 @@ def main():
                                 info_pairs_n.append(('order', '|'.join(map(str, pop_order_n))))
                             counts_disc_n = neut_meta.get('counts_disc') or []
                             if counts_disc_n:
-                                info_pairs_n.append(('sample_counts', '|'.join(map(str, counts_disc_n))))
+                                pl_n = neut_meta.get('ploidy', 1) or 1
+                                try:
+                                    sample_list_n = [int(h // pl_n) for h in counts_disc_n]
+                                except Exception:
+                                    sample_list_n = counts_disc_n
+                                info_pairs_n.append(('sample_counts', '|'.join(map(str, sample_list_n))))
+                                info_pairs_n.append(('hap_counts', '|'.join(map(str, counts_disc_n))))
                             theta_val_n = rho_val_n = None
                             try:
                                 toks_nt = raw_neut.split()
@@ -2105,7 +2132,7 @@ def main():
                             if neut_meta.get('chromosome') is not None:
                                 info_pairs_n.append(('chromosome', neut_meta.get('chromosome')))
                             kvn = {k:v for k,v in info_pairs_n if v is not None}
-                            core_keys_n = ['engine','species','model','pop0','order','sample_counts']
+                            core_keys_n = ['engine','species','model','pop0','order','sample_counts','hap_counts']
                             param_keys_n = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
                             def build_line_n(group_name, keys):
                                 vals = [f"{k}={kvn[k]}" for k in keys if k in kvn]

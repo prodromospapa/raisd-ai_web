@@ -7,10 +7,10 @@ sample_individuals = 100
 replicates = 1_000
 sel_2Ns = 500
 
-window = 250
-ips = 499 # odd
-iws = 1
-epochs = 3
+window = 1000
+ips = 11 # odd
+iws = 10
+epochs = 10
 
 engine = "msms"
 
