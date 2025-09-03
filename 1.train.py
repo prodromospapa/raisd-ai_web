@@ -35,8 +35,7 @@ def run_simulation(engine,species_id,model_id,pop_order,sample_individuals,windo
         "--threads", str(os.cpu_count()),
         "--target-snps-tol", "0.1",
         "--paired-neutral",
-        "--neutral-output", "neutral.ms",
-        "--neutral-same-seed"
+        "--neutral-output", "neutral.ms"
         ]
 
     if sfs:

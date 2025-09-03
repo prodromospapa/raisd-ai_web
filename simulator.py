@@ -959,7 +959,6 @@ def parse_args():
     pn.add_argument('--paired-neutral', action='store_true', help='Also run a neutral simulation with identical parameters (selection removed).')
     pn.add_argument('--neutral-engine', choices=['discoal','ms','msms'], help='Engine to use for neutral run (default: same as --engine).')
     pn.add_argument('--neutral-output', dest='neutral_out', help='Neutral output path. Default: main output name with _neutral before extension.')
-    pn.add_argument('--neutral-same-seed', action='store_true', help='Reuse primary run seed for neutral run when engines match; otherwise a different random seed is used.')
 
     gd = ap.add_argument_group('Demography')
     gd.add_argument('--disable-growth-discretization', dest='no_en_ladder', action='store_true', help='Disable exponential growth discretization.')
@@ -1368,6 +1367,15 @@ def main():
                 sys.exit(code)
         concatenated_stdout_loc = ''.join(t[1] for t in results_loc)
         concatenated_stderr_loc = ''.join(t[2] for t in results_loc)
+        # Persist chunk seeding metadata for potential neutral pairing reuse
+        try:
+            meta_loc.setdefault('runtime', {})
+            meta_loc['runtime']['chunk_sizes'] = chunks_loc
+            if engine in ('discoal','msms'):
+                meta_loc['runtime']['chunk_seeds'] = seeds_for_chunks
+            meta_loc['runtime']['per_rep_mode'] = per_rep_mode_loc
+        except Exception:
+            pass
         return meta_loc, raw_cmd_line_loc, concatenated_stdout_loc, concatenated_stderr_loc
 
     # Initial simulation at refined/derived length
@@ -1793,111 +1801,75 @@ def main():
                 sys.stderr.write('# DEBUG: released primary sweep output buffers before neutral run.\n')
         except Exception:
             pass
-    # Optional paired neutral run
+    # Optional paired neutral run (clean implementation)
     if getattr(args, 'paired_neutral', False):
-        fmt = args.format  # ensure available for neutral output generation
+        fmt = args.format
         neut_engine = args.neutral_engine or engine
-        if getattr(args, 'neutral_same_seed', False) and (neut_engine == engine):
-            neut_seed = primary_seed
-        else:
-            try:
-                import random as _rnd
-                neut_seed = _rnd.randint(1, 2**31 - 1)
-                if primary_seed is not None and neut_seed == primary_seed:
-                    neut_seed = (neut_seed + 1) % (2**31 - 1) or 1
-            except Exception:
-                neut_seed = None
-        # If user wants exact neutral twin and engine matches, derive neutral command by stripping selection flags
-        neut_cmd = None; neut_meta = None
-        if neut_engine == engine and engine in ('discoal','msms'):
-            # Start from original raw command line (post-enforcement) to guarantee identical theta/rho/length/demog/sample order
+        # Always generate an independent seed for the neutral run
+        try:
+            import random as _rseed
+            neut_seed = _rseed.randint(1,2**31-1)
+        except Exception:
+            neut_seed = None
+        # Build / derive neutral command
+        if neut_engine == engine and neut_engine in ('discoal','msms'):
             base_line = raw_cmd_line
             toks = shlex.split(base_line)
-            def _strip_selection_tokens_discoal(tokens):
-                out = []
-                skip_next = 0
-                sel_flags = {'-ws':1,'-x':1,'-a':1}
-                i=0
-                while i < len(tokens):
-                    t = tokens[i]
-                    if t in sel_flags:
-                        i += 1 + sel_flags[t]  # skip flag + its args
-                        continue
-                    out.append(t); i += 1
+            def _strip_discoal(ts):
+                out=[]; i=0; flags={'-ws':1,'-x':1,'-a':1}
+                while i < len(ts):
+                    t=ts[i]
+                    if t in flags:
+                        i+=1+flags[t]; continue
+                    out.append(t); i+=1
                 return out
-            def _strip_selection_tokens_msms(tokens):
-                out = []
-                i = 0
-                while i < len(tokens):
-                    t = tokens[i]
-                    if t in ('-SaA','-SAA','-Sp') and i+1 < len(tokens):
-                        i += 2; continue
-                    if t == '-Smark':
-                        i += 1; continue
-                    if t == '-SI':
-                        # pattern: -SI <tstart> <npop> <freq1> ... <freqN>
-                        if i+2 < len(tokens):
-                            try:
-                                npop_local = int(tokens[i+2])
-                                i += 3 + npop_local
-                                continue
-                            except Exception:
-                                # fallback: skip just flag
-                                i += 1
-                                continue
-                        else:
-                            i += 1
-                            continue
-                    if t == '-SFC':
-                        i += 1; continue
-                    out.append(t); i += 1
+            def _strip_msms(ts):
+                out=[]; i=0
+                while i < len(ts):
+                    t=ts[i]
+                    if t in ('-SaA','-SAA','-Sp') and i+1 < len(ts):
+                        i+=2; continue
+                    if t in ('-Smark','-SFC'):
+                        i+=1; continue
+                    if t=='-SI' and i+2 < len(ts):
+                        try:
+                            npop_local=int(ts[i+2]); i+=3+npop_local; continue
+                        except Exception:
+                            i+=1; continue
+                    out.append(t); i+=1
                 return out
-            if engine == 'discoal':
-                stripped = _strip_selection_tokens_discoal(toks)
-            else:  # msms
-                stripped = _strip_selection_tokens_msms(toks)
-            # Append seed if requested and not already there
+            stripped = _strip_discoal(toks) if neut_engine=='discoal' else _strip_msms(toks)
             if neut_seed is not None and '-seed' not in stripped:
                 stripped += ['-seed', str(neut_seed)]
             neut_line = ' '.join(stripped)
-            # Reconstruct full command block (reuse comments but remove sweep-specific comment lines)
-            base_comments = [c for c in meta.get('base_comments', []) if 'sweep-pos=' not in c and 'sweep-time=' not in c and 'fixation-time=' not in c]
+            base_comments = [c for c in meta.get('base_comments',[]) if 'sweep-pos=' not in c and 'sweep-time=' not in c and 'fixation-time=' not in c]
             neut_cmd = '\n'.join(base_comments + [neut_line])
-            # Clone meta and blank selection fields
             neut_meta = dict(meta)
             for k in ('sweep_pos','sel_2Ns','sweep_time','fixation_time'):
                 neut_meta[k] = None
-            neut_meta['base_comments'] = base_comments
-            neut_meta['engine'] = neut_engine
+            neut_meta['base_comments']=base_comments
+            neut_meta['engine']=neut_engine
         else:
-            # Fallback: build via neutral engine-specific builder (may differ if user intentionally changed engine)
-            if neut_engine == 'discoal':
-                neut_cmd, neut_meta = build_discoal_command(
-                    species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
-                    discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
-                    max_fold_per_step=args.max_fold_per_step, sweep_time=None, x=None, a=None, min_snps=None, chr_name=args.chromosome,
-                    disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=neut_seed,
-                )
-            elif neut_engine == 'msms':
-                neut_cmd, neut_meta = build_msms_command(
-                    species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
-                    pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
-                    max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                    min_snps=None, disable_en_ladder=args.no_en_ladder,
-                    a=None, x=None, fixation_time=0.0, debug=args.debug, seed=neut_seed,
-                )
+            if neut_engine=='discoal':
+                neut_cmd, neut_meta = build_discoal_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
+                    discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
+                    sweep_time=None, x=None, a=None, min_snps=None, chr_name=args.chromosome, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    seed=neut_seed)
+            elif neut_engine=='msms':
+                neut_cmd, neut_meta = build_msms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
+                    pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, a=None, x=None, fixation_time=0.0,
+                    debug=args.debug, seed=neut_seed)
             else:
-                neut_cmd, neut_meta = build_ms_command(
-                    species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
-                    pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
-                    max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                    min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=neut_seed,
-                )
-        raw_neut = None
-        neut_err_txt = ''
+                neut_cmd, neut_meta = build_ms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
+                    pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    seed=neut_seed)
+        # Extract raw neutral line
+        raw_neut=None
         for ln in neut_cmd.splitlines():
             if ln.startswith(neut_engine+' '):
-                raw_neut = ln.strip(); break
+                raw_neut=ln.strip(); break
         if raw_neut is None:
             sys.stderr.write('# ERROR: failed to extract neutral command line; skipping neutral run.\n')
         else:
@@ -1909,28 +1881,20 @@ def main():
                 # Fallback: treat as single run
                 total_reps_neut = 1
             neut_threads = max(1, min(int(getattr(args, 'threads', 1)), total_reps_neut))
-            per_rep_mode_neut = bool(getattr(args, 'progress', False) and total_reps_neut > 1)
-            # Chunking logic mirrors primary run
-            if per_rep_mode_neut:
-                neut_chunks = [1] * total_reps_neut
-            else:
-                if neut_threads == 1 or total_reps_neut == 1:
-                    neut_chunks = [total_reps_neut]
-                else:
-                    base = total_reps_neut // neut_threads
-                    rem = total_reps_neut % neut_threads
-                    neut_chunks = [base + (1 if i < rem else 0) for i in range(neut_threads) if base + (1 if i < rem else 0) > 0]
-            # Unique seeds per chunk for discoal/msms if not already provided
-            if neut_engine in ('discoal', 'msms'):
+            # Always force per-replicate execution to guarantee a distinct seed per simulation (requested behavior)
+            per_rep_mode_neut = True
+            neut_chunks = [1] * total_reps_neut
+            # Unique seeds per replicate (each chunk is size 1) for discoal/msms
+            if neut_engine in ('discoal','msms'):
                 try:
                     import random as _rndN
-                    unique_seeds_n = set(); seeds_for_chunks_n = []
+                    unique_seeds_n=set(); seeds_for_chunks_n=[]
                     while len(seeds_for_chunks_n) < len(neut_chunks):
-                        sN = _rndN.randint(1, 2**31 - 1)
+                        sN=_rndN.randint(1,2**31-1)
                         if sN in unique_seeds_n: continue
                         unique_seeds_n.add(sN); seeds_for_chunks_n.append(sN)
                 except Exception:
-                    seeds_for_chunks_n = [None] * len(neut_chunks)
+                    seeds_for_chunks_n=[None]*len(neut_chunks)
             else:
                 seeds_for_chunks_n = [None] * len(neut_chunks)
             # Prepare progress bar
@@ -1943,10 +1907,18 @@ def main():
                     sys.stderr.write('# neutral progress: 0/' + str(total_reps_neut) + '\n')
             def run_neut_chunk(rc, chunk_idx=None, rep_index=None):
                 toks_loc = neut_tokens[:]; toks_loc[2] = str(rc)
-                # Add seed if chunk-specific and not already present
+                # Force a unique seed for this replicate
                 if neut_engine in ('discoal','msms'):
                     seed_val_n = seeds_for_chunks_n[chunk_idx] if chunk_idx is not None and chunk_idx < len(seeds_for_chunks_n) else None
-                    if seed_val_n is not None and '-seed' not in toks_loc:
+                    # Remove any pre-existing -seed to avoid duplicates
+                    if '-seed' in toks_loc:
+                        try:
+                            idxs = [i for i,t in enumerate(toks_loc) if t=='-seed']
+                            for idx in reversed(idxs):
+                                del toks_loc[idx:idx+2]
+                        except Exception:
+                            pass
+                    if seed_val_n is not None:
                         toks_loc.extend(['-seed', str(seed_val_n)])
                 try:
                     rloc = subprocess.run(toks_loc, capture_output=True, text=True, check=True)
@@ -2172,8 +2144,7 @@ def main():
                     sys.stderr.write(f"# ERROR: failed to write neutral output {neut_out_path}: {e}\n")
             if neut_err_txt:
                 sys.stderr.write(neut_err_txt)
-        # Write separate SFS file if requested
-    # SFS already written earlier under new naming; do not duplicate
+        # SFS already written earlier under new naming; do not duplicate
 
 if __name__ == "__main__":
     main()
