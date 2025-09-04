@@ -3,8 +3,10 @@ import stdpopsim as sps
 import subprocess
 
 species = "Homo sapiens"
-sample_individuals = 100
-replicates = 1_000
+train_sample_individuals = 100
+train_replicates = 1_000
+sfs_sample_individuals = 10_000
+sfs_replicates = 1_000
 sel_2Ns = 500
 
 window = 1000
@@ -15,7 +17,7 @@ epochs = 10
 engine = "msms"
 
 
-def run_simulation(engine,species_id,model_id,pop_order,sample_individuals,window,ips,iws,chromosome,replicates,sfs=True,sel_2Ns=None):
+def run_simulation(engine,species_id,model_id,pop_order,train_sample_individuals,window,ips,iws,chromosome,train_replicates,sel_2Ns):
     # build target run directory: current_path/data/species_folder_name/model_id/population/chromosome
     out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
     os.makedirs(out_dir, exist_ok=True)
@@ -25,35 +27,49 @@ def run_simulation(engine,species_id,model_id,pop_order,sample_individuals,windo
         "--species-id", str(species_id),
         "--model-id", str(model_id),
         "--pop-order", str(pop_order),
-        "--sample-individuals", str(sample_individuals),
-        "--target-snps", str(int(window + ((ips/2) * iws))),
+        "--sample-individuals", str(train_sample_individuals),
+        "--target-snps", str(int(window + ((ips/2) * iws)*1.1)),
         "--chromosome", str(chromosome),
-        "--replicates", str(replicates),
+        "--replicates", str(train_replicates),
         "--output", "sweep.ms",
         "--sweep-pos", "0.5",
         "--sel-2Ns", str(sel_2Ns),
         "--threads", str(os.cpu_count()),
         "--target-snps-tol", "0.1",
         "--paired-neutral",
-        "--neutral-output", "neutral.ms"
-        ]
-
-    if sfs:
-        args += [
-            "--sfs",
-            "--sfs-normalized"
-        ]
-    args += [
+        "--neutral-output", "neutral.ms",
         "--progress"
-    ]
-
-    #print(subprocess.list2cmdline(args))
-    #exit()
+        ]
+    
     # run inside the target directory
     try:
         subprocess.run(args, cwd=out_dir, check=True)
     except subprocess.CalledProcessError as e:
         print(f"Simulation failed in {out_dir}: {e}")
+
+def get_sfs(engine,species_id,model_id,pop_order,sfs_sample_individuals,chromosome,sfs_replicates,sel_2Ns=None):
+    # build target run directory: current_path/data/species_folder_name/model_id/population/chromosome
+    out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
+    os.makedirs(out_dir, exist_ok=True)
+    args = [
+        "simulator.py",
+        "--engine", str(engine),
+        "--species-id", str(species_id),
+        "--model-id", str(model_id),
+        "--pop-order", str(pop_order),
+        "--sample-individuals", str(sfs_sample_individuals),
+        "--chromosome", str(chromosome),
+        "--replicates", str(sfs_replicates),
+        "--sfs",
+        "--threads", str(os.cpu_count()),
+        ]
+    
+    # run inside the target directory
+    try:
+        subprocess.run(args, cwd=out_dir, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Simulation failed in {out_dir}: {e}")
+    
 
 def get_info(model_id,pop_order,chromosome):
     out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
@@ -144,7 +160,7 @@ for model_id, populations in demographic_models.items():
     for population in populations:
         for chromosome in chromosomes:
             #for engine in ["msms", "dicoal"]:
-            run_simulation(engine, species_id, model_id, population, sample_individuals, window, ips, iws, chromosome, replicates, sel_2Ns=sel_2Ns)
+            run_simulation(engine, species_id, model_id, population, train_sample_individuals, window, ips, iws, chromosome, train_replicates, sel_2Ns)
             params, selection = get_info(model_id, population, chromosome)
             for type_ in ["sweep","neutral"]:
                 ms2bin(model_id, population, window, ips, iws, chromosome, type_, selection["sweep_bp"],params["length"])

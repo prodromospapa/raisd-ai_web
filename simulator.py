@@ -556,7 +556,14 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
             safety = 1.15  # bias upward so realized S more likely >= target
             length = int(math.ceil(min_snps / (theta_factor * H) * safety))
         else:
-            raise SystemExit('ERROR: Provide --length or --min-snps.')
+            # New fallback: use full chromosome length if chromosome specified
+            if chr_name and chosen_contig is not None and hasattr(chosen_contig, 'length'):
+                try:
+                    length = int(getattr(chosen_contig, 'length'))
+                except Exception:
+                    raise SystemExit('ERROR: Failed to obtain chromosome length; provide --length or --target-snps.')
+            else:
+                raise SystemExit('ERROR: Provide --length or --target-snps (or specify chromosome for automatic full length).')
 
     graph_order = [d.name for d in graph.demes]
     name_to_hap_all = {n: (ploidy * individual_counts[user_order.index(n)]) for n in user_order}
@@ -683,7 +690,8 @@ def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
         elif chr_name and chosen_contig is not None:
             length = int(getattr(chosen_contig,'length'))
         else:
-            raise SystemExit('ERROR: Provide --length or --min-snps for engine=ms/msms.')
+            # New fallback: if chromosome specified but length not retrievable -> error message adjusted
+            raise SystemExit('ERROR: Provide --length or --target-snps (or specify valid chromosome) for engine=ms/msms.')
 
     hap_counts_input_order = [ploidy * c for c in individual_counts]
     name_to_hap = {n: hap_counts_input_order[i] for i,n in enumerate(user_order)}
@@ -798,7 +806,7 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
         elif chr_name and chosen_contig is not None:
             length = int(getattr(chosen_contig,'length'))
         else:
-            raise SystemExit('ERROR: Provide --length or --min-snps for engine=msms.')
+            raise SystemExit('ERROR: Provide --length or --target-snps (or specify chromosome) for engine=msms.')
 
     hap_counts_input_order = [ploidy * c for c in individual_counts]
     name_to_hap = {n: hap_counts_input_order[i] for i,n in enumerate(user_order)}
@@ -958,7 +966,7 @@ def parse_args():
     pn = ap.add_argument_group('Paired neutral baseline')
     pn.add_argument('--paired-neutral', action='store_true', help='Also run a neutral simulation with identical parameters (selection removed).')
     pn.add_argument('--neutral-engine', choices=['discoal','ms','msms'], help='Engine to use for neutral run (default: same as --engine).')
-    pn.add_argument('--neutral-output', dest='neutral_out', help='Neutral output path. Default: main output name with _neutral before extension.')
+    pn.add_argument('--neutral-output', dest='neutral_out', help='Neutral output path. Default: main output name with _neutral before extension. If provided together with --sfs and no --output, no neutral ms/vcf file is written; only a neutral SFS is produced using this as basename.')
 
     gd = ap.add_argument_group('Demography')
     gd.add_argument('--disable-growth-discretization', dest='no_en_ladder', action='store_true', help='Disable exponential growth discretization.')
@@ -1017,6 +1025,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # Track whether user explicitly provided --output (before we potentially assign a default)
+    setattr(args, '_user_out_provided', args.out is not None and args.out != '')
     user_order = [d.strip() for d in args.demes.split(',') if d.strip()]
 
     # Automatic primary seed (used for reproducibility and optionally neutral run)
@@ -1090,18 +1100,26 @@ def main():
 
     # sweep flag validation (engine specific)
     if engine == 'discoal':
-        # Only enforce if user attempted selection
-        if any(getattr(args, n) is not None for n in ('sweep_time','a','x')):
+        # Treat as selection only if user supplied at least one of the sweep arguments.
+        user_attempted_selection = any(getattr(args, n) is not None for n in ('sweep_time','a','x'))
+        if user_attempted_selection:
             if args.sweep_time is None or args.a is None or args.x is None:
                 sys.exit('ERROR: discoal sweep requires --sweep-time, --sel-2Ns, and --sweep-pos.')
             if args.sweep_time < 0:
                 sys.exit('ERROR: --sweep-time must be >= 0.')
+        else:
+            sys.stderr.write('# INFO: No sweep parameters supplied; running neutral discoal simulation.\n')
     elif engine == 'msms':
-        if any(getattr(args, n) is not None for n in ('fix_time','a','x')):
+        # Because fix_time has a default (0.0), do not treat its mere presence as a selection attempt.
+        user_provided_fix = any(a.startswith('--fixation-time') for a in sys.argv[1:])
+        user_attempted_selection = (args.a is not None) or (args.x is not None) or user_provided_fix
+        if user_attempted_selection:
             if args.a is None or args.x is None:
                 sys.exit('ERROR: msms sweep requires both --sel-2Ns and --sweep-pos.')
             if args.fix_time is not None and args.fix_time < 0:
                 sys.exit('ERROR: --fixation-time must be >= 0 (time back in 4N units).')
+        else:
+            sys.stderr.write('# INFO: No sweep parameters supplied; running neutral msms simulation.\n')
 
     # Adaptive target-S segregating sites refinement if user gave --target-snps without explicit --length
     def _pilot_build(engine_name, length_val, reps_override=1, min_snps_forward=None):
@@ -1574,9 +1592,17 @@ def main():
             sys.stderr.write(f"# ERROR: failed to write SFS file {sfs_path}: {e}\n")
             if not args.out or args.out == '-':
                 sys.stdout.write(sfs_text)
+    # Decide if we should suppress primary output (SFS-only scenario)
+    write_primary_output = True
+    if (not getattr(args, '_user_out_provided', False)
+        and args.sfs
+        and isinstance(args.sfs, str)
+        and args.sfs not in (True, 'True')):
+        # User supplied a custom SFS filename but no --output: treat as SFS-only request.
+        write_primary_output = False
+        setattr(args, '_suppress_primary_output', True)
     # Handle primary output: if args.out is None -> write file with default stem; if '-' -> stdout
-    if args.out is None:
-        # build file name according to format
+    if args.out is None and write_primary_output:
         fmt_ext = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
         ext = fmt_ext.get(args.format, '.ms')
         args.out = default_stem + ext
@@ -1588,7 +1614,7 @@ def main():
         pass
     if concatenated_stderr:
         sys.stderr.write(concatenated_stderr)
-    if args.out and args.out != '-':
+    if write_primary_output and args.out and args.out != '-':
         # Normalize output filename extension based on requested format if user omitted one.
         ext_map = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
         desired_ext = ext_map.get(args.format, '')
@@ -1971,7 +1997,9 @@ def main():
                 if r[3]:
                     sys.stderr.write(f"# ERROR: neutral replicate returned code {r[3]} (engine={neut_engine}).\n")
             neut_out_path = getattr(args,'neutral_out', None)
-            if neut_out_path is None and args.out and args.out != '-':
+            # Track whether user explicitly supplied --neutral-output (vs derived from main output)
+            user_specified_neut = getattr(args, 'neutral_out', None) is not None
+            if neut_out_path is None and getattr(args, '_user_out_provided', False) and args.out and args.out != '-':
                 main_out = args.out
                 if main_out.endswith('.vcf.gz'):
                     root = main_out[:-7]; ext = '.vcf.gz'
@@ -1994,6 +2022,37 @@ def main():
                                 neut_out_path = neut_out_path[:-len(kext)]
                                 break
                         neut_out_path = neut_out_path + desired_ext
+            # New behavior: if user only wants SFS (no primary --output provided) and explicitly set --neutral-output,
+            # skip writing the neutral ms/vcf file; still compute neutral SFS using the provided path as basename.
+            skip_neut_file = (not getattr(args, '_user_out_provided', False)) and user_specified_neut and getattr(args, 'sfs', False)
+            if skip_neut_file:
+                # We'll still compute SFS below using neut_out_txt; adjust root for naming
+                if neut_out_path:
+                    neut_root = neut_out_path
+                    if neut_root.endswith('.vcf.gz'):
+                        neut_root = neut_root[:-7]
+                    elif neut_root.endswith('.ms.gz'):
+                        neut_root = neut_root[:-6]
+                    else:
+                        # remove single extension (e.g. .ms/.vcf/.bcf) if present
+                        base_root, base_ext = os.path.splitext(neut_root)
+                        if base_ext in ('.ms', '.vcf', '.bcf'):
+                            neut_root = base_root
+                else:
+                    neut_root = 'neutral'
+                sys.stderr.write('# INFO: skipping neutral output file (no --output provided); writing only neutral SFS.\n')
+                try:
+                    header_nsfs, lines_nsfs = compute_sfs_fast(neut_out_txt, normalized=args.sfs_normalized, mode=args.sfs_mode)
+                    neut_sfs_path = neut_root + '.sfs'
+                    nsfs_text = header_nsfs + '\n' + '\n'.join(lines_nsfs) + '\n'
+                    with open(neut_sfs_path, 'w') as fns:
+                        fns.write('# SFS output (neutral paired)\n')
+                        fns.write('# normalized=' + str(args.sfs_normalized) + ' mode=' + args.sfs_mode + '\n')
+                        fns.write(nsfs_text)
+                    sys.stderr.write(f"# INFO: wrote neutral SFS to {neut_sfs_path}\n")
+                except Exception as e:
+                    sys.stderr.write(f"# ERROR: failed to compute/write neutral SFS: {e}\n")
+                neut_out_path = None  # prevent file write path block below
             if neut_out_path and neut_out_path != '-':
                 try:
                     if fmt.startswith('vcf'):
