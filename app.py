@@ -10,6 +10,7 @@ from functools import lru_cache
 from datetime import datetime
 import glob
 import gzip
+import re
 
 import numpy as np
 import pandas as pd
@@ -232,10 +233,39 @@ ANNOTATION_DIR_TMPL = os.path.join(DATA_DIR, "{species}", "annotation", "{chr}.t
 
 @lru_cache(maxsize=64)
 def _load_annotation(species: str, chromosome: str) -> pd.DataFrame:
-    path = ANNOTATION_DIR_TMPL.format(species=species, chr=str(chromosome))
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Annotation file not found: {path}")
-    df = pd.read_csv(path, sep="\t", dtype={"chromosome": str})
+    # Accept a few common species folder name variants so callers may pass
+    # either 'Homo sapiens' or 'Homo_sapiens'. Try the provided species
+    # value first, then fall back to underscore/space variants.
+    candidates = []
+    s = str(species or '')
+    candidates.append(s)
+    # replace spaces with underscores and vice-versa
+    if ' ' in s:
+        candidates.append(s.replace(' ', '_'))
+    if '_' in s:
+        candidates.append(s.replace('_', ' '))
+    # also try a collapsed-underscore form (remove duplicate underscores)
+    candidates.append(s.replace('  ', ' ').replace('__', '_'))
+    # normalize case-preserving duplicates removed
+    seen = set()
+    tried_paths = []
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        path = ANNOTATION_DIR_TMPL.format(species=cand, chr=str(chromosome))
+        tried_paths.append(path)
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path, sep="\t", dtype={"chromosome": str})
+                app.logger.info(f"Loaded annotation file: {path}")
+            except Exception as read_e:
+                app.logger.exception(f"Failed to read annotation file {path}: {read_e}")
+                raise
+            break
+    else:
+        app.logger.warning(f"_load_annotation: no annotation file found for species variants {candidates!r} chromosome={chromosome}. Tried: {tried_paths}")
+        raise FileNotFoundError(f"Annotation file not found. Tried: {', '.join(tried_paths)}")
 
     def _first_non_null(series):
         for v in series:
@@ -337,6 +367,9 @@ DISPLAY_HEADER = [
     r"$sweep_{TR}$",
 ]
 
+# UI requirement: only expose these metrics in the dropdown (plots for others may still be generated internally)
+EXPOSED_METRICS = {r"$\mu$", r"$sweep_{TR}$"}
+
 def read_raisd_report(filename: str) -> pd.DataFrame:
     with open(filename, 'r') as f:
         content = f.read()
@@ -370,21 +403,6 @@ def _sanitize_metric_name(m: str) -> str:
     s = re.sub(r'_+', '_', s).strip('_')
     return s or 'metric'
 
-def plot_metric(df: pd.DataFrame, metric: str, out_png: str):
-    plt.figure(figsize=(10, 6))
-    if metric not in df.columns:
-        plt.text(0.5, 0.5, f'No data for {metric}', ha='center', va='center')
-    else:
-        plt.plot(df.index, df[metric], label=metric)
-        plt.xlabel('Position')
-        plt.ylabel(metric)
-        plt.title(metric)
-        plt.legend()
-        plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-
 def plot_metric_bytes(df: pd.DataFrame, metric: str, xmin: Optional[float] = None, xmax: Optional[float] = None) -> bytes:
     """Render a single-metric plot to PNG bytes; optional x-range can be supplied."""
     plt.figure(figsize=(10, 6))
@@ -402,6 +420,14 @@ def plot_metric_bytes(df: pd.DataFrame, metric: str, xmin: Optional[float] = Non
                 lo = xmin if xmin is not None else df.index.min()
                 hi = xmax if xmax is not None else df.index.max()
                 plt.xlim(lo, hi)
+            # Default y-axis range for sweep_TR metric should be 0..1
+            try:
+                # Compare sanitized names so either raw LaTeX header or sanitized forms match
+                if _sanitize_metric_name(metric) == _sanitize_metric_name(r"$sweep_{TR}$"):
+                    plt.ylim(0, 1)
+            except Exception:
+                # If anything goes wrong, don't prevent plotting
+                pass
         plt.tight_layout()
         buf = BytesIO()
         plt.savefig(buf, dpi=150, format='png')
@@ -599,14 +625,8 @@ def runs_report_csv(run_id):
     csv_data = buf.getvalue()
     return Response(csv_data, mimetype='text/csv', headers={'Content-Disposition': 'attachment; filename=RAiSD_Report.csv'})
 
-# Expected plots (we wait for all of them)
-def _expected_plot_filenames():
-    return [f"plot_{_sanitize_metric_name(h)}.png" for h in DISPLAY_HEADER]
-
-def _plots_exist(run_dir: str) -> bool:
-    for fn in _expected_plot_filenames():
-        if not os.path.exists(os.path.join(run_dir, fn)):
-            return False
+# Static PNG plots removed; readiness hinges solely on report presence
+def _plots_exist(run_dir: str) -> bool:  # backward compatibility shim
     return True
 
 # ------------------------------ Pipeline ------------------------------
@@ -744,6 +764,13 @@ def run_raisd(run_dir: str, model_path: str, vcf_path: str, chromosome: int, gri
             "stdout (tail):\n" + "\n".join(std_tail) + "\n\n"
             "stderr (tail):\n" + "\n".join(err_tail)
         )
+    # Successful run: remove grid directory to save space
+    try:
+        if os.path.isdir(grid_dir):
+            shutil.rmtree(grid_dir, ignore_errors=True)
+            append_log(run_dir, f"Removed grid directory: {RAISD_GRIDDIR}")
+    except Exception as ce:
+        append_log(run_dir, f"Warning: failed to remove grid directory {RAISD_GRIDDIR}: {ce}")
     return report_path
 
 # ------------------------------- Routes -------------------------------
@@ -764,6 +791,7 @@ def analyze():
     if not species:
         flash("Species is required.")
         return redirect(url_for('index'))
+    user_chrom_input = chromosome  # keep original text
     try:
         chromosome = int(chromosome)
     except Exception:
@@ -805,6 +833,22 @@ def analyze():
         vcf_path = os.path.join(run_dir, filename)
         append_log(run_dir, f"Using staged upload: {filename}")
         touch_run(run_id)
+        # Ensure minimal meta exists early so the UI can read species/chromosome
+        try:
+            meta_path = os.path.join(run_dir, 'result_meta.json')
+            meta_early = {
+                'run_id': run_id,
+                'species': species,
+                'chromosome': chromosome,
+                'grid': grid_str if isinstance(grid_str, str) else str(grid_str),
+                'uploaded_name': filename,
+                'plots_ready': False,
+                'plots': []
+            }
+            with open(meta_path, 'w', encoding='utf-8') as mf:
+                mf.write(json.dumps(meta_early))
+        except Exception:
+            pass
     else:
         run_id = uuid.uuid4().hex[:12]
         run_dir = os.path.join(RUNS_DIR, run_id)
@@ -815,9 +859,83 @@ def analyze():
             file.save(vcf_path)
             append_log(run_dir, f"Uploaded file saved: {filename} ({os.path.getsize(vcf_path)} bytes)")
             touch_run(run_id)
+            # Write minimal meta immediately so page loads have metadata available
+            try:
+                meta_path = os.path.join(run_dir, 'result_meta.json')
+                meta_early = {
+                    'run_id': run_id,
+                    'species': species,
+                    'chromosome': chromosome,
+                    'grid': grid_str if isinstance(grid_str, str) else str(grid_str),
+                    'uploaded_name': filename,
+                    'plots_ready': False,
+                    'plots': []
+                }
+                with open(meta_path, 'w', encoding='utf-8') as mf:
+                    mf.write(json.dumps(meta_early))
+            except Exception:
+                pass
         else:
             flash("No file available for analysis.")
             return redirect(url_for('index'))
+
+    # --------------------------------------------------------------
+    # Chromosome inference / validation from VCF header
+    # If the uploaded VCF header lists contigs and the user-provided chromosome
+    # (integer) is not directly represented, attempt smart matching:
+    #  - Accept exact numeric match
+    #  - Accept 'chrN' vs 'N' differences
+    #  - If single contig present, override chromosome with that contig
+    #  - If cannot reconcile, show an error listing available contigs
+    # --------------------------------------------------------------
+    try:
+        contigs = []
+        try:
+            vf_tmp = pysam.VariantFile(vcf_path)
+            contigs = [str(k) for k in vf_tmp.header.contigs.keys()]
+        except Exception:
+            contigs = []
+        if contigs:
+            contig_set = set(contigs)
+            numeric_str = str(chromosome)
+            chr_pref = f"chr{numeric_str}"
+            chosen_contig = None
+            if numeric_str in contig_set:
+                chosen_contig = numeric_str
+            elif chr_pref in contig_set:
+                chosen_contig = chr_pref
+            else:
+                # Attempt to find a single distinct contig if only one present
+                if len(contigs) == 1:
+                    chosen_contig = contigs[0]
+                    append_log(run_dir, f"Auto-overriding chromosome {chromosome} -> {chosen_contig} (single contig in VCF)")
+                else:
+                    # Try to strip 'chr' prefixes and compare
+                    stripped_map = {c[3:]: c for c in contigs if isinstance(c, str) and c.lower().startswith('chr') and len(c) > 3}
+                    if numeric_str in stripped_map:
+                        chosen_contig = stripped_map[numeric_str]
+            if chosen_contig is None:
+                # Could not reconcile; present helpful error if mismatch likely
+                # (Only if user selection not among available options and not single contig case already handled)
+                if str(chromosome) not in contig_set and f"chr{chromosome}" not in contig_set:
+                    shown = [str(x) for x in contigs[:20]]
+                    flash(f"Selected chromosome {chromosome} not found in VCF. Available: {', '.join(shown)}{'...' if len(contigs)>20 else ''}")
+                    # Clean up created run_dir so user can retry without clutter
+                    try:
+                        append_log(run_dir, "Removing run directory due to chromosome mismatch")
+                        shutil.rmtree(run_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                    return redirect(url_for('index'))
+            else:
+                # Normalize chromosome directory name (drop leading 'chr' if present) for model path usage later
+                chosen_contig_str = str(chosen_contig)
+                model_chr = re.sub(r'^chr', '', chosen_contig_str, flags=re.IGNORECASE)
+                if model_chr.isdigit():
+                    chromosome = int(model_chr)
+                append_log(run_dir, f"Chromosome validated/inferred: user={user_chrom_input} -> using_contig={chosen_contig} -> model_dir_component={chromosome}")
+    except Exception as ce:
+        append_log(run_dir, f"Chromosome inference warning: {ce}")
 
     def _analyze_worker(run_dir, filename, vcf_path, species, chromosome, grid):
         meta = {
@@ -906,52 +1024,24 @@ def analyze():
             report_path = run_raisd(run_dir, model_path, vcf_path, chromosome, grid=grid, ra_exe=ra_exe)
             df = read_raisd_report(report_path)
 
-            # Generate one plot per metric (NO separate sweep_TR summary plot)
-            plots = []
-            for h in DISPLAY_HEADER:
-                short = _sanitize_metric_name(h)
-                fname = f"plot_{short}.png"
-                plot_path = os.path.join(run_dir, fname)
-                try:
-                    plot_metric(df, h, plot_path)
-                except Exception:
-                    # minimal placeholder
-                    try:
-                        plt.figure(figsize=(6, 3))
-                        plt.text(0.5, 0.5, 'Plot failed', ha='center', va='center')
-                        plt.tight_layout()
-                        plt.savefig(plot_path, dpi=100)
-                        plt.close()
-                    except Exception:
-                        pass
-                plots.append({'metric': h, 'filename': fname})
+            # Do NOT generate static plot PNGs; we only serve dynamic data via /metric_data
+            plots = [{'metric': h} for h in DISPLAY_HEADER if h in EXPOSED_METRICS]
 
             # URLs for template
             try:
                 with app.app_context():
                     meta['report_url'] = url_for('runs_file', run_id=meta['run_id'], filename=RAISD_REPORT)
-                    meta['plots'] = []
-                    for p in plots:
-                        fname = p.get('filename')
-                        if not fname:
-                            continue
-                        meta['plots'].append({
-                            'metric': p.get('metric'),
-                            'filename': fname,
-                            'url': url_for('runs_file', run_id=meta['run_id'], filename=fname)
-                        })
-                    # default selection: put sweep_TR (sanitized) first if present
-                    preferred = _sanitize_metric_name(r"$\mu_{var}^{sweep_{TR}}$")
-                    i = next((k for k, pl in enumerate(meta['plots']) if _sanitize_metric_name(pl['metric']) == preferred), 0)
-                    if i != 0:
-                        meta['plots'].insert(0, meta['plots'].pop(i))
-                    meta['plot_url'] = meta['plots'][0]['url'] if meta['plots'] else None
+                    # Build metric list for UI (dynamic plotting only)
+                    preference_order = [r"$\mu$", r"$sweep_{TR}$"]
+                    meta['plots'] = [{'metric': p['metric']} for p in plots]
+                    meta['plots'].sort(key=lambda pl: (preference_order.index(pl['metric']) if pl['metric'] in preference_order else 999, pl['metric']))
+                    meta['plot_url'] = None  # no static image
             except Exception:
                 meta['report_url'] = None
 
-            # mark plots ready
+            # mark plots ready (logical readiness of dynamic metrics)
             meta['plots_ready'] = True
-            append_log(run_dir, f"Generated plots and parsed report: {RAISD_REPORT}")
+            append_log(run_dir, f"Parsed report (no static plots created): {RAISD_REPORT}")
 
             # clean big temporaries
             try:
@@ -1028,7 +1118,7 @@ def runs_tail(run_id):
             lines = f"(failed to read log: {e})"
     else:
         lines = '(no log available yet)'
-    done = os.path.exists(os.path.join(run_dir, RAISD_REPORT)) and _plots_exist(run_dir)
+    done = os.path.exists(os.path.join(run_dir, RAISD_REPORT))
     return json.dumps({'lines': lines, 'done': bool(done)}), 200, {'Content-Type': 'application/json'}
 
 @app.route('/runs/<run_id>/cleanup', methods=['POST'])
@@ -1053,7 +1143,7 @@ def _ready_or_error(run_dir: str) -> Tuple[bool, dict]:
                 meta = json.load(mf)
         except Exception:
             meta = {}
-    ready = (os.path.exists(report_path) and (_plots_exist(run_dir) or meta.get('plots_ready')))
+    ready = (os.path.exists(report_path) and (meta.get('plots_ready') or True))
     if ready or meta.get('error'):
         return True, meta
     return False, meta
@@ -1072,7 +1162,7 @@ def runs_final(run_id):
 
     if request.args.get('nowait', '0') == '1':
         report_path = os.path.join(run_dir, RAISD_REPORT)
-        if not (os.path.exists(report_path) and _plots_exist(run_dir)):
+        if not os.path.exists(report_path):
             return json.dumps({'status': 'running'}), 202, {'Content-Type': 'application/json'}
 
     t0 = time.time()
@@ -1278,17 +1368,12 @@ def runs_final(run_id):
     # Build/synthesize plots list
     plots = meta.get('plots') or []
     if not plots:
-        # synthesize from files
-        try:
-            for fn in sorted(os.listdir(run_dir)):
-                if fn.startswith('plot_') and fn.lower().endswith('.png'):
-                    plots.append({
-                        'metric': fn.replace('plot_', '').replace('.png', ''),
-                        'filename': fn,
-                        'url': url_for('runs_file', run_id=run_id, filename=fn)
-                    })
-        except Exception:
-            pass
+        # fallback: infer exposed metrics directly
+        plots = [{'metric': m} for m in DISPLAY_HEADER if m in EXPOSED_METRICS]
+
+    # Apply exposure filter if metrics present in original math form; attempt to map sanitized names back.
+    # Filter to exposed metrics only
+    plots = [p for p in plots if p.get('metric') in EXPOSED_METRICS]
 
     # Selection via query param ?plot=
     desired = (request.args.get('plot') or '').strip()
@@ -1308,7 +1393,7 @@ def runs_final(run_id):
     if sel_idx is not None and sel_idx != 0:
         plots.insert(0, plots.pop(sel_idx))
 
-    plot_url = plots[0]['url'] if plots else None
+    plot_url = None  # no static image
 
     if meta.get('error') and not os.path.exists(report_path):
         return json.dumps({'error': meta.get('error')}), 500, {'Content-Type': 'application/json'}
@@ -1416,11 +1501,28 @@ def genes_endpoint():
     try:
         # Load all hits first to derive available biotypes, then filter locally
         all_hits = _genes_in_window(species, chromosome, start_i, end_i, biotype=None)
-        available_biotypes = sorted(set(str(b) for b in all_hits['biotype'] if pd.notna(b)))
+        # Available biotypes for UI (as native strings)
+        available_biotypes = sorted({str(b) for b in all_hits['biotype'] if pd.notna(b)})
         if biotypes:
-            hits = all_hits[all_hits['biotype'].isin(biotypes)].copy()
+            # Robust membership test: compare normalized strings to handle numpy.str_ etc.
+            biotypes_norm = [str(b) for b in biotypes]
+            hits = all_hits[all_hits['biotype'].astype(str).isin(biotypes_norm)].copy()
         else:
             hits = all_hits
+        # Ensure JSON-serializable native Python types (int/str/None) for downstream json.dumps
+        # Convert numeric columns to Python ints and replace NaN with None for safety
+        if not hits.empty:
+            # Force integer types for start/end/overlap_bp where possible
+            for col in ('start', 'end', 'overlap_bp'):
+                if col in hits.columns:
+                    # convert via astype(int) may fail on NaN; coerce then convert
+                    hits[col] = hits[col].where(pd.notna(hits[col]), None)
+                    hits[col] = hits[col].apply(lambda v: int(v) if v is not None else None)
+            # Ensure label and biotype are plain Python strings or None
+            for col in ('label', 'biotype'):
+                if col in hits.columns:
+                    hits[col] = hits[col].where(pd.notna(hits[col]), None)
+                    hits[col] = hits[col].apply(lambda v: str(v) if v is not None else None)
     except FileNotFoundError as e:
         return json.dumps({'error': str(e)}), 404, {'Content-Type': 'application/json'}
     except Exception as e:
@@ -1452,7 +1554,31 @@ def upload():
     file.save(vcf_path)
     append_log(run_dir, f"Staged upload saved: {fname} ({os.path.getsize(vcf_path)} bytes)")
     touch_run(run_id)
-    return json.dumps({'run_id': run_id, 'filename': fname}), 200, {'Content-Type': 'application/json'}
+    # Inspect VCF header contigs immediately and return them so the UI can react
+    contigs = []
+    suggested = None
+    try:
+        try:
+            vf = pysam.VariantFile(vcf_path)
+            contigs = [str(k) for k in vf.header.contigs.keys()]
+        except Exception:
+            contigs = []
+        if contigs:
+            if len(contigs) == 1:
+                suggested = contigs[0]
+            else:
+                # prefer plain numeric contig '1' over 'chr1' when present
+                if '1' in contigs:
+                    suggested = '1'
+                elif 'chr1' in contigs:
+                    suggested = 'chr1'
+    except Exception as e:
+        append_log(run_dir, f"Upload-time contig inspection failed: {e}")
+
+    payload = {'run_id': run_id, 'filename': fname, 'contigs': contigs}
+    if suggested:
+        payload['suggested_chromosome'] = suggested
+    return json.dumps(payload), 200, {'Content-Type': 'application/json'}
 
 if __name__ == '__main__':
     host = os.environ.get('HOST', '0.0.0.0')

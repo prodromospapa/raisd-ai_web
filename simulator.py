@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse, math, sys, subprocess, shlex, concurrent.futures, gzip, re
+import shutil, tempfile, binascii
 import os
 import stdpopsim as sps
 import demes
@@ -289,6 +290,52 @@ def ms_like_to_vcf(ms_text, length, chrom='chr1', ploidy=1):
             genos.append('|'.join(alleles))
         body_lines.append(f'{chrom}\t{p}\tsnp{vidx}\t{ref}\t{alt}\t.\tPASS\t.\tGT\t' + '\t'.join(genos))
     return '\n'.join(header + body_lines) + '\n'
+
+# ---------- compression helpers ----------
+
+def _write_bgzip_text(path: str, text: str):
+    """Write BGZF-compressed text suitable for bcftools/tabix indexing.
+
+    Strategy order:
+      1. Use external 'bgzip -c'.
+      2. Use pysam.tabix_compress (if pysam available).
+      3. Fail with clear error (no silent raw gzip fallback) to avoid unusable files.
+
+    After writing, verify BGZF header (FEXTRA flag + 'BC' subfield) else raise.
+    """
+    tmp_path = None
+    bgzip_exe = shutil.which('bgzip')
+    try:
+        with tempfile.NamedTemporaryFile('w', delete=False) as tf:
+            tf.write(text)
+            tmp_path = tf.name
+        if bgzip_exe:
+            with open(path, 'wb') as outfh:
+                proc = subprocess.run([bgzip_exe, '-c', tmp_path], stdout=outfh, stderr=subprocess.PIPE)
+            if proc.returncode != 0:
+                raise RuntimeError(f"bgzip failed: {proc.stderr.decode().strip()}")
+        else:
+            try:
+                import pysam  # type: ignore
+                # pysam.tabix_compress creates bgzip file; force overwrite
+                pysam.tabix_compress(tmp_path, path, force=True)
+            except Exception as e:
+                raise SystemExit('# ERROR: Cannot produce BGZF output (.vcf.gz). Install htslib bgzip or pysam. Details: ' + str(e))
+        # Verify BGZF: read first 18 bytes
+        with open(path, 'rb') as fh:
+            head = fh.read(200)
+        if len(head) < 18 or head[0:2] != b'\x1f\x8b' or head[2] != 0x08:
+            raise SystemExit('# ERROR: Output not gzip format for BGZF.')
+        flg = head[3]
+        if not (flg & 0x04):  # FEXTRA bit
+            raise SystemExit('# ERROR: gzip file missing FEXTRA; not BGZF (install bgzip).')
+        # BGZF extra subfield contains 'BC' marker; search in first 200 bytes
+        if b'BC' not in head:
+            raise SystemExit('# ERROR: gzip extra field lacks BGZF BC marker; indexing would fail.')
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.unlink(tmp_path)
+            except Exception: pass
 
 # ---------- SFS utilities ----------
 
@@ -1148,7 +1195,9 @@ def main():
             )
         return cmd, meta_local
 
-    if args.length is None and args.min_snps is not None:
+    # Adaptive target-S refinement involves executing pilot simulations. If --debug is set
+    # the user requested to only show the command without running anything, so skip.
+    if args.length is None and args.min_snps is not None and not args.debug:
         # Initial builder-derived length (using existing formula logic in builders)
         init_cmd, init_meta = _pilot_build(engine, None, reps_override=1, min_snps_forward=args.min_snps)
         candidate_len = init_meta['length']
@@ -1212,7 +1261,7 @@ def main():
             sys.stderr.write(f"# DEBUG: auto-adjust length {init_meta['length']} -> {refined_len} (target_snps={target_snps}, last_observed={last_obs})\n")
         args.length = refined_len
 
-    # build command + run (final, using possibly refined args.length)
+    # build command (final, using possibly refined args.length unless in debug mode which skips refinement)
     if engine == 'discoal':
         sim_cmd, meta = build_discoal_command(
             species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
@@ -1238,6 +1287,18 @@ def main():
             max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
             min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=None,
         )
+
+    # Debug-only mode: print just the raw simulator command (first non-comment line) and exit.
+    if args.debug:
+        raw_line = None
+        for ln in sim_cmd.splitlines():
+            if ln.strip().startswith(engine + ' '):
+                raw_line = ln.strip(); break
+        # Fallback: if not found, print entire built block
+        if raw_line is None:
+            raw_line = sim_cmd.strip()
+        sys.stdout.write(raw_line + ('\n' if not raw_line.endswith('\n') else ''))
+        return
 
     # ---------------- Simulation runner + enforcement helpers ----------------
     def _simulate_current_length(length_val, show_progress=True):
@@ -1693,6 +1754,21 @@ def main():
                     return None
                 return '# ' + prefix + ': ' + ', '.join(vals)
             meta_comment_lines = []
+            # Inject seedms file content (if produced by underlying simulator) as comment and remove the file.
+            if fmt.startswith('vcf'):
+                seed_file = 'seedms'
+                if os.path.isfile(seed_file):
+                    try:
+                        with open(seed_file,'r') as sf:
+                            seed_content = sf.read().strip().splitlines()
+                        # Remove file to honor user request not to keep it.
+                        try: os.remove(seed_file)
+                        except Exception: pass
+                        for idx,line in enumerate(seed_content):
+                            # Use safe header lines; convert to VCF meta format later (##)
+                            meta_comment_lines.append(f"# seedms_line{idx+1}: {line}")
+                    except Exception:
+                        pass
             for grp, keys in (('core', core_keys), ('params', param_keys), ('selection', sel_keys)):
                 ln = build_group_line(grp, keys)
                 if ln:
@@ -1707,8 +1783,7 @@ def main():
             vcf_lines = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
             vcf_text_final = '\n'.join(vcf_lines) + ('\n' if not vcf_lines[-1].endswith('\n') else '')
             if fmt == 'vcf.gz':
-                with gzip.open(args.out, 'wt') as f:
-                    f.write(vcf_text_final)
+                _write_bgzip_text(args.out, vcf_text_final)
             else:
                 with open(args.out, 'w') as f:
                     f.write(vcf_text_final)
@@ -2116,8 +2191,7 @@ def main():
                         vcf_lines_neut = vcf_lines_neut[:header_idx_neut] + vcf_meta_lines_neut + vcf_lines_neut[header_idx_neut:]
                         vcf_text_neut_final = '\n'.join(vcf_lines_neut) + ('\n' if not vcf_lines_neut[-1].endswith('\n') else '')
                         if fmt == 'vcf.gz':
-                            with gzip.open(neut_out_path, 'wt') as f2:
-                                f2.write(vcf_text_neut_final)  # type: ignore[arg-type]
+                            _write_bgzip_text(neut_out_path, vcf_text_neut_final)  # type: ignore[arg-type]
                         else:
                             with open(neut_out_path, 'w') as f2:
                                 f2.write(vcf_text_neut_final)

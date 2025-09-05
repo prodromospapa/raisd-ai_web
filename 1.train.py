@@ -1,6 +1,8 @@
 import os
 import stdpopsim as sps
 import subprocess
+from tqdm import tqdm
+import shutil
 
 species = "Homo sapiens"
 train_sample_individuals = 100
@@ -9,17 +11,43 @@ sfs_sample_individuals = 10_000
 sfs_replicates = 1_000
 sel_2Ns = 500
 
-window = 1000
+window = 500
 ips = 11 # odd
 iws = 10
-epochs = 10
+epochs = 3
+gpu = False
+
+threads = os.cpu_count()//2
 
 engine = "msms"
 
 
+def run_subprocess(args, cwd, desc):
+    """Run a subprocess, capture output, exit script on failure with detailed message."""
+    try:
+        return subprocess.run(
+            args,
+            cwd=cwd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(
+            f"\n===== SUBPROCESS ERROR: {desc} =====\n"
+            f"Command: {' '.join(args)}\n"
+            f"Return code: {e.returncode}\n"
+            f"STDOUT:\n{e.stdout or '(empty)'}\n"
+            f"STDERR:\n{e.stderr or '(empty)'}\n"
+            f"===================================\n"
+        )
+        raise SystemExit(1)
+
+
 def run_simulation(engine,species_id,model_id,pop_order,train_sample_individuals,window,ips,iws,chromosome,train_replicates,sel_2Ns):
-    # build target run directory: current_path/data/species_folder_name/model_id/population/chromosome
-    out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
+    # build target run directory: current_path/data_/species_folder_name/model_id/population/chromosome
+    out_dir = os.path.join(os.getcwd(), "data_", species_folder_name, str(model_id), str(pop_order), str(chromosome))
     os.makedirs(out_dir, exist_ok=True)
     args = [
         "simulator.py",
@@ -34,22 +62,20 @@ def run_simulation(engine,species_id,model_id,pop_order,train_sample_individuals
         "--output", "sweep.ms",
         "--sweep-pos", "0.5",
         "--sel-2Ns", str(sel_2Ns),
-        "--threads", str(os.cpu_count()),
+        "--threads", str(threads),
         "--target-snps-tol", "0.1",
         "--paired-neutral",
         "--neutral-output", "neutral.ms",
-        "--progress"
         ]
+    if gpu:
+        args.append("--gpu")
     
-    # run inside the target directory
-    try:
-        subprocess.run(args, cwd=out_dir, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Simulation failed in {out_dir}: {e}")
+    # run inside the target directory (exit on failure)
+    run_subprocess(args, out_dir, f"simulation {model_id}/{pop_order}/{chromosome}")
 
 def get_sfs(engine,species_id,model_id,pop_order,sfs_sample_individuals,chromosome,sfs_replicates,sel_2Ns=None):
-    # build target run directory: current_path/data/species_folder_name/model_id/population/chromosome
-    out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
+    # build target run directory: current_path/data_/species_folder_name/model_id/population/chromosome
+    out_dir = os.path.join(os.getcwd(), "data_", species_folder_name, str(model_id), str(pop_order), str(chromosome))
     os.makedirs(out_dir, exist_ok=True)
     args = [
         "simulator.py",
@@ -63,27 +89,32 @@ def get_sfs(engine,species_id,model_id,pop_order,sfs_sample_individuals,chromoso
         "--sfs",
         "--threads", str(os.cpu_count()),
         ]
-    
-    # run inside the target directory
-    try:
-        subprocess.run(args, cwd=out_dir, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Simulation failed in {out_dir}: {e}")
+
+    # run inside the target directory (exit on failure)
+    run_subprocess(args, out_dir, f"SFS {model_id}/{pop_order}/{chromosome}")
     
 
 def get_info(model_id,pop_order,chromosome):
-    out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
-    with open(f"{out_dir}/sweep.ms", 'r') as f:
-        for i in range(4):
-            line = f.readline()
-            if i == 2:
-                params = {k: __import__('ast').literal_eval(v.strip().capitalize() if v.strip().lower() in ('true','false') else v.strip()) for k, v in (item.split('=', 1) for item in line.replace("# params: ", "").strip().split(", ") if "=" in item)}
-            if i == 3:
-                selection = {k: __import__('ast').literal_eval(v.strip().capitalize() if v.strip().lower() in ('true','false') else v.strip()) for k, v in (item.split('=', 1) for item in line.replace("# selection: ", "").strip().split(", ") if "=" in item)}
+    out_dir = os.path.join(os.getcwd(), "data_", species_folder_name, str(model_id), str(pop_order), str(chromosome))
+    params = {}
+    selection = {}
+    try:
+        with open(f"{out_dir}/sweep.ms", 'r') as f:
+            for i in range(4):
+                line = f.readline()
+                if not line:
+                    break
+                if i == 2:
+                    params = {k: __import__('ast').literal_eval(v.strip().capitalize() if v.strip().lower() in ('true','false') else v.strip()) for k, v in (item.split('=', 1) for item in line.replace("# params: ", "").strip().split(", ") if "=" in item)}
+                if i == 3:
+                    selection = {k: __import__('ast').literal_eval(v.strip().capitalize() if v.strip().lower() in ('true','false') else v.strip()) for k, v in (item.split('=', 1) for item in line.replace("# selection: ", "").strip().split(", ") if "=" in item)}
+    except FileNotFoundError:
+        print(f"Info file not found: {out_dir}/sweep.ms")
+
     return params, selection
 
 def ms2bin(model_id,pop_order,window,ips,iws,chromosome,type_,sweep_pos,length):
-    out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
+    out_dir = os.path.join(os.getcwd(), "data_", species_folder_name, str(model_id), str(pop_order), str(chromosome))
     args = [
         "RAiSD-AI",
         "-n", "bin",
@@ -100,16 +131,18 @@ def ms2bin(model_id,pop_order,window,ips,iws,chromosome,type_,sweep_pos,length):
         "-f"
     ]
 
-    try:
-        subprocess.run(args, cwd=out_dir, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Simulation failed in {out_dir}: {e}")
-    #os.remove(f"{out_dir}/{type_}.ms")
-    #os.remove(f"{out_dir}/RAiSD_Info.bin.{type_}TR")
+    run_subprocess(args, out_dir, f"RAiSD IMG-GEN {model_id}/{pop_order}/{chromosome}/{type_}")
+    # remove temporary files only after success
+    tmp_ms = f"{out_dir}/{type_}.ms"
+    if os.path.exists(tmp_ms):
+        os.remove(tmp_ms)
+    info_file = f"{out_dir}/RAiSD_Info.bin.{type_}TR"
+    if os.path.exists(info_file):
+        os.remove(info_file)
 
 
 def train_model(model_id, pop_order, chromosome, epochs):
-    out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
+    out_dir = os.path.join(os.getcwd(), "data_", species_folder_name, str(model_id), str(pop_order), str(chromosome))
     args = [
         "RAiSD-AI",
         "-n", "model",
@@ -118,10 +151,7 @@ def train_model(model_id, pop_order, chromosome, epochs):
         "-e", str(epochs),
         "-arc", "FASTER-NN"
     ]
-    try:
-        subprocess.run(args, cwd=out_dir, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Simulation failed in {out_dir}: {e}")
+    run_subprocess(args, out_dir, f"model training {model_id}/{pop_order}/{chromosome}")
 
 species_dict = {sp.name: sp.id for sp in sps.all_species()}
 if species in species_dict.values():
@@ -129,7 +159,7 @@ if species in species_dict.values():
 else:
     species_full_name = species
 species_folder_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in str(species_full_name)).strip().replace(" ", "_")
-os.makedirs(os.path.join("data", species_folder_name), exist_ok=True)
+os.makedirs(os.path.join("data_", species_folder_name), exist_ok=True)
 
 if species in species_dict.keys():
     species_id = species_dict[species]
@@ -140,32 +170,64 @@ else:
 
 species_std = sps.get_species(species_id)
 
-if not os.path.exists(f"data/{species_folder_name}/chromosomes.txt"):
+if not os.path.exists(f"data_/{species_folder_name}/chromosomes.txt"):
         chromosomes = [c.id for c in species_std.genome.chromosomes]
         remove_chr = input(f"Which of {chromosomes} to remove (comma-separated): ")
         remove_chr = [c.strip() for c in remove_chr.split(",") if c.strip()]
         chromosomes = [c for c in chromosomes if c not in remove_chr]
-        with open(f"data/{species_folder_name}/chromosomes.txt", 'w') as f:
+        with open(f"data_/{species_folder_name}/chromosomes.txt", 'w') as f:
             for chromosome in chromosomes:
                 f.write(chromosome+"\n")
 else:
-    with open(f"data/{species_folder_name}/chromosomes.txt", 'r') as f:
+    with open(f"data_/{species_folder_name}/chromosomes.txt", 'r') as f:
         chromosomes = [line.strip() for line in f]
 
 demographic_models = {
         m.id: [p.name for p in species_std.get_demographic_model(m.id).populations]
         for m in species_std.demographic_models}
 
-for model_id, populations in demographic_models.items():
-    for population in populations:
-        for chromosome in chromosomes:
-            #for engine in ["msms", "dicoal"]:
-            run_simulation(engine, species_id, model_id, population, train_sample_individuals, window, ips, iws, chromosome, train_replicates, sel_2Ns)
-            params, selection = get_info(model_id, population, chromosome)
-            for type_ in ["sweep","neutral"]:
-                ms2bin(model_id, population, window, ips, iws, chromosome, type_, selection["sweep_bp"],params["length"])
-            train_model(model_id, population, chromosome, epochs)
-            exit()
+# Progress accounting (models with varying population counts) -----------------
+total_tasks = sum(len(pops) * len(chromosomes) for pops in demographic_models.values())
 
-# RAiSD-AI -n test -mdl data/Homo_sapiens/OutOfAfricaExtendedNeandertalAdmixturePulse_3I21/YRI/1/RAiSD_Model.model -op SWP-SCN -I test.ms -L 10000000 -frm -G 300 -pci 1 1 -R
+# Count already completed tasks (model file exists)
+def _model_done(model_id, population, chromosome):
+    return os.path.exists(f"data_/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Model.model/model.pt")
+
+tasks_done = sum(
+    1
+    for model_id, pops in demographic_models.items()
+    for population in pops
+    for chromosome in chromosomes
+    if _model_done(model_id, population, chromosome)
+)
+
+with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as total_bar:
+    for model_id, populations in demographic_models.items():
+        for population in populations:
+            for chromosome in chromosomes:
+                if _model_done(model_id, population, chromosome):
+                    # already counted in initial; just continue
+                    continue
+                try:
+                    sweep_path = f"data_/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep.ms"
+                    if not os.path.exists(sweep_path):
+                        run_simulation(engine, species_id, model_id, population, train_sample_individuals, window, ips, iws, chromosome, train_replicates, sel_2Ns)
+
+                    params, selection = get_info(model_id, population, chromosome)
+                    for type_ in ["sweep", "neutral"]:
+                        img_info = f"data_/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Images.bin/{type_}TR"
+                        if not os.path.exists(img_info):
+                            sweep_bp = selection.get("sweep_bp")
+                            length = params.get("length")
+                            ms2bin(model_id, population, window, ips, iws, chromosome, type_, sweep_bp, length)
+
+                    train_model(model_id, population, chromosome, epochs)
+                    img_bin = f"data_/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Images.bin"
+                    if os.path.exists(img_bin):
+                        shutil.rmtree(img_bin)
+                finally:
+                    # Only advance when task just completed (not pre-counted)
+                    total_bar.update(1)
+
+# RAiSD-AI -n test -mdl data_/Homo_sapiens/OutOfAfricaExtendedNeandertalAdmixturePulse_3I21/YRI/1/RAiSD_Model.model -op SWP-SCN -I test.ms -L 10000000 -frm -G 300 -pci 1 1 -R
 # RAiSD-AI -n ms -f -op RSD-DEF -I test.ms -frm -G 300 -R -L 1000000
