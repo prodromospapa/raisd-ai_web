@@ -30,11 +30,16 @@ def reorder_put_first(order_list, first_name):
     if first_name not in order_list:
         raise SystemExit(f"ERROR: requested name '{first_name}' not in list {order_list}")
     return [first_name] + [d for d in order_list if d != first_name]
-
 def harmonic_number(n):
-    return sum(1.0/i for i in range(1, n+1)) if n > 0 else 0.0
+    try:
+        n_int = int(n)
+    except Exception:
+        return 0.0
+    if n_int <= 0:
+        return 0.0
+    return sum(1.0/i for i in range(1, n_int+1))
 
-# ---------- ms/discoal demography helpers ----------
+# ---------- ms/msms/scrm demography & subprocess helpers ----------
 
 def strip_I_block(ms_cmd):
     toks = ms_cmd.split()
@@ -50,6 +55,7 @@ def strip_I_block(ms_cmd):
     j = i + 2 + npop
     return ' '.join(toks[:i] + toks[j:])
 
+
 def strip_all_growth(ms_cmd):
     toks = ms_cmd.split()
     out = []
@@ -61,6 +67,7 @@ def strip_all_growth(ms_cmd):
         out.append(toks[i]); i += 1
     return ' '.join(out)
 
+
 def remap_indices_ms_1based(ms_cmd, mapping):
     toks = ms_cmd.split(); out = []; i = 0
     while i < len(toks):
@@ -70,33 +77,39 @@ def remap_indices_ms_1based(ms_cmd, mapping):
                 idx = int(float(toks[i+1]))
                 out += ['-n', str(mapping.get(idx, idx)), toks[i+2]]
                 i += 3; continue
-            except Exception: pass
+            except Exception:
+                pass
         if t == '-en' and i+3 < len(toks):
             try:
                 idx = int(float(toks[i+2]))
                 out += ['-en', toks[i+1], str(mapping.get(idx, idx)), toks[i+3]]
                 i += 4; continue
-            except Exception: pass
+            except Exception:
+                pass
         if t == '-m' and i+3 < len(toks):
             try:
                 ii = int(float(toks[i+1])); jj = int(float(toks[i+2]))
                 out += ['-m', str(mapping.get(ii, ii)), str(mapping.get(jj, jj)), toks[i+3]]
                 i += 4; continue
-            except Exception: pass
+            except Exception:
+                pass
         if t == '-em' and i+4 < len(toks):
             try:
                 ii = int(float(toks[i+2])); jj = int(float(toks[i+3]))
                 out += ['-em', toks[i+1], str(mapping.get(ii, ii)), str(mapping.get(jj, jj)), toks[i+4]]
                 i += 5; continue
-            except Exception: pass
+            except Exception:
+                pass
         if t == '-ej' and i+3 < len(toks):
             try:
                 ii = int(float(toks[i+2])); jj = int(float(toks[i+3]))
                 out += ['-ej', toks[i+1], str(mapping.get(ii, ii)), str(mapping.get(jj, jj))]
                 i += 4; continue
-            except Exception: pass
+            except Exception:
+                pass
         out.append(t); i += 1
     return ' '.join(out)
+
 
 def map_ej_to_ed(ms_cmd):
     toks = ms_cmd.split(); out = []; i = 0
@@ -107,6 +120,7 @@ def map_ej_to_ed(ms_cmd):
         out.append(toks[i]); i += 1
     return ' '.join(out)
 
+
 def shift_to_0_based(ms_cmd):
     toks = ms_cmd.split(); out = []; i = 0
     while i < len(toks):
@@ -115,24 +129,29 @@ def shift_to_0_based(ms_cmd):
             try:
                 out += ['-en', toks[i+1], str(int(float(toks[i+2]))-1), toks[i+3]]
                 i += 4; continue
-            except ValueError: pass
+            except ValueError:
+                pass
         if t == '-em' and i + 4 < len(toks):
             try:
                 out += ['-em', toks[i+1], str(int(float(toks[i+2]))-1), str(int(float(toks[i+3]))-1), toks[i+4]]
                 i += 5; continue
-            except ValueError: pass
+            except ValueError:
+                pass
         if t == '-ed' and i + 3 < len(toks):
             try:
                 out += ['-ed', toks[i+1], str(int(float(toks[i+2]))-1), str(int(float(toks[i+3]))-1)]
                 i += 4; continue
-            except ValueError: pass
+            except ValueError:
+                pass
         if t == '-n' and i + 2 < len(toks):
             try:
                 out += ['-n', str(int(float(toks[i+1]))-1), toks[i+2]]
                 i += 3; continue
-            except ValueError: pass
+            except ValueError:
+                pass
         out.append(t); i += 1
     return ' '.join(out)
+
 
 def stepwise_from_exponential_epochs_graph_order(graph, N0, max_fold_per_step=1.05):
     en = []
@@ -156,6 +175,7 @@ def stepwise_from_exponential_epochs_graph_order(graph, N0, max_fold_per_step=1.
     en.sort(key=lambda x: -x[0])
     return en
 
+
 def sanitize_ms_demography(ms_demog_str):
     toks = ms_demog_str.split(); out = []; i = 0
     arg_counts = {'-n':2,'-en':3,'-m':3,'-em':4,'-ej':3}
@@ -170,145 +190,139 @@ def sanitize_ms_demography(ms_demog_str):
                 out.extend(toks[i:i+1+need]); i += 1 + need; continue
             else:
                 break
-        if t.startswith('-'): out.append(t)
+        if t.startswith('-'):
+            out.append(t)
         i += 1
     return ' '.join(out)
 
 
 def _make_affinity_preexec(cpu_list):
-    """Return a preexec_fn that sets CPU affinity for the child process.
-
-    cpu_list should be an iterable of integer CPU indexes. This uses
-    os.sched_setaffinity and quietly ignores any failure so the code
-    remains portable to environments where affinity cannot be set.
-    """
+    """Return a preexec_fn that sets CPU affinity for the child process (best-effort)."""
     def _set_affinity():
         try:
-            # sched_setaffinity expects an iterable of CPU ids
             os.sched_setaffinity(0, cpu_list)
         except Exception:
-            # Best-effort only; failure should not abort the simulation
             pass
     return _set_affinity
 
-# ---------- output converters ----------
+# ---------- conversion helpers ----------
 
-def ms_like_to_vcf(ms_text, length, chrom='chr1', ploidy=1):
-    """Convert single-replicate ms/discoal/msms output to a minimal VCF string.
+def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int = 1) -> str:
+    """Convert a single-replicate ms-like block to a simple VCF string.
 
-    Groups consecutive haplotypes into individuals of size=ploidy to form genotypes.
-    Assumes haplotypes are emitted in consistent order across loci.
+    Expects a block starting with 'segsites:' and a following 'positions:' line, then haplotypes.
     """
-    # Ensure only one replicate (one segsites block)
-    seg_blocks = [ln for ln in ms_text.splitlines() if ln.startswith('segsites:')]
-    if len(seg_blocks) == 0:
-        raise SystemExit('ERROR: Cannot locate segsites line in simulator output for VCF conversion.')
-    if len(seg_blocks) > 1:
-        raise SystemExit('ERROR: VCF export currently supports only a single replicate; use --replicates 1.')
-    lines = ms_text.splitlines()
-    # Find segsites line index
-    seg_idx = None
-    for i,ln in enumerate(lines):
-        if ln.startswith('segsites:'):
-            seg_idx = i; break
-    if seg_idx is None:
-        raise SystemExit('ERROR: segsites line not found.')
-    try:
-        segsites = int(lines[seg_idx].split()[1])
-    except Exception:
-        raise SystemExit('ERROR: Failed to parse segsites count.')
-    if segsites == 0:
+    if not ms_text:
+        # minimal empty VCF
         header = [
             '##fileformat=VCFv4.2',
             '##source=stdpopsim2ms.py',
-            f'##contig=<ID={chrom},length={length}>',
+            f'##contig=<ID={chrom},length={int(length) if length else 0}>',
+            '##INFO=<ID=.,Number=0,Type=Flag,Description="Placeholder">',
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
             '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT'
         ]
         return '\n'.join(header) + '\n'
-    if seg_idx + 1 >= len(lines) or not lines[seg_idx+1].startswith('positions:'):
-        # ms-like outputs sometimes have '//' before positions; search ahead
-        pos_line = None; pos_line_idx = None
-        for j in range(seg_idx+1, min(seg_idx+5, len(lines))):
-            if lines[j].startswith('positions:'):
-                pos_line = lines[j]; pos_line_idx = j; break
-        if pos_line is None:
-            raise SystemExit('ERROR: positions line not found after segsites line.')
-    else:
-        pos_line = lines[seg_idx+1]; pos_line_idx = seg_idx+1
-    parts = pos_line.split()
-    pos_floats = [float(p) for p in parts[1:]]
-    if len(pos_floats) != segsites:
-        # some simulators label with 'positions:' then floats
-        # tolerate mismatch by using min length
-        pos_floats = pos_floats[:segsites]
-    # Haplotypes start after positions line until blank or next '//' or end
+    lines = [l.rstrip('\n') for l in ms_text.splitlines()]
+    segsites = 0
+    pos_vals = []
     hap_lines = []
-    if pos_line_idx is None:
-        raise SystemExit('ERROR: Internal: positions line index unresolved.')
-    for ln in lines[pos_line_idx+1:]:
-        if not ln.strip():
-            break
-        if ln.startswith('//'):
-            break
+    i = 0
+    # find first segsites
+    while i < len(lines):
+        ln = lines[i].strip()
         if ln.startswith('segsites:'):
+            try:
+                segsites = int(ln.split()[1])
+            except Exception:
+                segsites = 0
+            # positions line should follow within a few lines
+            j = i + 1
+            pos_line_idx = None
+            while j < len(lines) and j <= i + 10:
+                if lines[j].strip().startswith('positions:'):
+                    pos_line_idx = j
+                    break
+                if lines[j].strip().startswith('segsites:'):
+                    break
+                j += 1
+            if pos_line_idx is None:
+                # consider no variants
+                segsites = 0
+                pos_vals = []
+                hap_lines = []
+                break
+            try:
+                pos_tokens = lines[pos_line_idx].split(':', 1)[1].strip().split()
+            except Exception:
+                pos_tokens = []
+            try:
+                pos_vals = [float(p) for p in pos_tokens]
+            except Exception:
+                pos_vals = []
+            # collect haplotypes after positions
+            k = pos_line_idx + 1
+            while k < len(lines):
+                s = lines[k].strip()
+                if not s or s.startswith('//') or s.startswith('segsites:') or s.startswith('positions:'):
+                    break
+                if set(s) <= {'0', '1'}:
+                    hap_lines.append(s)
+                k += 1
             break
-        if any(kw in ln for kw in ('segsites:', 'positions:')):
-            break
-        # haplotype line: sequence of 0/1
-        seq = ln.strip()
-        if set(seq) <= {'0','1'}:
-            hap_lines.append(seq)
-        else:
-            # Ignore non 0/1 lines (e.g., comments)
-            continue
-    if not hap_lines:
-        raise SystemExit('ERROR: No haplotype lines parsed for VCF conversion.')
-    n_hap = len(hap_lines)
-    # Ensure all hap lines same length
-    Lset = {len(h) for h in hap_lines}
-    if len(Lset) != 1:
-        raise SystemExit('ERROR: Inconsistent haplotype lengths in simulator output.')
-    seq_len = Lset.pop()
-    if seq_len < segsites:
-        raise SystemExit('ERROR: Fewer columns in haplotypes than segsites.')
-    # Map fractional positions to integer coordinates (1..length)
+        i += 1
+    if segsites == 0 or not pos_vals or not hap_lines:
+        # header-only VCF for empty replicate
+        header = [
+            '##fileformat=VCFv4.2',
+            '##source=stdpopsim2ms.py',
+            f'##contig=<ID={chrom},length={int(length) if length else 0}>',
+            '##INFO=<ID=.,Number=0,Type=Flag,Description="Placeholder">',
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
+            '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT'
+        ]
+        return '\n'.join(header) + '\n'
+    # normalize positions to integer coordinates
     used = set()
     pos_ints = []
-    for f in pos_floats:
-        p = int(round(f * length))
-        if p < 1: p = 1
-        if p > length: p = length
-        # ensure uniqueness by shifting forward
-        while p in used and p < length:
+    L = int(length) if length else 0
+    for f in pos_vals:
+        try:
+            p = int(round(float(f) * float(L)))
+        except Exception:
+            p = 1
+        if p < 1:
+            p = 1
+        if L and p > L:
+            p = L
+        while p in used and (not L or p < L):
             p += 1
         used.add(p)
         pos_ints.append(p)
-    # Build VCF
-    header = [
-        '##fileformat=VCFv4.2',
-        '##source=stdpopsim2ms.py',
-        f'##contig=<ID={chrom},length={length}>',
-        '##INFO=<ID=.,Number=0,Type=Flag,Description="Placeholder">',
-        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">'
-    ]
+    n_hap = len(hap_lines)
     if ploidy < 1:
         ploidy = 1
     if n_hap % ploidy != 0:
         raise SystemExit(f'ERROR: Total haplotypes {n_hap} not divisible by ploidy {ploidy} for VCF conversion.')
     n_ind = n_hap // ploidy
+    header = [
+        '##fileformat=VCFv4.2',
+        '##source=stdpopsim2ms.py',
+        f'##contig=<ID={chrom},length={L}>',
+        '##INFO=<ID=.,Number=0,Type=Flag,Description="Placeholder">',
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">'
+    ]
     sample_names = [f'Ind{i+1}' for i in range(n_ind)]
     header.append('#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t' + '\t'.join(sample_names))
-    body_lines = []
-    for vidx,(p) in enumerate(pos_ints, start=1):
+    body = []
+    for vidx, p in enumerate(pos_ints, start=1):
         ref = 'A'; alt = 'T'
-        geno_chars = [hap_lines[h][vidx-1] for h in range(n_hap)]
-        # Group into ploidy-sized genotypes (phased)
         genos = []
         for i in range(0, n_hap, ploidy):
-            alleles = ['1' if c == '1' else '0' for c in geno_chars[i:i+ploidy]]
+            alleles = ['1' if hap_lines[i + a][vidx - 1] == '1' else '0' for a in range(ploidy)]
             genos.append('|'.join(alleles))
-        body_lines.append(f'{chrom}\t{p}\tsnp{vidx}\t{ref}\t{alt}\t.\tPASS\t.\tGT\t' + '\t'.join(genos))
-    return '\n'.join(header + body_lines) + '\n'
+        body.append(f'{chrom}\t{p}\tsnp{vidx}\t{ref}\t{alt}\t.\tPASS\t.\tGT\t' + '\t'.join(genos))
+    return '\n'.join(header + body) + '\n'
 
 
 def vcf_to_ms_like(vcf_text, length, ploidy=1):
@@ -441,7 +455,7 @@ def _vcf_text_to_bcf(path_vcf: str, path_bcf: str):
         raise SystemExit(f'# ERROR: failed to convert VCF to BCF via bcftools: {e}')
 
 
-def _adjust_vcf_contig_length(vcf_text: str, chrom_id: object = None, new_length: object = None) -> str:
+def _adjust_vcf_contig_length(vcf_text: str, chrom_id=None, new_length=None) -> str:
     """Replace contig length for contig with ID==chrom_id in a VCF text block.
 
     If chrom_id is None, replace the first contig line's length. Returns modified text.
@@ -666,7 +680,7 @@ def compute_sfs_fast(ms_text, normalized=False, mode='mean'):
 
 def build_discoal_command(*, species, model_id, user_order, individual_counts, discoal_pop0,
                           reps, length, max_fold_per_step, sweep_time, x, s=None, min_snps=None, chr_name=None,
-                          disable_en_ladder=False, debug=False, seed=None):
+                          disable_en_ladder=False, seed=None):
     sp = sps.get_species(species)
     model = sp.get_demographic_model(model_id)
     # Prefer mutation rate specified on the demographic model if present
@@ -841,8 +855,7 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
         if sweep_time is not None:
             loc_line += f" sweep-time={sweep_time}"
         meta['base_comments'].append(loc_line)
-    if debug:
-        sys.stderr.write('# DEBUG discoal_demog_ms(after_remap_0b) '+demog_0b+'\n')
+    # no debug printing
     if seed is not None:
         meta['seed'] = seed
     return discoal_cmd, meta
@@ -851,7 +864,7 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
 
 def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
                      reps, length, max_fold_per_step, chr_name=None,
-                     min_snps=None, disable_en_ladder=False, debug=False, seed=None):
+                     min_snps=None, disable_en_ladder=False, seed=None):
     engine = 'ms'
     sp = sps.get_species(species)
     model = sp.get_demographic_model(model_id)
@@ -960,8 +973,7 @@ def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
     'base_comments': ['# engine='+engine, f"# pop0={pop0}", f"# order={desired_order}",
               f"# theta={theta} rho={rho} length={length} N0={N0} mu={mu} r={rrate} ploidy={ploidy}"],
     }
-    if debug:
-        sys.stderr.write('# DEBUG ms demog(after_remap) '+demog_final+'\n')
+    # no debug printing
     if seed is not None:
         meta['seed'] = seed
     return full_cmd, meta
@@ -970,7 +982,7 @@ def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
 # ---------- scrm (SMC approximation) builder ----------
 def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0,
                        reps, length, max_fold_per_step, chr_name=None,
-                       min_snps=None, disable_en_ladder=False, debug=False, seed=None):
+                       min_snps=None, disable_en_ladder=False, seed=None):
     """Build a scrm command string mirroring the ms builder but emitting 'scrm' as the executable.
 
     scrm is a commonly-used SMC approximation simulator with ms-like CLI. This builder
@@ -1085,8 +1097,7 @@ def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0
     'base_comments': ['# engine='+engine, f"# pop0={pop0}", f"# order={desired_order}",
               f"# theta={theta} rho={rho} length={length} N0={N0} mu={mu} r={rrate} ploidy={ploidy}"],
     }
-    if debug:
-        sys.stderr.write('# DEBUG scrm demog(after_remap) '+demog_final+'\n')
+    # no debug printing
     if seed is not None:
         meta['seed'] = seed
     return full_cmd, meta
@@ -1095,7 +1106,7 @@ def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0
 # ---------- msprime (in-process stdpopsim engine) builder ----------
 def build_msprime_command(*, species, model_id, user_order, individual_counts, pop0,
                           reps, length, max_fold_per_step, chr_name=None,
-                          min_snps=None, disable_en_ladder=False, debug=False, seed=None):
+                          min_snps=None, disable_en_ladder=False, seed=None):
     """Prepare metadata for running stdpopsim.engines._MsprimeEngine in-process.
 
     This returns a small command-like string (for debug) and a meta dict compatible with other builders.
@@ -1173,11 +1184,7 @@ def build_msprime_command(*, species, model_id, user_order, individual_counts, p
             'reason': 'msprime_supports_continuous_growth',
         }
     }
-    if (disable_en_ladder or (max_fold_per_step is not None and float(max_fold_per_step) != 1.05)) and debug:
-        try:
-            sys.stderr.write('# INFO: engine=msprime ignores --disable-growth-discretization/--growth-max-fold (native exponential support).\n')
-        except Exception:
-            pass
+    # no debug printing
     if seed is not None:
         meta['seed'] = seed
     return pseudo_cmd, meta
@@ -1187,7 +1194,7 @@ def build_msprime_command(*, species, model_id, user_order, individual_counts, p
 def build_msms_command(*, species, model_id, user_order, individual_counts, pop0,
                        reps, length, max_fold_per_step, chr_name=None,
                        min_snps=None, disable_en_ladder=False, a=None, s=None, x=None,
-                       fixation_time=0.0, debug=False, seed=None):
+                       fixation_time=0.0, seed=None):
     sp = sps.get_species(species)
     model = sp.get_demographic_model(model_id)
     raw_demog = model.model
@@ -1360,8 +1367,7 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
         if fixation_time:
             loc_line += f" fixation-time={fixation_time}"
         meta['base_comments'].append(loc_line)
-    if debug:
-        sys.stderr.write('# DEBUG msms demog(after_remap) '+demog_final+'\n')
+    # no debug printing
     if seed is not None:
         meta['seed'] = seed
     return full_cmd, meta
@@ -1382,7 +1388,13 @@ class _RequiredAnnotatingFormatter(argparse.ArgumentDefaultsHelpFormatter):
 def parse_args():
     """Unified parser: always show selection arguments; validate post parse based on --engine."""
     ap = argparse.ArgumentParser(
-        description=("Export stdpopsim demography to ms-format using: discoal (selection origin), ms (neutral), msms (selection fixation present)."),
+        description=(
+            "Simulate genomic data using stdpopsim demographies and write ms-like or VCF/BCF outputs.\n"
+            "Engines: discoal (sweep origin), ms (neutral), msms (sweep fixation), scrm (SMC), msprime (in-process).\n"
+            "Outputs: ms/ms.gz (raw ms-like) or vcf/vcf.gz/bcf (converted). For VCF/BCF with multiple replicates, one file per replicate is written inside a folder named after the output stem.\n"
+            "Extras: paired-neutral baseline (engine defaults to --engine), unfolded SFS computation (VCF auto-converted internally), target-snps length derivation and per-replicate enforcement with optional overshoot shrink (see --target-snps-tol), show-command preview for external engines.\n"
+            "Species may be given by identifier or full common/scientific name (e.g. Homo sapiens)."
+        ),
         formatter_class=_RequiredAnnotatingFormatter,
     )
     g = ap.add_argument_group('Core')
@@ -1403,7 +1415,7 @@ def parse_args():
     g.add_argument('--target-snps-tol', dest='min_snps_tol', type=float, default=0.0,
                    help=("Fractional overshoot tolerance for --target-snps. After all replicates reach >= target, "
                          "if max(segsites) > target*(1+tol) the sequence length is iteratively shrunk while keeping every replicate >= target. "
-                         "Set 0 to disable shrink (default 0). Example: 0.02 allows ~2% overshoot before shrink attempts."))
+                         "Set 0 to disable shrink (default 0). Example: 0.02 allows ~2%% overshoot before shrink attempts."))
     g.add_argument('--chromosome', dest='chromosome', default=None,
                    help="Chromosome/contig name for mutation/recombination rates/length (optional).")
     g.add_argument('--replicates', dest='reps', type=int, default=1,
@@ -1415,7 +1427,8 @@ def parse_args():
                    help="Output format. 'ms'/'ms.gz' write raw ms-like (optionally gzipped); 'vcf'/'vcf.gz' convert single replicate to VCF.")
     g.add_argument('--threads', dest='threads', type=int, default=1,
                    help="Parallel threads for replicate chunks.")
-    g.add_argument('--debug', action='store_true', help="Enable debug logging to stderr.")
+    # Show-only command flag
+    g.add_argument('--show-command', action='store_true', help="Print the external simulator command that would run and exit (no execution).")
     g.add_argument('--progress', action='store_true', help="Show progress bar (requires tqdm).")
     g.add_argument('--sfs', nargs='?', const=True, default=False,
                    help="Compute unfolded SFS. Optional value sets output basename; default name modelid_pop0[_chrom][_sweeppop].sfs.")
@@ -1444,6 +1457,7 @@ def parse_args():
     sg.add_argument('--fixation-time', dest='fix_time', type=float, default=0.0, help='Fixation time back in 4N units (msms only; default 0=present).')
 
     args = ap.parse_args()
+    # No legacy debug flag; use --show-command for previews.
     engine = args.engine
     argv_full = sys.argv[1:]
     # Misuse checks
@@ -1493,7 +1507,29 @@ def parse_args():
         try:
             sp = sps.get_species(args.species)
         except Exception:
-            raise SystemExit(f"ERROR: Cannot validate --chromosome because species '{args.species}' not found in stdpopsim.")
+            # Try resolving a full species name (e.g. 'Homo sapiens') to its ID
+            resolved = None
+            try:
+                name_to_id = {sp_obj.name: sp_obj.id for sp_obj in sps.all_species()}
+                # Direct match first
+                if args.species in name_to_id:
+                    resolved = name_to_id[args.species]
+                else:
+                    # Case-insensitive match
+                    wanted = args.species.strip().lower()
+                    for full_name, sp_id in name_to_id.items():
+                        if full_name.lower() == wanted:
+                            resolved = sp_id
+                            break
+                if resolved:
+                    args.species = resolved
+                    sp = sps.get_species(args.species)
+                else:
+                    raise SystemExit(f"ERROR: Cannot validate --chromosome because species '{args.species}' not found in stdpopsim.")
+            except SystemExit:
+                raise
+            except Exception:
+                raise SystemExit(f"ERROR: Cannot validate --chromosome because species '{args.species}' not found in stdpopsim.")
         # Try to resolve contig using stdpopsim API; if not found, attempt to list available contig names
         contig_ok = False
         try:
@@ -1567,8 +1603,6 @@ def main():
             if cont is not None and hasattr(cont, 'length'):
                 try:
                     args.length = int(getattr(cont, 'length'))
-                    if getattr(args, 'debug', False):
-                        sys.stderr.write(f"# DEBUG: using contig full length {args.length} for chromosome {args.chromosome}\n")
                 except Exception:
                     # if we cannot read contig length, leave args.length unchanged and let builders error naturally
                     pass
@@ -1648,7 +1682,7 @@ def main():
                 discoal_pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, sweep_time=getattr(args,'sweep_time',None),
                 x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=min_snps_forward, chr_name=args.chromosome,
-                disable_en_ladder=args.no_en_ladder, debug=False, seed=None,
+                disable_en_ladder=args.no_en_ladder, seed=None,
             )
         elif engine_name == 'msms':
             cmd, meta_local = build_msms_command(
@@ -1656,34 +1690,33 @@ def main():
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
                 min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder,
-                a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), debug=False, seed=None,
+                a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), seed=None,
             )
         elif engine_name == 'scrm':
             cmd, meta_local = build_scrm_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder, debug=False, seed=None,
+                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder, seed=None,
             )
         elif engine_name == 'msprime':
             cmd, meta_local = build_msprime_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder, debug=False, seed=None,
+                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder, seed=None,
             )
         else:  # ms
             cmd, meta_local = build_ms_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder, debug=False, seed=None,
+                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder, seed=None,
             )
         return cmd, meta_local
 
-    # Adaptive target-S refinement involves executing pilot simulations. If --debug is set
-    # the user requested to only show the command without running anything, so skip.
-    if args.length is None and args.min_snps is not None and not args.debug:
+    # Adaptive target-S refinement involves executing pilot simulations. Skip when only showing command.
+    if args.length is None and args.min_snps is not None and not getattr(args, 'show_command', False):
         # Initial builder-derived length (using existing formula logic in builders)
         init_cmd, init_meta = _pilot_build(engine, None, reps_override=1, min_snps_forward=args.min_snps)
         candidate_len = init_meta['length']
@@ -1752,8 +1785,7 @@ def main():
                     candidate_len = int(math.ceil(candidate_len * (target_snps / max(1,last_obs)) * 1.05))
                     break
         refined_len = candidate_len
-        if refined_len != init_meta['length'] and args.debug:
-            sys.stderr.write(f"# DEBUG: auto-adjust length {init_meta['length']} -> {refined_len} (target_snps={target_snps}, last_observed={last_obs})\n")
+    # refined length computed; proceed
         args.length = refined_len
 
     # build command (final, using possibly refined args.length unless in debug mode which skips refinement)
@@ -1769,7 +1801,7 @@ def main():
             discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, sweep_time=getattr(args,'sweep_time',None),
             x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=args.min_snps, chr_name=args.chromosome,
-            disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=None,
+            disable_en_ladder=args.no_en_ladder, seed=None,
         )
     elif engine == 'msms':
         sim_cmd, meta = build_msms_command(
@@ -1777,7 +1809,7 @@ def main():
             pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
             min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder,
-            a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), debug=args.debug, seed=None,
+            a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), seed=None,
         )
     else:
         # ms neutral only: selection flags were already warned & ignored in parse_args.
@@ -1786,14 +1818,14 @@ def main():
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=args.length,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
             )
         elif engine == 'msprime':
             sim_cmd, meta = build_msprime_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=args.length,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
             )
         else:
             sim_cmd, meta = build_ms_command(
@@ -1801,16 +1833,18 @@ def main():
             # For engine=ms there is no --sweep-pop/--sweep-pos group; pop0 falls back to first deme.
             pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-            min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=None,
+            min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
         )
 
-    # Debug-only mode: print just the raw simulator command (first non-comment line) and exit.
-    if args.debug:
+    # Show-only mode: print the external command and exit (do not execute). For msprime, no external command.
+    if getattr(args, 'show_command', False):
+        if engine == 'msprime':
+            sys.stderr.write('# ERROR: engine=msprime is an internal stdpopsim/msprime engine; there is no external shell command to show.\n')
+            sys.exit(1)
         raw_line = None
         for ln in sim_cmd.splitlines():
             if ln.strip().startswith(engine + ' '):
                 raw_line = ln.strip(); break
-        # Fallback: if not found, print entire built block
         if raw_line is None:
             raw_line = sim_cmd.strip()
         sys.stdout.write(raw_line + ('\n' if not raw_line.endswith('\n') else ''))
@@ -1823,70 +1857,69 @@ def main():
         if engine == 'discoal':
             sim_cmd_loc, meta_loc = build_discoal_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
-                discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=length_val,
-                max_fold_per_step=args.max_fold_per_step, sweep_time=getattr(args,'sweep_time',None),
-                x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=args.min_snps, chr_name=args.chromosome,
-                disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=None,
+                discoal_pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
+                max_fold_per_step=args.max_fold_per_step, sweep_time=getattr(args, 'sweep_time', None),
+                x=getattr(args, 'x', None), s=getattr(args, 's', None), min_snps=args.min_snps, chr_name=args.chromosome,
+                disable_en_ladder=args.no_en_ladder, seed=None,
             )
         elif engine == 'msms':
             sim_cmd_loc, meta_loc = build_msms_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
-                pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=length_val,
+                pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
                 min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder,
-                a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), debug=args.debug, seed=None,
+                a=getattr(args, 'a', None), s=getattr(args, 's', None), x=getattr(args, 'x', None), fixation_time=getattr(args, 'fix_time', 0.0), seed=None,
             )
         elif engine == 'scrm':
             sim_cmd_loc, meta_loc = build_scrm_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
-                pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=length_val,
+                pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
             )
         elif engine == 'msprime':
             sim_cmd_loc, meta_loc = build_msprime_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
-                pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=length_val,
+                pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
             )
         else:
             sim_cmd_loc, meta_loc = build_ms_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
-                pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=length_val,
+                pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, debug=args.debug, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
             )
         raw_cmd_line_loc = None
         for ln in sim_cmd_loc.splitlines():
-            if ln.startswith(engine+' '):
+            if ln.startswith(engine + ' '):
                 raw_cmd_line_loc = ln.strip(); break
         if raw_cmd_line_loc is None:
             sys.exit('ERROR: Failed to locate simulator command line (builder).')
-        # Debug safety: if user requested --debug, do not execute external simulator; return the built command.
-        if getattr(args, 'debug', False):
-            return meta_loc, raw_cmd_line_loc, '', ''
+        # No legacy debug bypass; always execute unless --show-command was used earlier.
         cmd_tokens_loc = shlex.split(raw_cmd_line_loc)
         total_reps_loc = int(cmd_tokens_loc[2])
         # progress handling (optionally suppressed for enforcement iterations)
-        threads_loc = max(1, min(int(getattr(args,'threads',1)), total_reps_loc))
+        threads_loc = max(1, min(int(getattr(args, 'threads', 1)), total_reps_loc))
         per_rep_mode_loc = bool(args.progress and show_progress and total_reps_loc > 1)
         if per_rep_mode_loc:
-            chunks_loc = [1]*total_reps_loc
+            chunks_loc = [1] * total_reps_loc
         else:
             if threads_loc == 1 or total_reps_loc == 1:
                 chunks_loc = [total_reps_loc]
             else:
-                base = total_reps_loc // threads_loc; rem = total_reps_loc % threads_loc
-                chunks_loc = [base + (1 if i<rem else 0) for i in range(threads_loc) if base + (1 if i<rem else 0) > 0]
+                base = total_reps_loc // threads_loc
+                rem = total_reps_loc % threads_loc
+                chunks_loc = [base + (1 if i < rem else 0) for i in range(threads_loc) if base + (1 if i < rem else 0) > 0]
         # Prepare unique seeds per chunk for engines supporting explicit seeding
         chunk_process_count = None
         # Engines that support per-replicate seeding/mode. Include msprime so it can run multiple
         # replicates with distinct seeds in per-rep mode like other in-process engines.
-        per_rep_engine = engine in ('discoal','msms','msprime') and per_rep_mode_loc
+        per_rep_engine = engine in ('discoal', 'msms', 'msprime') and per_rep_mode_loc
         # Generate unique seeds per chunk for external engines and msprime; for ms we will use
         # the Hudson ms "-seeds" triplet to ensure independence across parallel chunks.
-        if engine in ('discoal','msms','msprime','ms'):
+        if engine in ('discoal', 'msms', 'msprime', 'ms'):
             if per_rep_mode_loc:
                 chunk_process_count = len(chunks_loc)  # each chunk = 1 replicate
             else:
@@ -1897,12 +1930,14 @@ def main():
                 import random as _rnd2
                 while len(seeds_for_chunks) < chunk_process_count:
                     s = _rnd2.randint(1, 2**31 - 1)
-                    if s in unique_seeds: continue
-                    unique_seeds.add(s); seeds_for_chunks.append(s)
+                    if s in unique_seeds:
+                        continue
+                    unique_seeds.add(s)
+                    seeds_for_chunks.append(s)
             except Exception:
-                seeds_for_chunks = [None]*chunk_process_count
+                seeds_for_chunks = [None] * chunk_process_count
         else:
-            seeds_for_chunks = [None]*len(chunks_loc)
+            seeds_for_chunks = [None] * len(chunks_loc)
 
         def run_chunk_loc(rc, replicate_index=None, chunk_idx=None):
             toks = cmd_tokens_loc[:]; toks[2] = str(rc)
@@ -1915,11 +1950,7 @@ def main():
                 # Run stdpopsim's msprime engine in-process using stdpopsim.get_engine('msprime').
                 try:
                     eng = sps.get_engine('msprime')
-                    if getattr(args, 'debug', False):
-                        try:
-                            sys.stderr.write(f"# DEBUG: obtained msprime engine: {eng}\n")
-                        except Exception:
-                            pass
+                    # no debug printing
                 except Exception as e:
                     return (rc, '', f'# ERROR: failed to get msprime engine from stdpopsim: {e}\n', 1, replicate_index)
                 # Build contig and samples mapping
@@ -1962,11 +1993,7 @@ def main():
                             pass
                         hint = ("; available: " + ", ".join(map(str, avail_names[:20])) + ("..." if len(avail_names) > 20 else "")) if avail_names else ""
                         return (rc, '', f"# ERROR: msprime engine could not resolve a contig. Provide --chromosome or choose one{hint}.\n", 1, replicate_index)
-                    if getattr(args, 'debug', False):
-                        try:
-                            sys.stderr.write(f"# DEBUG: chosen_contig={getattr(chosen_contig, 'id', str(chosen_contig))}\n")
-                        except Exception:
-                            pass
+                    # no debug printing
                     # if model provides a mutation rate and chosen_contig exists, try to set it to avoid stdpopsim warning
                     try:
                         if chosen_contig is not None and getattr(model_obj, 'mutation_rate', None) is not None:
@@ -2007,11 +2034,7 @@ def main():
                         if seed_val is not None:
                             # msprime/stdpopsim expect the keyword 'seed' for reproducible runs
                             kwargs['seed'] = seed_val + (rep_i if seed_val is not None else 0)
-                        if getattr(args, 'debug', False):
-                            try:
-                                sys.stderr.write(f"# DEBUG: msprime simulate rep={rep_i} kwargs={kwargs}\n")
-                            except Exception:
-                                pass
+                        # no debug printing
                         # prefer model mutation rate when available
                         try:
                             model_rate = getattr(model_obj, 'mutation_rate', None)
@@ -2023,11 +2046,7 @@ def main():
                                     pass
                         except Exception:
                             pass
-                        if getattr(args, 'debug', False):
-                            try:
-                                sys.stderr.write(f"# DEBUG: model mutation_rate={getattr(model_obj, 'mutation_rate', None)}\n")
-                            except Exception:
-                                pass
+                        # no debug printing
                         # Run simulate inside a guarded block to capture full traceback on error
                         try:
                             ts = eng.simulate(model_obj, chosen_contig, samples_per_pop, **kwargs)
@@ -2151,32 +2170,32 @@ def main():
             with concurrent.futures.ThreadPoolExecutor(max_workers=threads_loc) as ex:
                 futs = []
                 rep_counter = 0
-                for idx,c in enumerate(chunks_loc):
+                for idx, c in enumerate(chunks_loc):
                     futs.append(ex.submit(run_chunk_loc, c, rep_counter, idx))
                     rep_counter += 1
                 for fut in concurrent.futures.as_completed(futs):
-                    rc,out,err,code,rep_idx = fut.result()
-                    results_loc.append((rc,out,err,code,rep_idx))
+                    rc, out, err, code, rep_idx = fut.result()
+                    results_loc.append((rc, out, err, code, rep_idx))
                     if bar_loc is not None:
                         bar_loc.update(1)
                     elif args.progress and show_progress:
                         progress_done_loc += 1
                         sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
-            results_loc.sort(key=lambda x: (x[4] if len(x)>4 else 0))
+            results_loc.sort(key=lambda x: (x[4] if len(x) > 4 else 0))
         else:
             if len(chunks_loc) == 1:
-                rc,out,err,code,rep_idx = run_chunk_loc(chunks_loc[0], 0, 0)
-                results_loc.append((rc,out,err,code,rep_idx))
+                rc, out, err, code, rep_idx = run_chunk_loc(chunks_loc[0], 0, 0)
+                results_loc.append((rc, out, err, code, rep_idx))
                 if bar_loc is not None:
                     bar_loc.update(total_reps_loc)
                 elif args.progress and show_progress and total_reps_loc == 1:
                     sys.stderr.write('# progress: 1/1\n')
             else:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks_loc)) as ex:
-                    futs = [ex.submit(run_chunk_loc, c, i, i) for i,c in enumerate(chunks_loc)]
+                    futs = [ex.submit(run_chunk_loc, c, i, i) for i, c in enumerate(chunks_loc)]
                     for fut in concurrent.futures.as_completed(futs):
-                        rc,out,err,code,rep_idx = fut.result()
-                        results_loc.append((rc,out,err,code,rep_idx))
+                        rc, out, err, code, rep_idx = fut.result()
+                        results_loc.append((rc, out, err, code, rep_idx))
                         if bar_loc is not None:
                             try:
                                 bar_loc.update(int(rc))
@@ -2189,13 +2208,15 @@ def main():
             bar_loc.close()
         for tpl in results_loc:
             if len(tpl) == 5:
-                rc,out,err,code,_r = tpl
+                rc, out, err, code, _r = tpl
             else:
-                rc,out,err,code = tpl
+                rc, out, err, code = tpl
             if code is not None:
                 sys.stderr.write(f'# ERROR: {engine} exited with code {code}.\n')
-                if out: sys.stderr.write(out)
-                if err: sys.stderr.write(err)
+                if out:
+                    sys.stderr.write(out)
+                if err:
+                    sys.stderr.write(err)
                 sys.exit(code)
         concatenated_stdout_loc = ''.join(t[1] for t in results_loc)
         concatenated_stderr_loc = ''.join(t[2] for t in results_loc)
@@ -2204,7 +2225,7 @@ def main():
             meta_loc.setdefault('runtime', {})
             meta_loc['runtime']['chunk_sizes'] = chunks_loc
             # Persist chunk seeds for engines that support explicit seeding. Include ms and msprime.
-            if engine in ('discoal','msms','msprime','ms'):
+            if engine in ('discoal', 'msms', 'msprime', 'ms'):
                 meta_loc['runtime']['chunk_seeds'] = seeds_for_chunks
             meta_loc['runtime']['per_rep_mode'] = per_rep_mode_loc
         except Exception:
@@ -2213,21 +2234,7 @@ def main():
 
     # Initial simulation at refined/derived length
     meta, raw_cmd_line, concatenated_stdout, concatenated_stderr = _simulate_current_length(args.length, show_progress=True)
-    # Temporary debug dump controlled via environment variable SIM_DEBUG_DUMP
-    try:
-        import os as _os, sys as _sys
-        if _os.environ.get('SIM_DEBUG_DUMP'):
-            _sys.stderr.write(f"# DEBUG: _user_out_provided={getattr(args,'_user_out_provided',False)}\n")
-            try:
-                _sys.stderr.write(f"# DEBUG: meta.keys()={list(meta.keys())}\n")
-            except Exception:
-                _sys.stderr.write(f"# DEBUG: meta={meta}\n")
-            _sys.stderr.write(f"# DEBUG: engine={meta.get('engine')} produced_format={meta.get('produced_format')}\n")
-            _sys.stderr.write(f"# DEBUG: len(concatenated_stdout)={(len(concatenated_stdout) if concatenated_stdout is not None else 'None')}\n")
-            _sys.stderr.write(f"# DEBUG: concatenated_stdout_head={(repr(concatenated_stdout[:200]) if concatenated_stdout else 'EMPTY')}\n")
-            _sys.stderr.write(f"# DEBUG: len(concatenated_stderr)={(len(concatenated_stderr) if concatenated_stderr is not None else 'None')}\n")
-    except Exception:
-        pass
+    # Debug-only dump removed per cleanup
 
     # Enforcement: ensure ALL replicates meet/exceed target and optionally shrink overshoot
     if args.min_snps is not None:
@@ -2248,19 +2255,17 @@ def main():
                 new_length = int(math.ceil(length_current * factor * inflation))
                 if new_length <= length_current:
                     new_length = length_current + 1
-                if args.debug:
-                    sys.stderr.write(f"# DEBUG: enforce iter{enforce_iter} length {length_current} -> {new_length} (min_segs={min_segs} target={target_snps})\n")
+                # no debug printing
                 length_current = new_length
                 meta, raw_cmd_line, concatenated_stdout, concatenated_stderr = _simulate_current_length(length_current, show_progress=False)
                 enforce_iter += 1
                 continue
             break
         args.length = length_current
-        if args.debug:
-            seg_list_final = [int(x) for x in pattern_segs.findall(concatenated_stdout)]
-            if seg_list_final:
-                sys.stderr.write(f"# DEBUG: enforcement complete length={args.length} segsites_min={min(seg_list_final)} segsites_max={max(seg_list_final)} target={target_snps} tol={tol_internal}\n")
-
+    # After enforcement loop, optionally perform overshoot shrink and record stats
+    if args.min_snps is not None:
+        seg_list_final = [int(x) for x in pattern_segs.findall(concatenated_stdout)]
+        # no debug printing
         overshoot_status = None
         shrink_bracket_attempts = 0
         shrink_extra_reductions = 0
@@ -2344,11 +2349,8 @@ def main():
                     overshoot_status = 'met'
                 else:
                     overshoot_status = 'unmet_minimal_feasible'
-                    if args.debug:
-                        sys.stderr.write(f"# DEBUG: tolerance unmet at minimal feasible length (len={hi_len}) max_segs={max_final} threshold={target_snps*(1.0+tol_internal):.2f}\n")
-                if args.debug:
-                    min_final = min(hi_seg_list)
-                    sys.stderr.write(f"# DEBUG: shrink-binary finalized length={hi_len} segsites_min={min_final} segsites_max={max_final} status={overshoot_status} tol={tol_internal}\n")
+                    # no debug printing
+                # no debug printing
             else:
                 overshoot_status = 'no_data'
         final_seg_list = [int(x) for x in pattern_segs.findall(concatenated_stdout)] if 'pattern_segs' in locals() else []
@@ -2672,18 +2674,12 @@ def main():
                             try:
                                 ts = eng.simulate(model_obj, chosen_contig, samples_per_pop)
                             except Exception as e:
-                                if getattr(args, 'debug', False):
-                                    try: sys.stderr.write(f"# DEBUG: msprime simulate failed for rep {ridx}: {e}\n")
-                                    except Exception: pass
                                 if args.sfs_mode == 'per-rep':
                                     per_rep_lines.append(f"rep{ridx+1}\t" + '\t'.join('0' for _ in range(n_hap-1)))
                                 continue
                             try:
                                 sfs_raw = ts.allele_frequency_spectrum(polarised=True, span_normalise=False)
                             except Exception as e:
-                                if getattr(args, 'debug', False):
-                                    try: sys.stderr.write(f"# DEBUG: allele_frequency_spectrum failed for rep {ridx}: {e}\n")
-                                    except Exception: pass
                                 if args.sfs_mode == 'per-rep':
                                     per_rep_lines.append(f"rep{ridx+1}\t" + '\t'.join('0' for _ in range(n_hap-1)))
                                 continue
@@ -2933,7 +2929,11 @@ def main():
                     cur.append(ln)
                 if cur:
                     blocks.append(''.join(cur))
+                seg_hdr_pat = re.compile(r'^\s*segsites\s*:', re.IGNORECASE | re.MULTILINE)
                 for blk in blocks:
+                    # Skip blocks that don't contain any segsites header
+                    if not seg_hdr_pat.search(blk or ''):
+                        continue
                     vtxt = ms_like_to_vcf(blk, meta['length'], chrom=meta.get('chromosome') or 'chr1', ploidy=meta.get('ploidy',1))
                     vcf_lines = vtxt.splitlines()
                     meta_lines = _build_vcf_meta_lines_bcf()
@@ -3101,7 +3101,11 @@ def main():
                     cur.append(ln)
                 if cur:
                     blocks.append(''.join(cur))
+                seg_hdr_pat = re.compile(r'^\s*segsites\s*:', re.IGNORECASE | re.MULTILINE)
                 for blk in blocks:
+                    # Skip blocks that don't contain any segsites header
+                    if not seg_hdr_pat.search(blk or ''):
+                        continue
                     vtxt = ms_like_to_vcf(blk, meta['length'], chrom=meta.get('chromosome') or 'chr1', ploidy=meta.get('ploidy',1))
                     vcf_lines = vtxt.splitlines()
                     meta_lines = _build_vcf_meta_lines()
@@ -3326,8 +3330,7 @@ def main():
                 final_seg_list = None  # type: ignore
             import gc as _gc
             _gc.collect()
-            if args.debug:
-                sys.stderr.write('# DEBUG: released primary sweep output buffers before neutral run.\n')
+            # no debug printing
         except Exception:
             pass
     # Optional paired neutral run (clean implementation)
@@ -3377,33 +3380,33 @@ def main():
             if neut_engine=='discoal':
                 neut_cmd, neut_meta = build_discoal_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    sweep_time=None, x=None, s=None, min_snps=None, chr_name=args.chromosome, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    sweep_time=None, x=None, s=None, min_snps=None, chr_name=args.chromosome, disable_en_ladder=args.no_en_ladder,
                     seed=neut_seed)
             elif neut_engine=='msms':
                 neut_cmd, neut_meta = build_msms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
                     chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, a=None, s=None, x=None, fixation_time=0.0,
-                    debug=args.debug, seed=neut_seed)
+                    seed=neut_seed)
             elif neut_engine=='ms':
                 neut_cmd, neut_meta = build_ms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder,
                     seed=neut_seed)
             elif neut_engine=='scrm':
                 neut_cmd, neut_meta = build_scrm_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder,
                     seed=neut_seed)
             elif neut_engine=='msprime':
                 neut_cmd, neut_meta = build_msprime_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder,
                     seed=neut_seed)
             else:
                 # Fallback to ms neutral if an unknown engine is somehow specified
                 neut_cmd, neut_meta = build_ms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder,
                     seed=neut_seed)
         # Extract raw neutral line
         raw_neut=None
