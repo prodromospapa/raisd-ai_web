@@ -68,30 +68,8 @@ def run_simulation(engine,species_id,model_id,pop_order,train_sample_individuals
         ]
     if gpu:
         args.append("--gpu")
-    
     # run inside the target directory (exit on failure)
     run_subprocess(args, out_dir, f"simulation {model_id}/{pop_order}/{chromosome}")
-
-def get_sfs(engine,species_id,model_id,pop_order,sfs_sample_individuals,chromosome,sfs_replicates,sel_s=None):
-    # build target run directory: current_path/data/species_folder_name/model_id/population/chromosome
-    out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
-    os.makedirs(out_dir, exist_ok=True)
-    args = [
-        "simulator.py",
-        "--engine", str(engine),
-        "--species-id", str(species_id),
-        "--model-id", str(model_id),
-        "--pop-order", str(pop_order),
-        "--sample-individuals", str(sfs_sample_individuals),
-        "--chromosome", str(chromosome),
-        "--replicates", str(sfs_replicates),
-        "--sfs",
-        "--threads", str(os.cpu_count()),
-        ]
-
-    # run inside the target directory (exit on failure)
-    run_subprocess(args, out_dir, f"SFS {model_id}/{pop_order}/{chromosome}")
-    
 
 def get_info(model_id,pop_order,chromosome):
     out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(pop_order), str(chromosome))
@@ -214,12 +192,23 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                         run_simulation(engine, species_id, model_id, population, train_sample_individuals, window, ips, iws, chromosome, train_replicates, sel_s)
                         
                     for type_ in ["sweep", "neutral"]:
-                        img_info = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Images.bin/{type_}TR"
-                        if not os.path.exists(img_info):
+                        if type_ == "sweep":
                             params, selection = get_info(model_id, population, chromosome)
                             sweep_bp = selection.get("sweep_bp")
                             length = params.get("length")
+                            with open(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt", 'w') as f:
+                                f.write(f"sweep_bp: {sweep_bp}\nlength: {length}\n")
+                        else:
+                            with open(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt", 'r') as f:
+                                lines = f.readlines()
+                                sweep_bp = int(lines[0].strip().split(": ")[1])
+                                length = int(lines[1].strip().split(": ")[1])
+
+                        img_info = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Images.bin/{type_}TR"
+                        if not os.path.exists(img_info):
                             ms2bin(model_id, population, window, ips, iws, chromosome, type_, sweep_bp, length)
+                        if type_ == "neutral":
+                            os.remove(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt")
 
                     train_model(model_id, population, chromosome, epochs)
                     img_bin = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Images.bin"

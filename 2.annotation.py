@@ -26,6 +26,9 @@ parser.add_argument(
 args = parser.parse_args()
 species = args.species
 
+species_dict = {sp.name: sp.id for sp in stdpopsim.all_species()}
+if species in species_dict.values():
+    species = [sp.name for sp in stdpopsim.all_species() if sp.id == species][0]
 
 HOSTS = [
     "http://www.ensembl.org/biomart",   # vertebrates
