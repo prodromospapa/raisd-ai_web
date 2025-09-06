@@ -863,7 +863,7 @@ def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
     genome = sp.genome
     mu = None; rrate = None; chosen_contig = None
     if chr_name:
-        try: chosen_contig = sp.get_contig(chr_name, mutation_rate=model_mu)
+        try: chosen_contig = sp.get_contig(chr_name)
         except Exception: chosen_contig = None
         if chosen_contig is not None:
             try:
@@ -982,7 +982,7 @@ def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0
     genome = sp.genome
     mu = None; rrate = None; chosen_contig = None
     if chr_name:
-        try: chosen_contig = sp.get_contig(chr_name, mutation_rate=model_mu)
+        try: chosen_contig = sp.get_contig(chr_name)
         except Exception: chosen_contig = None
         if chosen_contig is not None:
             try:
@@ -1097,7 +1097,7 @@ def build_msprime_command(*, species, model_id, user_order, individual_counts, p
     genome = sp.genome
     mu = None; rrate = None; chosen_contig = None
     if chr_name:
-        try: chosen_contig = sp.get_contig(chr_name, mutation_rate=model_mu)
+        try: chosen_contig = sp.get_contig(chr_name)
         except Exception: chosen_contig = None
         if chosen_contig is not None:
             try:
@@ -1180,7 +1180,7 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
     genome = sp.genome
     mu = None; rrate = None; chosen_contig = None
     if chr_name:
-        try: chosen_contig = sp.get_contig(chr_name, mutation_rate=model_mu)
+        try: chosen_contig = sp.get_contig(chr_name)
         except Exception: chosen_contig = None
         if chosen_contig is not None:
             try:
@@ -1507,6 +1507,28 @@ def main():
     try: max_cpu = os.cpu_count() or 1
     except Exception: max_cpu = 1
     args.threads = min(max(1, args.threads), max_cpu)
+    # If the user specified a chromosome/contig but DID NOT provide an explicit
+    # --length or --target-snps, prefer using the contig's native length. If the
+    # user has explicitly supplied --length or --target-snps we respect that and
+    # do NOT force the full contig length.
+    if getattr(args, 'chromosome', None) is not None and (getattr(args, 'length', None) is None and getattr(args, 'min_snps', None) is None):
+        try:
+            sp_tmp = sps.get_species(args.species)
+            try:
+                cont = sp_tmp.get_contig(args.chromosome)
+            except Exception:
+                cont = None
+            if cont is not None and hasattr(cont, 'length'):
+                try:
+                    args.length = int(getattr(cont, 'length'))
+                    if getattr(args, 'debug', False):
+                        sys.stderr.write(f"# DEBUG: using contig full length {args.length} for chromosome {args.chromosome}\n")
+                except Exception:
+                    # if we cannot read contig length, leave args.length unchanged and let builders error naturally
+                    pass
+        except Exception:
+            # best-effort only; do not fatal here
+            pass
 
     # validate model & complete demes list
     try:
@@ -1810,10 +1832,9 @@ def main():
         # Engines that support per-replicate seeding/mode. Include msprime so it can run multiple
         # replicates with distinct seeds in per-rep mode like other in-process engines.
         per_rep_engine = engine in ('discoal','msms','msprime') and per_rep_mode_loc
-        # Consolidate ms into single process to avoid duplicate seeds while honoring user request not to use -seeds
-        if engine == 'ms' and threads_loc > 1 and not per_rep_mode_loc and len(chunks_loc) > 1:
-            chunks_loc = [total_reps_loc]
-        if engine in ('discoal','msms','msprime'):
+        # Generate unique seeds per chunk for external engines and msprime; for ms we will use
+        # the Hudson ms "-seeds" triplet to ensure independence across parallel chunks.
+        if engine in ('discoal','msms','msprime','ms'):
             if per_rep_mode_loc:
                 chunk_process_count = len(chunks_loc)  # each chunk = 1 replicate
             else:
@@ -1856,6 +1877,19 @@ def main():
                     species_id = meta_lp.get('species_id')
                     sp = sps.get_species(species_id)
                     chr_name = meta_lp.get('chromosome') or getattr(args, 'chromosome', None)
+                    # Fallback: if no chromosome provided, pick the first available contig name
+                    if not chr_name:
+                        try:
+                            genome_obj = getattr(sp, 'genome', None)
+                            contigs_list = getattr(genome_obj, 'contigs', []) if genome_obj is not None else []
+                            if contigs_list:
+                                # Prefer .name, else .id, else string repr
+                                cand = getattr(contigs_list[0], 'name', None) or getattr(contigs_list[0], 'id', None) or str(contigs_list[0])
+                                if isinstance(cand, str) and cand.strip():
+                                    chr_name = cand
+                        except Exception:
+                            # leave chr_name as None; subsequent get_contig will likely fail and be reported below
+                            pass
                     # Build a contig spanning [0, length_val) with model's mutation_rate where possible
                     try:
                         chosen_contig = sp.get_contig(chr_name, mutation_rate=getattr(model_obj, 'mutation_rate', None), left=0, right=max(0, int(length_val) - 1))
@@ -1865,6 +1899,17 @@ def main():
                             chosen_contig = sp.get_contig(chr_name)
                         except Exception:
                             chosen_contig = None
+                    # If still None, report a clear error early
+                    if chosen_contig is None:
+                        avail_names = []
+                        try:
+                            genome_obj = getattr(sp, 'genome', None)
+                            contigs_list = getattr(genome_obj, 'contigs', []) if genome_obj is not None else []
+                            avail_names = [getattr(c, 'name', getattr(c, 'id', str(c))) for c in contigs_list]
+                        except Exception:
+                            pass
+                        hint = ("; available: " + ", ".join(map(str, avail_names[:20])) + ("..." if len(avail_names) > 20 else "")) if avail_names else ""
+                        return (rc, '', f"# ERROR: msprime engine could not resolve a contig. Provide --chromosome or choose one{hint}.\n", 1, replicate_index)
                     if getattr(args, 'debug', False):
                         try:
                             sys.stderr.write(f"# DEBUG: chosen_contig={getattr(chosen_contig, 'id', str(chosen_contig))}\n")
@@ -2009,6 +2054,31 @@ def main():
                     cpu_list = list(range(total_cpus))
                 else:
                     cpu_list = list(range(start_cpu, end_cpu)) if end_cpu > start_cpu else [start_cpu % total_cpus]
+                # Inject explicit seeds for engines supporting them to ensure independence across chunks
+                if engine in ('discoal','msms') and seed_val is not None:
+                    # Remove any existing -seed if present, then add our chosen seed
+                    try:
+                        if '-seed' in toks:
+                            idxs = [i for i,t in enumerate(toks) if t == '-seed']
+                            for idx in reversed(idxs):
+                                del toks[idx:idx+2]
+                    except Exception:
+                        pass
+                    toks.extend(['-seed', str(int(seed_val))])
+                elif engine == 'ms' and seed_val is not None:
+                    # Hudson ms expects three integers after -seeds
+                    try:
+                        # Remove any existing -seeds triplet
+                        if '-seeds' in toks:
+                            idxs = [i for i,t in enumerate(toks) if t == '-seeds']
+                            for idx in reversed(idxs):
+                                del toks[idx:idx+4]
+                    except Exception:
+                        pass
+                    s1 = int(seed_val)
+                    s2 = s1 + 1
+                    s3 = s1 + 2
+                    toks.extend(['-seeds', str(s1), str(s2), str(s3)])
                 pre = _make_affinity_preexec(cpu_list)
                 r = subprocess.run(toks, capture_output=True, text=True, check=True, env=env, preexec_fn=pre)
                 return (rc, r.stdout, r.stderr, None, replicate_index)
@@ -2081,8 +2151,8 @@ def main():
         try:
             meta_loc.setdefault('runtime', {})
             meta_loc['runtime']['chunk_sizes'] = chunks_loc
-            # Persist chunk seeds for engines that support explicit seeding. Include msprime.
-            if engine in ('discoal','msms','msprime'):
+            # Persist chunk seeds for engines that support explicit seeding. Include ms and msprime.
+            if engine in ('discoal','msms','msprime','ms'):
                 meta_loc['runtime']['chunk_seeds'] = seeds_for_chunks
             meta_loc['runtime']['per_rep_mode'] = per_rep_mode_loc
         except Exception:
@@ -2091,6 +2161,21 @@ def main():
 
     # Initial simulation at refined/derived length
     meta, raw_cmd_line, concatenated_stdout, concatenated_stderr = _simulate_current_length(args.length, show_progress=True)
+    # Temporary debug dump controlled via environment variable SIM_DEBUG_DUMP
+    try:
+        import os as _os, sys as _sys
+        if _os.environ.get('SIM_DEBUG_DUMP'):
+            _sys.stderr.write(f"# DEBUG: _user_out_provided={getattr(args,'_user_out_provided',False)}\n")
+            try:
+                _sys.stderr.write(f"# DEBUG: meta.keys()={list(meta.keys())}\n")
+            except Exception:
+                _sys.stderr.write(f"# DEBUG: meta={meta}\n")
+            _sys.stderr.write(f"# DEBUG: engine={meta.get('engine')} produced_format={meta.get('produced_format')}\n")
+            _sys.stderr.write(f"# DEBUG: len(concatenated_stdout)={(len(concatenated_stdout) if concatenated_stdout is not None else 'None')}\n")
+            _sys.stderr.write(f"# DEBUG: concatenated_stdout_head={(repr(concatenated_stdout[:200]) if concatenated_stdout else 'EMPTY')}\n")
+            _sys.stderr.write(f"# DEBUG: len(concatenated_stderr)={(len(concatenated_stderr) if concatenated_stderr is not None else 'None')}\n")
+    except Exception:
+        pass
 
     # Enforcement: ensure ALL replicates meet/exceed target and optionally shrink overshoot
     if args.min_snps is not None:
@@ -2646,8 +2731,118 @@ def main():
                     break
             args.out = args.out + desired_ext
         fmt = args.format
+        # Safety: if the engine produced ms-like stdout and user requested ms output,
+        # ensure the output filename uses the correct .ms / .ms.gz extension.
+        try:
+            if concatenated_stdout and concatenated_stdout.lstrip().startswith('ms ') and fmt in ('ms', 'ms.gz'):
+                desired_ext = '.ms.gz' if fmt == 'ms.gz' else '.ms'
+                if args.out and not args.out.endswith(desired_ext):
+                    for kext in ('.vcf.gz', '.vcf', '.bcf', '.ms.gz', '.ms'):
+                        if args.out.endswith(kext):
+                            args.out = args.out[:-len(kext)]
+                            break
+                    args.out = args.out + desired_ext
+        except Exception:
+            pass
         # Write primary output first
-        if fmt.startswith('vcf'):
+        if fmt == 'bcf':
+            # Build a VCF text (inject metadata) and convert to BCF via bcftools
+            if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf' and concatenated_stdout:
+                vcf_text = concatenated_stdout
+                try:
+                    vcf_text = _adjust_vcf_contig_length(vcf_text, meta.get('chromosome'), meta.get('length'))
+                except Exception:
+                    pass
+            else:
+                vcf_text = ms_like_to_vcf(concatenated_stdout, meta['length'], chrom=meta.get('chromosome') or 'chr1', ploidy=meta.get('ploidy',1))
+            # Build and inject metadata comment lines
+            info_pairs = []
+            info_pairs.append(('engine', meta.get('engine', engine)))
+            info_pairs.append(('species', meta.get('species_id')))
+            info_pairs.append(('model', model_id))
+            info_pairs.append(('pop0', meta.get('pop0')))
+            if meta.get('pop_order'):
+                info_pairs.append(('order', '|'.join(map(str, meta.get('pop_order')))))
+            if meta.get('counts_disc'):
+                hap_list = meta.get('counts_disc') or []
+                pl = meta.get('ploidy', 1) or 1
+                try:
+                    sample_list = [int(h // pl) for h in hap_list]
+                except Exception:
+                    sample_list = hap_list
+                info_pairs.append(('sample_counts', '|'.join(map(str, sample_list))))
+                info_pairs.append(('hap_counts', '|'.join(map(str, hap_list))))
+            theta_val = rho_val = None
+            try:
+                toks_tmp = raw_cmd_line.split()
+                if '-t' in toks_tmp:
+                    theta_val = toks_tmp[toks_tmp.index('-t')+1]
+                if '-r' in toks_tmp:
+                    rho_val = toks_tmp[toks_tmp.index('-r')+1]
+            except Exception:
+                pass
+            if theta_val: info_pairs.append(('theta', theta_val))
+            if rho_val: info_pairs.append(('rho', rho_val))
+            info_pairs.append(('length', meta.get('length')))
+            info_pairs.append(('N0', meta.get('N0')))
+            info_pairs.append(('mu', meta.get('mu')))
+            info_pairs.append(('r', meta.get('rrate')))
+            info_pairs.append(('ploidy', meta.get('ploidy')))
+            if meta.get('chromosome') is not None:
+                info_pairs.append(('chromosome', meta.get('chromosome')))
+            if meta.get('sweep_pos') is not None:
+                sp = meta.get('sweep_pos')
+                info_pairs.append(('sweep_pos', sp))
+                try:
+                    if sp is not None and meta.get('length'):
+                        sweep_bp = int(round(float(sp) * int(meta.get('length'))))
+                        info_pairs.append(('sweep_bp', sweep_bp))
+                except Exception:
+                    pass
+            if meta.get('sel_2Ns') is not None:
+                info_pairs.append(('sel_2Ns', meta.get('sel_2Ns')))
+            if meta.get('sweep_time') is not None:
+                info_pairs.append(('sweep_time', meta.get('sweep_time')))
+            if meta.get('fixation_time') is not None:
+                info_pairs.append(('fixation_time', meta.get('fixation_time')))
+            kv_dict = {k:v for k,v in info_pairs if v is not None}
+            enf_stats = meta.get('enforcement_stats') or {}
+            for k,v in enf_stats.items():
+                kv_dict[k] = v
+            core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
+            param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
+            sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
+            def build_group_line(prefix, keys):
+                vals = [f"{k}={kv_dict[k]}" for k in keys if k in kv_dict]
+                if not vals:
+                    return None
+                return '# ' + prefix + ': ' + ', '.join(vals)
+            meta_comment_lines = []
+            for grp, keys in (('core', core_keys), ('params', param_keys), ('selection', sel_keys)):
+                ln = build_group_line(grp, keys)
+                if ln:
+                    meta_comment_lines.append(ln)
+            vcf_lines = vcf_text.splitlines()
+            try:
+                header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
+            except StopIteration:
+                header_idx = len(vcf_lines)
+            vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_comment_lines]
+            vcf_lines = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
+            vcf_text_final = '\n'.join(vcf_lines) + ('\n' if not vcf_lines[-1].endswith('\n') else '')
+            tmp_vcf = None
+            try:
+                with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                    tf.write(vcf_text_final)
+                    tmp_vcf = tf.name
+                _vcf_text_to_bcf(tmp_vcf, args.out)
+            finally:
+                try:
+                    if tmp_vcf is not None and os.path.exists(tmp_vcf):
+                        os.unlink(tmp_vcf)
+                except Exception:
+                    pass
+        elif fmt.startswith('vcf'):
             # If msprime produced VCF directly, use it; otherwise convert from ms-like.
             if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf' and concatenated_stdout:
                 vcf_text = concatenated_stdout
@@ -2658,7 +2853,7 @@ def main():
                     pass
             else:
                 vcf_text = ms_like_to_vcf(concatenated_stdout, meta['length'], chrom=meta.get('chromosome') or 'chr1', ploidy=meta.get('ploidy',1))
-            # Build metadata lines identical to ms output style
+            # Build metadata lines identical to ms output style and inject into VCF header
             info_pairs = []
             info_pairs.append(('engine', meta.get('engine', engine)))
             info_pairs.append(('species', meta.get('species_id')))
@@ -2666,7 +2861,6 @@ def main():
             info_pairs.append(('pop0', meta.get('pop0')))
             if meta.get('pop_order'):
                 info_pairs.append(('order', '|'.join(map(str, meta.get('pop_order')))))
-            # Emit sample (individual) counts and haplotype counts separately.
             if meta.get('counts_disc'):
                 hap_list = meta.get('counts_disc') or []
                 pl = meta.get('ploidy', 1) or 1
@@ -2722,12 +2916,10 @@ def main():
                     return None
                 return '# ' + prefix + ': ' + ', '.join(vals)
             meta_comment_lines = []
-            # (seed lines are emitted per-replicate during msprime VCF->ms conversion)
             for grp, keys in (('core', core_keys), ('params', param_keys), ('selection', sel_keys)):
                 ln = build_group_line(grp, keys)
                 if ln:
                     meta_comment_lines.append(ln)
-            # Inject these lines into VCF header (convert '# ' to '##' for VCF compliance while preserving human readability)
             vcf_lines = vcf_text.splitlines()
             try:
                 header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
@@ -2738,205 +2930,10 @@ def main():
             vcf_text_final = '\n'.join(vcf_lines) + ('\n' if not vcf_lines[-1].endswith('\n') else '')
             if fmt == 'vcf.gz':
                 _write_bgzip_text(args.out, vcf_text_final)
-            elif fmt == 'bcf':
-                # write temp plain VCF then convert to BCF
-                tmp_vcf = None
-                try:
-                    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
-                        tf.write(vcf_text_final)
-                        tmp_vcf = tf.name
-                    _vcf_text_to_bcf(tmp_vcf, args.out)
-                    # concatenate the resulting ms-like blocks while prefixing each replicate
-                    # with its own `# seedms_lineN:` comment.
-                    vcf_text_all = concatenated_stdout or ''
-                    # build seed_lines (expand chunk_seeds -> per-rep seed list)
-                    runtime = meta.get('runtime', {}) or {}
-                    chunk_seeds = runtime.get('chunk_seeds') or []
-                    chunk_sizes = runtime.get('chunk_sizes') or []
-                    seed_lines = []
-                    for ci, base_seed in enumerate(chunk_seeds):
-                        if base_seed is None:
-                            continue
-                        reps_in_chunk = chunk_sizes[ci] if ci < len(chunk_sizes) else 1
-                        for r in range(reps_in_chunk):
-                            seed_lines.append(str(int(base_seed) + int(r)))
-
-                    # Heuristic split: split on '##fileformat' if present, else treat as single block
-                    blocks = []
-                    if '##fileformat' in vcf_text_all:
-                        parts = vcf_text_all.split('##fileformat')
-                        for p in parts:
-                            p = p.strip()
-                            if not p:
-                                continue
-                            blocks.append('##fileformat' + '\n' + p if not p.startswith('\n') else '##fileformat' + p)
-                    else:
-                        blocks = [vcf_text_all]
-
-                    ms_blocks = []
-                    for ib, vb in enumerate(blocks):
-                        try:
-                            vb_adj = vb
-                            if getattr(args, 'length', None) is not None:
-                                try:
-                                    vb_adj = _adjust_vcf_contig_length(vb_adj, meta.get('chromosome'), meta.get('length'))
-                                except Exception:
-                                    pass
-                            # Inject per-block VCF meta seed line so conversion keeps seed info
-                            try:
-                                vlines = vb_adj.splitlines()
-                                try:
-                                    header_idx = next(i for i, l in enumerate(vlines) if l.startswith('#CHROM'))
-                                except StopIteration:
-                                    header_idx = len(vlines)
-                                if ib < len(seed_lines):
-                                    seed_meta = f"##seedms_line{ib+1}: {seed_lines[ib]}"
-                                    vlines = vlines[:header_idx] + [seed_meta] + vlines[header_idx:]
-                                vb_adj = '\n'.join(vlines) + ('\n' if not vb_adj.endswith('\n') else '')
-                            except Exception:
-                                pass
-                            ms_blk = vcf_to_ms_like(vb_adj, meta.get('length'), ploidy=meta.get('ploidy', 1))
-                            ms_blocks.append(ms_blk)
-                        except Exception:
-                            ms_blocks.append('segsites: 0\n')
-
-                    # Build raw_ms by prefixing each replicate block with its seed comment line
-                    combined = []
-                    for i, mb in enumerate(ms_blocks):
-                        # plain seed number line (no '# seedms_lineN:' prefix)
-                        seed_line = seed_lines[i] if i < len(seed_lines) else None
-                        seed_comment = (str(seed_line) + '\n') if seed_line is not None else ''
-                        mb_str = mb
-                        # ensure replicate separator '//' is present before the block like other engines
-                        if not mb_str.lstrip().startswith('//'):
-                            mb_str = '//\n' + mb_str
-                        combined.append(seed_comment + mb_str)
-                    raw_ms = '\n'.join(combined)
-                except Exception as e:
-                    sys.stderr.write(f"# ERROR: failed to convert msprime VCF to ms-like: {e}\n")
-                    raw_ms = ''
-                # Write converted ms output (support gzipped .ms.gz)
-                f_open = gzip.open if fmt == 'ms.gz' else open
-                mode = 'wt' if fmt == 'ms.gz' else 'w'
-                # Build and write metadata comment lines (match other engines) instead of raw command
-                info_pairs = []
-                info_pairs.append(('engine', meta.get('engine', engine)))
-                info_pairs.append(('species', meta.get('species_id')))
-                info_pairs.append(('model', model_id))
-                info_pairs.append(('pop0', meta.get('pop0')))
-                if meta.get('pop_order'):
-                    info_pairs.append(('order', '|'.join(map(str, meta.get('pop_order')))))
-                if meta.get('counts_disc'):
-                    hap_list = meta.get('counts_disc') or []
-                    pl = meta.get('ploidy', 1) or 1
-                    try:
-                        sample_list = [int(h // pl) for h in hap_list]
-                    except Exception:
-                        sample_list = hap_list
-                    info_pairs.append(('sample_counts', '|'.join(map(str, sample_list))))
-                    info_pairs.append(('hap_counts', '|'.join(map(str, hap_list))))
-                # parse theta/rho from command if possible
-                theta_val = rho_val = None
-                try:
-                    toks_tmp = raw_cmd_line.split()
-                    if '-t' in toks_tmp:
-                        theta_val = toks_tmp[toks_tmp.index('-t')+1]
-                    if '-r' in toks_tmp:
-                        rho_val = toks_tmp[toks_tmp.index('-r')+1]
-                except Exception:
-                    pass
-                if theta_val: info_pairs.append(('theta', theta_val))
-                if rho_val: info_pairs.append(('rho', rho_val))
-                info_pairs.append(('length', meta.get('length')))
-                info_pairs.append(('N0', meta.get('N0')))
-                info_pairs.append(('mu', meta.get('mu')))
-                info_pairs.append(('r', meta.get('rrate')))
-                info_pairs.append(('ploidy', meta.get('ploidy')))
-                if meta.get('chromosome') is not None:
-                    info_pairs.append(('chromosome', meta.get('chromosome')))
-                if meta.get('sweep_pos') is not None:
-                    sp = meta.get('sweep_pos')
-                    info_pairs.append(('sweep_pos', sp))
-                    try:
-                        if sp is not None and meta.get('length'):
-                            sweep_bp = int(round(float(sp) * int(meta.get('length'))))
-                            info_pairs.append(('sweep_bp', sweep_bp))
-                    except Exception: pass
-                if meta.get('sel_2Ns') is not None:
-                    info_pairs.append(('sel_2Ns', meta.get('sel_2Ns')))
-                if meta.get('sweep_time') is not None:
-                    info_pairs.append(('sweep_time', meta.get('sweep_time')))
-                if meta.get('fixation_time') is not None:
-                    info_pairs.append(('fixation_time', meta.get('fixation_time')))
-                kv_dict = {k:v for k,v in info_pairs if v is not None}
-                enf = meta.get('enforcement_stats') or {}
-                for k,v in enf.items():
-                    kv_dict[k] = v
-                core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
-                param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
-                sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
-                def build_line(group_name, keys):
-                    vals = [f"{k}={kv_dict[k]}" for k in keys if k in kv_dict]
-                    if not vals:
-                        return None
-                    return '# ' + group_name + ': ' + ', '.join(vals)
-                lines_info = []
-                for grp_name, keys in (('core', core_keys), ('params', param_keys), ('selection', sel_keys)):
-                    ln = build_line(grp_name, keys)
-                    if ln:
-                        lines_info.append(ln)
-                with f_open(args.out, mode) as f:
-                    # Emit header groups
-                    for ln in lines_info:
-                        f.write(ln + '\n')
-                    # Detect seed file/content if present (we will not write header seed lines)
-                    try:
-                        runtime = meta.get('runtime', {}) or {}
-                        chunk_seeds = runtime.get('chunk_seeds') or []
-                        chunk_sizes = runtime.get('chunk_sizes') or []
-                        seed_lines = []
-                        for ci, base_seed in enumerate(chunk_seeds):
-                            if base_seed is None:
-                                continue
-                            reps_in_chunk = chunk_sizes[ci] if ci < len(chunk_sizes) else 1
-                            for r in range(reps_in_chunk):
-                                seed_lines.append(str(int(base_seed) + int(r)))
-                        # Do not read or create external seed file 'seedms'.
-                        # Rely only on runtime-provided chunk_seeds/seed_lines for seed information.
-                        seed_file = None
-                        seed_file_content = None
-                    except Exception:
-                        seed_file_content = None
-                    # Write the engine-provided RNG/seed line (if present in captured stdout) or the seed file content
-                    written_rng = False
-                    try:
-                        if seed_file_content:
-                            f.write(seed_file_content + '\n')
-                            written_rng = True
-                        else:
-                            lines = (concatenated_stdout or '').splitlines()
-                            # Accept only lines that look like RNG/seed lines: hex starting with 0x or plain integer
-                            seed_re = re.compile(r'^(0x[0-9a-fA-F]+|[0-9]+)$')
-                            for ln in lines:
-                                ln_str = ln.strip()
-                                if not ln_str:
-                                    continue
-                                if ln_str.startswith('#'):
-                                    continue
-                                if ln_str.startswith(engine + ' '):
-                                    # skip the echoed command line
-                                    continue
-                                if seed_re.match(ln_str):
-                                    f.write(ln_str + '\n')
-                                    written_rng = True
-                                    break
-                    except Exception:
-                        written_rng = False
-                    # single blank line separating header/info from the simulation body
-                    f.write('\n')
-                    # now write the converted ms-like body
-                    f.write(str(raw_ms) + ('' if str(raw_ms).endswith('\n') else '\n'))
             else:
+                with open(args.out, 'w') as f:
+                    f.write(vcf_text_final)
+        else:
                 f_open = gzip.open if fmt == 'ms.gz' else open
                 mode = 'wt' if fmt == 'ms.gz' else 'w'
                 # Keep file open for the entire write sequence so subsequent writes don't target a closed file.
@@ -3019,18 +3016,63 @@ def main():
                             lines_info.append(ln)
                     for ln in lines_info:
                         f.write(ln + '\n')
-                    # seed lines not written in header; per-replicate seeds are emitted before each replicate block
-                    # format line removed per user request
-                    lines = concatenated_stdout.splitlines(True)
-                    for ln in lines:
-                        # Avoid duplicating echoed command lines. For ms and discoal we skip the engine line.
-                        # For msms, some versions may echo both an 'msms ...' line and a compatibility 'ms ...' line;
-                        # keep only the 'msms' line we already wrote (raw_cmd_line) and drop any stray 'ms ' line.
-                        if ln.startswith(engine+' '):
-                            continue
-                        if engine == 'msms' and ln.startswith('ms '):
-                            continue
-                        f.write(ln)
+                    # Write body: if msprime produced VCF, convert to ms-like per replicate; else, write captured ms-like output.
+                    if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf' and concatenated_stdout:
+                        vcf_text_all = concatenated_stdout
+                        # Build per-rep seed list from runtime chunk seeds
+                        runtime = meta.get('runtime', {}) or {}
+                        chunk_seeds = runtime.get('chunk_seeds') or []
+                        chunk_sizes = runtime.get('chunk_sizes') or []
+                        seed_lines = []
+                        for ci, base_seed in enumerate(chunk_seeds):
+                            if base_seed is None:
+                                continue
+                            reps_in_chunk = chunk_sizes[ci] if ci < len(chunk_sizes) else 1
+                            for r in range(reps_in_chunk):
+                                seed_lines.append(str(int(base_seed) + int(r)))
+                        # Split concatenated VCFs on '##fileformat'
+                        blocks = []
+                        if '##fileformat' in vcf_text_all:
+                            parts = vcf_text_all.split('##fileformat')
+                            for p in parts:
+                                p = p.strip()
+                                if not p:
+                                    continue
+                                blocks.append('##fileformat' + ('\n' if not p.startswith('\n') else '') + p)
+                        else:
+                            blocks = [vcf_text_all]
+                        # Convert each block to ms-like and write with replicate separators and seed lines
+                        for ib, vb in enumerate(blocks):
+                            vb_adj = vb
+                            try:
+                                vb_adj = _adjust_vcf_contig_length(vb_adj, meta.get('chromosome'), meta.get('length'))
+                            except Exception:
+                                pass
+                            # Prepend per-rep seed (plain integer on its own line), if available
+                            if ib < len(seed_lines):
+                                f.write(seed_lines[ib] + '\n')
+                            # Replicate separator
+                            f.write('//\n')
+                            try:
+                                ms_blk = vcf_to_ms_like(vb_adj, meta.get('length'), ploidy=meta.get('ploidy', 1))
+                            except Exception:
+                                ms_blk = 'segsites: 0\n'
+                            if not ms_blk.endswith('\n'):
+                                ms_blk += '\n'
+                            f.write(ms_blk)
+                    else:
+                        # seed lines not written in header; per-replicate seeds are emitted before each replicate block
+                        # format line removed per user request
+                        lines = (concatenated_stdout or '').splitlines(True)
+                        for ln in lines:
+                            # Avoid duplicating echoed command lines. For ms and discoal we skip the engine line.
+                            # For msms, some versions may echo both an 'msms ...' line and a compatibility 'ms ...' line;
+                            # keep only the 'msms' line we already wrote (raw_cmd_line) and drop any stray 'ms ' line.
+                            if ln.startswith(engine+' '):
+                                continue
+                            if engine == 'msms' and ln.startswith('ms '):
+                                continue
+                            f.write(ln)
     # If a paired neutral run is requested, release large primary output buffers now to free RAM before neutral simulation.
     if getattr(args, 'paired_neutral', False):
         try:
@@ -3111,8 +3153,8 @@ def main():
             # Always force per-replicate execution to guarantee a distinct seed per simulation (requested behavior)
             per_rep_mode_neut = True
             neut_chunks = [1] * total_reps_neut
-            # Unique seeds per replicate (each chunk is size 1) for discoal/msms
-            if neut_engine in ('discoal','msms'):
+            # Unique seeds per replicate (each chunk is size 1) for discoal/msms/ms
+            if neut_engine in ('discoal','msms','ms'):
                 try:
                     import random as _rndN
                     unique_seeds_n=set(); seeds_for_chunks_n=[]
@@ -3135,18 +3177,31 @@ def main():
             def run_neut_chunk(rc, chunk_idx=None, rep_index=None):
                 toks_loc = neut_tokens[:]; toks_loc[2] = str(rc)
                 # Force a unique seed for this replicate
-                if neut_engine in ('discoal','msms'):
+                if neut_engine in ('discoal','msms','ms'):
                     seed_val_n = seeds_for_chunks_n[chunk_idx] if chunk_idx is not None and chunk_idx < len(seeds_for_chunks_n) else None
-                    # Remove any pre-existing -seed to avoid duplicates
-                    if '-seed' in toks_loc:
-                        try:
-                            idxs = [i for i,t in enumerate(toks_loc) if t=='-seed']
-                            for idx in reversed(idxs):
-                                del toks_loc[idx:idx+2]
-                        except Exception:
-                            pass
-                    if seed_val_n is not None:
-                        toks_loc.extend(['-seed', str(seed_val_n)])
+                    if neut_engine in ('discoal','msms'):
+                        # Remove any pre-existing -seed to avoid duplicates, then add
+                        if '-seed' in toks_loc:
+                            try:
+                                idxs = [i for i,t in enumerate(toks_loc) if t=='-seed']
+                                for idx in reversed(idxs):
+                                    del toks_loc[idx:idx+2]
+                            except Exception:
+                                pass
+                        if seed_val_n is not None:
+                            toks_loc.extend(['-seed', str(int(seed_val_n))])
+                    elif neut_engine == 'ms':
+                        # Use ms -seeds s1 s2 s3
+                        if '-seeds' in toks_loc:
+                            try:
+                                idxs = [i for i,t in enumerate(toks_loc) if t=='-seeds']
+                                for idx in reversed(idxs):
+                                    del toks_loc[idx:idx+4]
+                            except Exception:
+                                pass
+                        if seed_val_n is not None:
+                            s1 = int(seed_val_n); s2 = s1 + 1; s3 = s1 + 2
+                            toks_loc.extend(['-seeds', str(s1), str(s2), str(s3)])
                 try:
                     # Prevent simulator subprocesses from spawning many OpenMP/BLAS threads
                     env_n = os.environ.copy()
