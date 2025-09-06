@@ -3347,16 +3347,60 @@ def main():
         if neut_engine == engine and neut_engine in ('discoal','msms'):
             base_line = raw_cmd_line
             toks = shlex.split(base_line)
+
             def _strip_discoal(ts):
-                out=[]; i=0; flags={'-ws':1,'-x':1,'-a':1}
+                """Remove discoal selection options: -ws <t>, -x <pos>, -a <2Ns>."""
+                out = []
+                i = 0
+                flags = {'-ws': 1, '-x': 1, '-a': 1}
                 while i < len(ts):
-                    t=ts[i]
+                    t = ts[i]
                     if t in flags:
-                        i+=1+flags[t]; continue
-                    out.append(t); i+=1
+                        i += 1 + flags[t]
+                        continue
+                    out.append(t)
+                    i += 1
+                return out
+
+            def _strip_msms(ts):
+                """Remove msms selection options: -SaA <a> -SAA <2a> -Sp <x> -Smark -SI <t> <npop> <freqs...> -SFC."""
+                out = []
+                i = 0
+                # flags with 1 argument
+                one_arg = {'-SaA', '-SAA', '-Sp'}
+                # flags with variable args
+                while i < len(ts):
+                    t = ts[i]
+                    if t in one_arg:
+                        i += 2  # skip flag and its single value
+                        continue
+                    if t == '-Smark' or t == '-SFC':
+                        i += 1
+                        continue
+                    if t == '-SI':
+                        # structure: -SI <tstart> <npop> <f1> ... <fN>
+                        j = i + 1
+                        # need at least two more tokens for tstart and npop
+                        if j + 1 < len(ts):
+                            # skip tstart and npop
+                            j += 2
+                            try:
+                                npop_val = int(ts[i + 2])
+                            except Exception:
+                                npop_val = 0
+                            j += max(0, npop_val)
+                        i = j
+                        continue
+                    out.append(t)
+                    i += 1
+                return out
+
             # Build a neutral command by stripping selection args from the primary command.
             try:
-                stripped = _strip_discoal(toks)
+                if neut_engine == 'discoal':
+                    stripped = _strip_discoal(toks)
+                else:  # msms
+                    stripped = _strip_msms(toks)
                 neut_cmd = ' '.join(stripped)
             except Exception:
                 neut_cmd = base_line

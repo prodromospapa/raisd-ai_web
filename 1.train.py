@@ -68,6 +68,7 @@ def run_simulation(engine,species_id,model_id,pop_order,train_sample_individuals
         ]
     if gpu:
         args.append("--gpu")
+    
     # run inside the target directory (exit on failure)
     run_subprocess(args, out_dir, f"simulation {model_id}/{pop_order}/{chromosome}")
 
@@ -124,7 +125,8 @@ def train_model(model_id, pop_order, chromosome, epochs):
         "RAiSD-AI",
         "-n", "model",
         "-I", "RAiSD_Images.bin",
-        "-f", "-op", "MDL-GEN",
+        "-f", 
+        "-op", "MDL-GEN",
         "-e", str(epochs),
         "-arc", "FASTER-NN"
     ]
