@@ -64,8 +64,7 @@ def run_simulation(engine,species_id,model_id,pop_order,train_sample_individuals
         "--sel-s", str(sel_s),
         "--threads", str(threads),
         "--target-snps-tol", "0.1",
-        "--paired-neutral",
-        "--neutral-output", "neutral.ms",
+    "--paired-neutral", "neutral.ms",
         ]
     if gpu:
         args.append("--gpu")
@@ -208,13 +207,15 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                 if _model_done(model_id, population, chromosome):
                     # already counted in initial; just continue
                     continue
-                try:               
+                try: 
+                    sweep_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep.ms"
+                    neutral_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/neutral.ms"
+                    if not os.path.exists(sweep_path) or not os.path.exists(neutral_path):
+                        run_simulation(engine, species_id, model_id, population, train_sample_individuals, window, ips, iws, chromosome, train_replicates, sel_s)
+                        
                     for type_ in ["sweep", "neutral"]:
-                        sweep_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/{type_}.ms"
                         img_info = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Images.bin/{type_}TR"
                         if not os.path.exists(img_info):
-                            if not os.path.exists(sweep_path):
-                                run_simulation(engine, species_id, model_id, population, train_sample_individuals, window, ips, iws, chromosome, train_replicates, sel_s)
                             params, selection = get_info(model_id, population, chromosome)
                             sweep_bp = selection.get("sweep_bp")
                             length = params.get("length")

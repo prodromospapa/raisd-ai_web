@@ -820,6 +820,13 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
         'sel_2Ns': a if sel_args else None,
         'sweep_time': sweep_time if sel_args else None,
         'fixation_time': None,
+        'growth_discretization': {
+            'requested_disable': bool(disable_en_ladder),
+            'max_fold_per_step': float(max_fold_per_step),
+            'applied': (not disable_en_ladder and len(en_ladder) > 0),
+            'steps': len(en_ladder),
+            'reason': ('disabled_by_flag' if disable_en_ladder else ('stepwise_en_ladder' if len(en_ladder) > 0 else 'no_exponential_epochs')),
+        },
         'base_comments': [f"# pop0 (sweep-capable) deme: {discoal_pop0}; indices 0-based; order: {desired_disc_order}",
                           f"# theta={theta} rho={rho} length={length} N0={N0} mu={mu} r={rrate} ploidy={ploidy}"],
     }
@@ -943,6 +950,13 @@ def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
         'sel_2Ns': None,
         'sweep_time': None,
         'fixation_time': None,
+        'growth_discretization': {
+            'requested_disable': bool(disable_en_ladder),
+            'max_fold_per_step': float(max_fold_per_step),
+            'applied': (not disable_en_ladder and bool(en_ladder)),
+            'steps': len(en_ladder),
+            'reason': ('disabled_by_flag' if disable_en_ladder else ('stepwise_en_ladder' if en_ladder else 'no_exponential_epochs')),
+        },
     'base_comments': ['# engine='+engine, f"# pop0={pop0}", f"# order={desired_order}",
               f"# theta={theta} rho={rho} length={length} N0={N0} mu={mu} r={rrate} ploidy={ploidy}"],
     }
@@ -1061,6 +1075,13 @@ def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0
         'sel_2Ns': None,
         'sweep_time': None,
         'fixation_time': None,
+        'growth_discretization': {
+            'requested_disable': bool(disable_en_ladder),
+            'max_fold_per_step': float(max_fold_per_step),
+            'applied': (not disable_en_ladder and bool(en_ladder)),
+            'steps': len(en_ladder),
+            'reason': ('disabled_by_flag' if disable_en_ladder else ('stepwise_en_ladder' if en_ladder else 'no_exponential_epochs')),
+        },
     'base_comments': ['# engine='+engine, f"# pop0={pop0}", f"# order={desired_order}",
               f"# theta={theta} rho={rho} length={length} N0={N0} mu={mu} r={rrate} ploidy={ploidy}"],
     }
@@ -1142,8 +1163,21 @@ def build_msprime_command(*, species, model_id, user_order, individual_counts, p
         'length': length, 'reps': reps, 'chromosome': chr_name if chr_name else None,
         'species_id': species, 'graph': graph, 'model_obj': model,
         'samples_graph_order': samples_graph_order,
-        'base_comments': ['# engine=msprime', f"# pop0={pop0}", f"# order={desired_order}"]
+        'base_comments': ['# engine=msprime', f"# pop0={pop0}", f"# order={desired_order}"],
+        # Growth discretization is a no-op for msprime (continuous-size support)
+        'growth_discretization': {
+            'requested_disable': bool(disable_en_ladder),
+            'max_fold_per_step': float(max_fold_per_step),
+            'applied': False,
+            'steps': 0,
+            'reason': 'msprime_supports_continuous_growth',
+        }
     }
+    if (disable_en_ladder or (max_fold_per_step is not None and float(max_fold_per_step) != 1.05)) and debug:
+        try:
+            sys.stderr.write('# INFO: engine=msprime ignores --disable-growth-discretization/--growth-max-fold (native exponential support).\n')
+        except Exception:
+            pass
     if seed is not None:
         meta['seed'] = seed
     return pseudo_cmd, meta
@@ -1305,6 +1339,13 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
         'sel_s': (s if sel_args else None),
         'sweep_time': None,
         'fixation_time': fixation_time if sel_args else None,
+        'growth_discretization': {
+            'requested_disable': bool(disable_en_ladder),
+            'max_fold_per_step': float(max_fold_per_step),
+            'applied': (not disable_en_ladder and bool(en_ladder)),
+            'steps': len(en_ladder),
+            'reason': ('disabled_by_flag' if disable_en_ladder else ('stepwise_en_ladder' if en_ladder else 'no_exponential_epochs')),
+        },
         'base_comments': ['# engine=msms', f"# pop0={pop0}", f"# order={desired_order}",
               f"# theta={theta} rho={rho} length={length} N0={N0} mu={mu} r={rrate} ploidy={ploidy}"],
     }
@@ -1382,9 +1423,14 @@ def parse_args():
     g.add_argument('--sfs-mode', choices=['mean','per-rep'], default='mean', help="SFS aggregation mode.")
 
     pn = ap.add_argument_group('Paired neutral baseline')
-    pn.add_argument('--paired-neutral', action='store_true', help='Also run a neutral simulation with identical parameters (selection removed).')
+    pn.add_argument('--paired-neutral', nargs='?', const=True, default=False,
+                    help=(
+                        'Also run a neutral simulation with identical parameters (selection removed). '
+                        'Optionally provide a name/path for the neutral artifact, e.g., --paired-neutral neutral.ms. '
+                        'If omitted, the neutral filename is the primary name with _neutral before the extension. '
+                        'In SFS-only mode (no --output), the provided value serves as the neutral SFS basename.'
+                    ))
     pn.add_argument('--neutral-engine', choices=['discoal','ms','msms','scrm','msprime'], help='Engine to use for neutral run (default: same as --engine).')
-    pn.add_argument('--neutral-output', dest='neutral_out', help='Neutral output path. Default: main output name with _neutral before extension. If provided together with --sfs and no --output, no neutral ms/vcf file is written; only a neutral SFS is produced using this as basename.')
 
     gd = ap.add_argument_group('Demography')
     gd.add_argument('--disable-growth-discretization', dest='no_en_ladder', action='store_true', help='Disable exponential growth discretization.')
@@ -1711,6 +1757,12 @@ def main():
         args.length = refined_len
 
     # build command (final, using possibly refined args.length unless in debug mode which skips refinement)
+    # Inform about growth-discretization flags with msprime (no effect across the pipeline)
+    try:
+        if engine == 'msprime' and (getattr(args, 'no_en_ladder', False) or (float(getattr(args, 'max_fold_per_step', 1.05)) != 1.05)):
+            sys.stderr.write('# INFO: --disable-growth-discretization/--growth-max-fold have no effect for engine=msprime (continuous growth simulated natively).\n')
+    except Exception:
+        pass
     if engine == 'discoal':
         sim_cmd, meta = build_discoal_command(
             species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
@@ -2336,6 +2388,26 @@ def main():
     if sweeppop and sweeppop != pop0:
         parts_name.append(sweeppop)
     default_stem = '_'.join(parts_name)
+    # If paired-neutral was requested but the primary run is neutral, ignore as redundant.
+    try:
+        if getattr(args, 'paired_neutral', False):
+            eng0 = meta.get('engine')
+            # Neutral if engine is neutral-only or selection args absent
+            primary_neutral = False
+            if eng0 in ('ms', 'scrm', 'msprime'):
+                primary_neutral = True
+            else:
+                sel_present = bool(meta.get('sel_args')) or bool(meta.get('sweep_pos')) or bool(meta.get('sel_2Ns'))
+                primary_neutral = not sel_present
+            if primary_neutral:
+                reason = 'engine is neutral-only' if eng0 in ('ms','scrm','msprime') else 'no sweep parameters provided'
+                try:
+                    sys.stderr.write(f"# INFO: primary simulation is neutral ({reason}); ignoring --paired-neutral.\n")
+                except Exception:
+                    pass
+                setattr(args, 'paired_neutral', False)
+    except Exception:
+        pass
 
     if args.sfs:
         # track whether we've already written the SFS file to avoid duplicate writes/messages
@@ -2692,8 +2764,13 @@ def main():
             if not args.out or args.out == '-':
                 sys.stdout.write(sfs_text)
         # If user requested only SFS (no explicit --output provided), exit now
-        # to avoid continuing with primary output or paired-neutral runs.
-        if getattr(args, 'sfs', False) and not getattr(args, '_user_out_provided', False):
+        # EXCEPT when a paired neutral run is requested, in which case we continue
+        # so we can also generate the neutral paired output/SFS.
+        if (
+            getattr(args, 'sfs', False)
+            and not getattr(args, '_user_out_provided', False)
+            and not getattr(args, 'paired_neutral', False)
+        ):
             try:
                 sys.stderr.flush()
                 sys.stdout.flush()
@@ -2746,193 +2823,352 @@ def main():
             pass
         # Write primary output first
         if fmt == 'bcf':
-            # Build a VCF text (inject metadata) and convert to BCF via bcftools
+            # Produce per-replicate VCF texts then convert each to BCF
+            def _build_vcf_meta_lines_bcf():
+                info_pairs = []
+                info_pairs.append(('engine', meta.get('engine', engine)))
+                info_pairs.append(('species', meta.get('species_id')))
+                info_pairs.append(('model', model_id))
+                info_pairs.append(('pop0', meta.get('pop0')))
+                if meta.get('pop_order'):
+                    info_pairs.append(('order', '|'.join(map(str, meta.get('pop_order')))))
+                if meta.get('counts_disc'):
+                    hap_list = meta.get('counts_disc') or []
+                    pl = meta.get('ploidy', 1) or 1
+                    try:
+                        sample_list = [int(h // pl) for h in hap_list]
+                    except Exception:
+                        sample_list = hap_list
+                    info_pairs.append(('sample_counts', '|'.join(map(str, sample_list))))
+                    info_pairs.append(('hap_counts', '|'.join(map(str, hap_list))))
+                theta_val = rho_val = None
+                try:
+                    toks_tmp = raw_cmd_line.split()
+                    if '-t' in toks_tmp:
+                        theta_val = toks_tmp[toks_tmp.index('-t')+1]
+                    if '-r' in toks_tmp:
+                        rho_val = toks_tmp[toks_tmp.index('-r')+1]
+                except Exception:
+                    pass
+                if theta_val: info_pairs.append(('theta', theta_val))
+                if rho_val: info_pairs.append(('rho', rho_val))
+                info_pairs.append(('length', meta.get('length')))
+                info_pairs.append(('N0', meta.get('N0')))
+                info_pairs.append(('mu', meta.get('mu')))
+                info_pairs.append(('r', meta.get('rrate')))
+                info_pairs.append(('ploidy', meta.get('ploidy')))
+                if meta.get('chromosome') is not None:
+                    info_pairs.append(('chromosome', meta.get('chromosome')))
+                if meta.get('sweep_pos') is not None:
+                    sp = meta.get('sweep_pos')
+                    info_pairs.append(('sweep_pos', sp))
+                    try:
+                        if sp is not None and meta.get('length'):
+                            sweep_bp = int(round(float(sp) * int(meta.get('length'))))
+                            info_pairs.append(('sweep_bp', sweep_bp))
+                    except Exception:
+                        pass
+                if meta.get('sel_2Ns') is not None:
+                    info_pairs.append(('sel_2Ns', meta.get('sel_2Ns')))
+                if meta.get('sweep_time') is not None:
+                    info_pairs.append(('sweep_time', meta.get('sweep_time')))
+                if meta.get('fixation_time') is not None:
+                    info_pairs.append(('fixation_time', meta.get('fixation_time')))
+                kv_dict = {k:v for k,v in info_pairs if v is not None}
+                core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
+                param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
+                sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
+                def build_group_line(prefix, keys):
+                    vals = [f"{k}={kv_dict[k]}" for k in keys if k in kv_dict]
+                    if not vals:
+                        return None
+                    return '# ' + prefix + ': ' + ', '.join(vals)
+                meta_comment_lines_local = []
+                for grp, keys in (('core', core_keys), ('params', param_keys), ('selection', sel_keys)):
+                    ln = build_group_line(grp, keys)
+                    if ln:
+                        meta_comment_lines_local.append(ln)
+                return meta_comment_lines_local
+
+            per_rep_vcfs = []
             if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf' and concatenated_stdout:
-                vcf_text = concatenated_stdout
-                try:
-                    vcf_text = _adjust_vcf_contig_length(vcf_text, meta.get('chromosome'), meta.get('length'))
-                except Exception:
-                    pass
+                vtxt = concatenated_stdout
+                blocks = []
+                if '##fileformat' in vtxt:
+                    parts = vtxt.split('##fileformat')
+                    for p in parts:
+                        p = p.strip()
+                        if not p:
+                            continue
+                        blocks.append('##fileformat' + p if not p.startswith('##fileformat') else p)
+                else:
+                    blocks = [vtxt]
+                for vb in blocks:
+                    try:
+                        vb = _adjust_vcf_contig_length(vb, meta.get('chromosome'), meta.get('length'))
+                    except Exception:
+                        pass
+                    vcf_lines = vb.splitlines()
+                    meta_lines = _build_vcf_meta_lines_bcf()
+                    try:
+                        header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
+                    except StopIteration:
+                        header_idx = len(vcf_lines)
+                    vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines]
+                    vcf_lines_final = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
+                    per_rep_vcfs.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
             else:
-                vcf_text = ms_like_to_vcf(concatenated_stdout, meta['length'], chrom=meta.get('chromosome') or 'chr1', ploidy=meta.get('ploidy',1))
-            # Build and inject metadata comment lines
-            info_pairs = []
-            info_pairs.append(('engine', meta.get('engine', engine)))
-            info_pairs.append(('species', meta.get('species_id')))
-            info_pairs.append(('model', model_id))
-            info_pairs.append(('pop0', meta.get('pop0')))
-            if meta.get('pop_order'):
-                info_pairs.append(('order', '|'.join(map(str, meta.get('pop_order')))))
-            if meta.get('counts_disc'):
-                hap_list = meta.get('counts_disc') or []
-                pl = meta.get('ploidy', 1) or 1
+                # Split ms-like stdout into replicate blocks
+                text = concatenated_stdout or ''
+                blocks = []
+                cur = []
+                for ln in (text.splitlines(True)):
+                    if ln.startswith('//'):
+                        if cur:
+                            blocks.append(''.join(cur))
+                            cur = []
+                        continue
+                    if ln.startswith('ms ') or ln.startswith('msms ') or ln.startswith('discoal ') or ln.startswith('scrm '):
+                        continue
+                    cur.append(ln)
+                if cur:
+                    blocks.append(''.join(cur))
+                for blk in blocks:
+                    vtxt = ms_like_to_vcf(blk, meta['length'], chrom=meta.get('chromosome') or 'chr1', ploidy=meta.get('ploidy',1))
+                    vcf_lines = vtxt.splitlines()
+                    meta_lines = _build_vcf_meta_lines_bcf()
+                    try:
+                        header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
+                    except StopIteration:
+                        header_idx = len(vcf_lines)
+                    vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines]
+                    vcf_lines_final = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
+                    per_rep_vcfs.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
+
+            # Write BCFs
+            if args.reps and args.reps > 1 and args.out and args.out != '-':
+                parent = os.path.dirname(args.out)
+                base = os.path.basename(args.out)
+                # derive folder name by stripping known extensions
+                folder_base = base
+                if base.endswith('.vcf.gz'):
+                    folder_base = base[:-7]
+                elif base.endswith('.vcf') or base.endswith('.bcf'):
+                    folder_base = base[:-4]
+                out_dir = os.path.join(parent, folder_base) if parent else folder_base
                 try:
-                    sample_list = [int(h // pl) for h in hap_list]
-                except Exception:
-                    sample_list = hap_list
-                info_pairs.append(('sample_counts', '|'.join(map(str, sample_list))))
-                info_pairs.append(('hap_counts', '|'.join(map(str, hap_list))))
-            theta_val = rho_val = None
-            try:
-                toks_tmp = raw_cmd_line.split()
-                if '-t' in toks_tmp:
-                    theta_val = toks_tmp[toks_tmp.index('-t')+1]
-                if '-r' in toks_tmp:
-                    rho_val = toks_tmp[toks_tmp.index('-r')+1]
-            except Exception:
-                pass
-            if theta_val: info_pairs.append(('theta', theta_val))
-            if rho_val: info_pairs.append(('rho', rho_val))
-            info_pairs.append(('length', meta.get('length')))
-            info_pairs.append(('N0', meta.get('N0')))
-            info_pairs.append(('mu', meta.get('mu')))
-            info_pairs.append(('r', meta.get('rrate')))
-            info_pairs.append(('ploidy', meta.get('ploidy')))
-            if meta.get('chromosome') is not None:
-                info_pairs.append(('chromosome', meta.get('chromosome')))
-            if meta.get('sweep_pos') is not None:
-                sp = meta.get('sweep_pos')
-                info_pairs.append(('sweep_pos', sp))
-                try:
-                    if sp is not None and meta.get('length'):
-                        sweep_bp = int(round(float(sp) * int(meta.get('length'))))
-                        info_pairs.append(('sweep_bp', sweep_bp))
+                    os.makedirs(out_dir, exist_ok=True)
                 except Exception:
                     pass
-            if meta.get('sel_2Ns') is not None:
-                info_pairs.append(('sel_2Ns', meta.get('sel_2Ns')))
-            if meta.get('sweep_time') is not None:
-                info_pairs.append(('sweep_time', meta.get('sweep_time')))
-            if meta.get('fixation_time') is not None:
-                info_pairs.append(('fixation_time', meta.get('fixation_time')))
-            kv_dict = {k:v for k,v in info_pairs if v is not None}
-            enf_stats = meta.get('enforcement_stats') or {}
-            for k,v in enf_stats.items():
-                kv_dict[k] = v
-            core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
-            param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
-            sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
-            def build_group_line(prefix, keys):
-                vals = [f"{k}={kv_dict[k]}" for k in keys if k in kv_dict]
-                if not vals:
-                    return None
-                return '# ' + prefix + ': ' + ', '.join(vals)
-            meta_comment_lines = []
-            for grp, keys in (('core', core_keys), ('params', param_keys), ('selection', sel_keys)):
-                ln = build_group_line(grp, keys)
-                if ln:
-                    meta_comment_lines.append(ln)
-            vcf_lines = vcf_text.splitlines()
-            try:
-                header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
-            except StopIteration:
-                header_idx = len(vcf_lines)
-            vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_comment_lines]
-            vcf_lines = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
-            vcf_text_final = '\n'.join(vcf_lines) + ('\n' if not vcf_lines[-1].endswith('\n') else '')
-            tmp_vcf = None
-            try:
-                with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
-                    tf.write(vcf_text_final)
-                    tmp_vcf = tf.name
-                _vcf_text_to_bcf(tmp_vcf, args.out)
-            finally:
+                root = folder_base
+                for i, vtxt in enumerate(per_rep_vcfs, start=1):
+                    path_out = os.path.join(out_dir, f"{root}_{i}.bcf")
+                    tmp_vcf = None
+                    try:
+                        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                            tf.write(vtxt)
+                            tmp_vcf = tf.name
+                        _vcf_text_to_bcf(tmp_vcf, path_out)
+                    finally:
+                        try:
+                            if tmp_vcf is not None and os.path.exists(tmp_vcf):
+                                os.unlink(tmp_vcf)
+                        except Exception:
+                            pass
+            else:
+                tmp_vcf = None
                 try:
-                    if tmp_vcf is not None and os.path.exists(tmp_vcf):
-                        os.unlink(tmp_vcf)
-                except Exception:
-                    pass
+                    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                        tf.write(per_rep_vcfs[0] if per_rep_vcfs else '')
+                        tmp_vcf = tf.name
+                    _vcf_text_to_bcf(tmp_vcf, args.out)
+                finally:
+                    try:
+                        if tmp_vcf is not None and os.path.exists(tmp_vcf):
+                            os.unlink(tmp_vcf)
+                    except Exception:
+                        pass
         elif fmt.startswith('vcf'):
-            # If msprime produced VCF directly, use it; otherwise convert from ms-like.
+            # Build metadata lines for header injection
+            def _build_vcf_meta_lines():
+                info_pairs = []
+                info_pairs.append(('engine', meta.get('engine', engine)))
+                info_pairs.append(('species', meta.get('species_id')))
+                info_pairs.append(('model', model_id))
+                info_pairs.append(('pop0', meta.get('pop0')))
+                if meta.get('pop_order'):
+                    info_pairs.append(('order', '|'.join(map(str, meta.get('pop_order')))))
+                if meta.get('counts_disc'):
+                    hap_list = meta.get('counts_disc') or []
+                    pl = meta.get('ploidy', 1) or 1
+                    try:
+                        sample_list = [int(h // pl) for h in hap_list]
+                    except Exception:
+                        sample_list = hap_list
+                    info_pairs.append(('sample_counts', '|'.join(map(str, sample_list))))
+                    info_pairs.append(('hap_counts', '|'.join(map(str, hap_list))))
+                theta_val = rho_val = None
+                try:
+                    toks_tmp = raw_cmd_line.split()
+                    if '-t' in toks_tmp:
+                        theta_val = toks_tmp[toks_tmp.index('-t')+1]
+                    if '-r' in toks_tmp:
+                        rho_val = toks_tmp[toks_tmp.index('-r')+1]
+                except Exception:
+                    pass
+                if theta_val: info_pairs.append(('theta', theta_val))
+                if rho_val: info_pairs.append(('rho', rho_val))
+                info_pairs.append(('length', meta.get('length')))
+                info_pairs.append(('N0', meta.get('N0')))
+                info_pairs.append(('mu', meta.get('mu')))
+                info_pairs.append(('r', meta.get('rrate')))
+                info_pairs.append(('ploidy', meta.get('ploidy')))
+                if meta.get('chromosome') is not None:
+                    info_pairs.append(('chromosome', meta.get('chromosome')))
+                if meta.get('sweep_pos') is not None:
+                    sp = meta.get('sweep_pos')
+                    info_pairs.append(('sweep_pos', sp))
+                    try:
+                        if sp is not None and meta.get('length'):
+                            sweep_bp = int(round(float(sp) * int(meta.get('length'))))
+                            info_pairs.append(('sweep_bp', sweep_bp))
+                    except Exception:
+                        pass
+                if meta.get('sel_2Ns') is not None:
+                    info_pairs.append(('sel_2Ns', meta.get('sel_2Ns')))
+                if meta.get('sweep_time') is not None:
+                    info_pairs.append(('sweep_time', meta.get('sweep_time')))
+                if meta.get('fixation_time') is not None:
+                    info_pairs.append(('fixation_time', meta.get('fixation_time')))
+                kv_dict = {k:v for k,v in info_pairs if v is not None}
+                core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
+                param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
+                sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
+                def build_group_line(prefix, keys):
+                    vals = [f"{k}={kv_dict[k]}" for k in keys if k in kv_dict]
+                    if not vals:
+                        return None
+                    return '# ' + prefix + ': ' + ', '.join(vals)
+                meta_comment_lines_local = []
+                for grp, keys in (('core', core_keys), ('params', param_keys), ('selection', sel_keys)):
+                    ln = build_group_line(grp, keys)
+                    if ln:
+                        meta_comment_lines_local.append(ln)
+                return meta_comment_lines_local
+
+            # Prepare per-replicate VCF texts
+            per_rep_vcfs = []
             if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf' and concatenated_stdout:
-                vcf_text = concatenated_stdout
-                # Adjust contig length annotation to match simulated --length when available
+                vtxt = concatenated_stdout
+                blocks = []
+                if '##fileformat' in vtxt:
+                    parts = vtxt.split('##fileformat')
+                    for p in parts:
+                        p = p.strip()
+                        if not p:
+                            continue
+                        blocks.append('##fileformat' + p if not p.startswith('##fileformat') else p)
+                else:
+                    blocks = [vtxt]
+                for vb in blocks:
+                    try:
+                        vb = _adjust_vcf_contig_length(vb, meta.get('chromosome'), meta.get('length'))
+                    except Exception:
+                        pass
+                    vcf_lines = vb.splitlines()
+                    meta_lines = _build_vcf_meta_lines()
+                    try:
+                        header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
+                    except StopIteration:
+                        header_idx = len(vcf_lines)
+                    vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines]
+                    vcf_lines_final = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
+                    per_rep_vcfs.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
+            else:
+                # Split ms-like stdout into replicate blocks by '//'
+                text = concatenated_stdout or ''
+                blocks = []
+                cur = []
+                for ln in (text.splitlines(True)):
+                    if ln.startswith('//'):
+                        if cur:
+                            blocks.append(''.join(cur))
+                            cur = []
+                        continue
+                    # Skip echoed engine lines
+                    if ln.startswith('ms ') or ln.startswith('msms ') or ln.startswith('discoal ') or ln.startswith('scrm '):
+                        continue
+                    cur.append(ln)
+                if cur:
+                    blocks.append(''.join(cur))
+                for blk in blocks:
+                    vtxt = ms_like_to_vcf(blk, meta['length'], chrom=meta.get('chromosome') or 'chr1', ploidy=meta.get('ploidy',1))
+                    vcf_lines = vtxt.splitlines()
+                    meta_lines = _build_vcf_meta_lines()
+                    try:
+                        header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
+                    except StopIteration:
+                        header_idx = len(vcf_lines)
+                    vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines]
+                    vcf_lines_final = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
+                    per_rep_vcfs.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
+
+            # If multiple replicates, write each to its own file under a folder named after --output
+            if args.reps and args.reps > 1 and args.out and args.out != '-':
+                parent = os.path.dirname(args.out)
+                base = os.path.basename(args.out)
+                # derive folder name by stripping known extensions
+                folder_base = base
+                if fmt == 'vcf.gz' and base.endswith('.vcf.gz'):
+                    folder_base = base[:-7]
+                elif fmt == 'vcf' and base.endswith('.vcf'):
+                    folder_base = base[:-4]
+                elif fmt == 'bcf' and base.endswith('.bcf'):
+                    folder_base = base[:-4]
+                out_dir = os.path.join(parent, folder_base) if parent else folder_base
                 try:
-                    vcf_text = _adjust_vcf_contig_length(vcf_text, meta.get('chromosome'), meta.get('length'))
+                    os.makedirs(out_dir, exist_ok=True)
                 except Exception:
                     pass
+                root = folder_base
+                if root.endswith('.vcf.gz'):
+                    root = root[:-7]
+                    extw = '.vcf.gz'
+                elif root.endswith('.vcf'):
+                    root = root[:-4]
+                    extw = '.vcf'
+                else:
+                    root = root[:-4] if root.endswith('.bcf') else root
+                    extw = '.bcf' if fmt == 'bcf' else ('.vcf.gz' if fmt=='vcf.gz' else '.vcf')
+                for i, vtxt in enumerate(per_rep_vcfs, start=1):
+                    fname = f"{root}_{i}{extw}"
+                    path_out = os.path.join(out_dir, fname)
+                    if fmt == 'vcf.gz':
+                        _write_bgzip_text(path_out, vtxt)
+                    elif fmt == 'bcf':
+                        tmp_vcf = None
+                        try:
+                            with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                                tf.write(vtxt)
+                                tmp_vcf = tf.name
+                            _vcf_text_to_bcf(tmp_vcf, path_out)
+                        finally:
+                            try:
+                                if tmp_vcf is not None and os.path.exists(tmp_vcf):
+                                    os.unlink(tmp_vcf)
+                            except Exception:
+                                pass
+                    else:
+                        with open(path_out, 'w') as f:
+                            f.write(vtxt)
             else:
-                vcf_text = ms_like_to_vcf(concatenated_stdout, meta['length'], chrom=meta.get('chromosome') or 'chr1', ploidy=meta.get('ploidy',1))
-            # Build metadata lines identical to ms output style and inject into VCF header
-            info_pairs = []
-            info_pairs.append(('engine', meta.get('engine', engine)))
-            info_pairs.append(('species', meta.get('species_id')))
-            info_pairs.append(('model', model_id))
-            info_pairs.append(('pop0', meta.get('pop0')))
-            if meta.get('pop_order'):
-                info_pairs.append(('order', '|'.join(map(str, meta.get('pop_order')))))
-            if meta.get('counts_disc'):
-                hap_list = meta.get('counts_disc') or []
-                pl = meta.get('ploidy', 1) or 1
-                try:
-                    sample_list = [int(h // pl) for h in hap_list]
-                except Exception:
-                    sample_list = hap_list  # fallback
-                info_pairs.append(('sample_counts', '|'.join(map(str, sample_list))))
-                info_pairs.append(('hap_counts', '|'.join(map(str, hap_list))))
-            theta_val = rho_val = None
-            try:
-                toks_tmp = raw_cmd_line.split()
-                if '-t' in toks_tmp:
-                    theta_val = toks_tmp[toks_tmp.index('-t')+1]
-                if '-r' in toks_tmp:
-                    rho_val = toks_tmp[toks_tmp.index('-r')+1]
-            except Exception:
-                pass
-            if theta_val: info_pairs.append(('theta', theta_val))
-            if rho_val: info_pairs.append(('rho', rho_val))
-            info_pairs.append(('length', meta.get('length')))
-            info_pairs.append(('N0', meta.get('N0')))
-            info_pairs.append(('mu', meta.get('mu')))
-            info_pairs.append(('r', meta.get('rrate')))
-            info_pairs.append(('ploidy', meta.get('ploidy')))
-            if meta.get('chromosome') is not None:
-                info_pairs.append(('chromosome', meta.get('chromosome')))
-            if meta.get('sweep_pos') is not None:
-                sp = meta.get('sweep_pos')
-                info_pairs.append(('sweep_pos', sp))
-                try:
-                    if sp is not None and meta.get('length'):
-                        sweep_bp = int(round(float(sp) * int(meta.get('length'))))
-                        info_pairs.append(('sweep_bp', sweep_bp))
-                except Exception:
-                    pass
-            if meta.get('sel_2Ns') is not None:
-                info_pairs.append(('sel_2Ns', meta.get('sel_2Ns')))
-            if meta.get('sweep_time') is not None:
-                info_pairs.append(('sweep_time', meta.get('sweep_time')))
-            if meta.get('fixation_time') is not None:
-                info_pairs.append(('fixation_time', meta.get('fixation_time')))
-            kv_dict = {k:v for k,v in info_pairs if v is not None}
-            enf_stats = meta.get('enforcement_stats') or {}
-            for k,v in enf_stats.items():
-                kv_dict[k] = v
-            core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
-            param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
-            sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
-            def build_group_line(prefix, keys):
-                vals = [f"{k}={kv_dict[k]}" for k in keys if k in kv_dict]
-                if not vals:
-                    return None
-                return '# ' + prefix + ': ' + ', '.join(vals)
-            meta_comment_lines = []
-            for grp, keys in (('core', core_keys), ('params', param_keys), ('selection', sel_keys)):
-                ln = build_group_line(grp, keys)
-                if ln:
-                    meta_comment_lines.append(ln)
-            vcf_lines = vcf_text.splitlines()
-            try:
-                header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
-            except StopIteration:
-                header_idx = len(vcf_lines)
-            vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_comment_lines]
-            vcf_lines = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
-            vcf_text_final = '\n'.join(vcf_lines) + ('\n' if not vcf_lines[-1].endswith('\n') else '')
-            if fmt == 'vcf.gz':
-                _write_bgzip_text(args.out, vcf_text_final)
-            else:
-                with open(args.out, 'w') as f:
-                    f.write(vcf_text_final)
+                # Single output file
+                vcf_text = per_rep_vcfs[0] if per_rep_vcfs else ''
+                if fmt == 'vcf.gz':
+                    _write_bgzip_text(args.out, vcf_text)
+                else:
+                    with open(args.out, 'w') as f:
+                        f.write(vcf_text)
         else:
                 f_open = gzip.open if fmt == 'ms.gz' else open
                 mode = 'wt' if fmt == 'ms.gz' else 'w'
@@ -3115,9 +3351,28 @@ def main():
                     if t in flags:
                         i+=1+flags[t]; continue
                     out.append(t); i+=1
-            # Defer creating the SFS file until the run fully completes.
-            sfs_pending = (sfs_path, sfs_text)
-            neut_meta['engine']=neut_engine
+            # Build a neutral command by stripping selection args from the primary command.
+            try:
+                stripped = _strip_discoal(toks)
+                neut_cmd = ' '.join(stripped)
+            except Exception:
+                neut_cmd = base_line
+            # Create a neutral metadata dict from primary meta and clear selection fields.
+            try:
+                if isinstance(meta, dict):
+                    neut_meta = dict(meta)
+                else:
+                    neut_meta = {}
+            except Exception:
+                neut_meta = {}
+            neut_meta['engine'] = neut_engine
+            # Clear selection-specific metadata for the neutral run
+            for k in ('sel_args','sweep_pos','sel_2Ns','sel_s','sweep_time','fixation_time'):
+                if k in neut_meta:
+                    neut_meta[k] = None if not isinstance(neut_meta[k], list) else []
+            # Defer creating the SFS file until the run fully completes (only if available).
+            if 'sfs_path' in locals() and 'sfs_text' in locals():
+                sfs_pending = (sfs_path, sfs_text)
         else:
             if neut_engine=='discoal':
                 neut_cmd, neut_meta = build_discoal_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
@@ -3129,7 +3384,23 @@ def main():
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
                     chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, a=None, s=None, x=None, fixation_time=0.0,
                     debug=args.debug, seed=neut_seed)
+            elif neut_engine=='ms':
+                neut_cmd, neut_meta = build_ms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
+                    pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    seed=neut_seed)
+            elif neut_engine=='scrm':
+                neut_cmd, neut_meta = build_scrm_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
+                    pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    seed=neut_seed)
+            elif neut_engine=='msprime':
+                neut_cmd, neut_meta = build_msprime_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
+                    pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug,
+                    seed=neut_seed)
             else:
+                # Fallback to ms neutral if an unknown engine is somehow specified
                 neut_cmd, neut_meta = build_ms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
                     chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, debug=args.debug,
@@ -3153,8 +3424,8 @@ def main():
             # Always force per-replicate execution to guarantee a distinct seed per simulation (requested behavior)
             per_rep_mode_neut = True
             neut_chunks = [1] * total_reps_neut
-            # Unique seeds per replicate (each chunk is size 1) for discoal/msms/ms
-            if neut_engine in ('discoal','msms','ms'):
+            # Unique seeds per replicate (each chunk is size 1) for discoal/msms/ms/msprime
+            if neut_engine in ('discoal','msms','ms','msprime'):
                 try:
                     import random as _rndN
                     unique_seeds_n=set(); seeds_for_chunks_n=[]
@@ -3177,7 +3448,7 @@ def main():
             def run_neut_chunk(rc, chunk_idx=None, rep_index=None):
                 toks_loc = neut_tokens[:]; toks_loc[2] = str(rc)
                 # Force a unique seed for this replicate
-                if neut_engine in ('discoal','msms','ms'):
+                if neut_engine in ('discoal','msms','ms','msprime'):
                     seed_val_n = seeds_for_chunks_n[chunk_idx] if chunk_idx is not None and chunk_idx < len(seeds_for_chunks_n) else None
                     if neut_engine in ('discoal','msms'):
                         # Remove any pre-existing -seed to avoid duplicates, then add
@@ -3202,6 +3473,73 @@ def main():
                         if seed_val_n is not None:
                             s1 = int(seed_val_n); s2 = s1 + 1; s3 = s1 + 2
                             toks_loc.extend(['-seeds', str(s1), str(s2), str(s3)])
+                    elif neut_engine == 'msprime':
+                        # handled below in-process; nothing to append to toks_loc
+                        pass
+                # Special in-process handling for msprime neutral runs
+                if neut_engine == 'msprime':
+                    try:
+                        eng = sps.get_engine('msprime')
+                    except Exception as e:
+                        return (rc, '', f'# ERROR: neutral msprime: failed to get engine: {e}\n', 1, rep_index)
+                    # Prepare inputs from neut_meta
+                    try:
+                        sp = sps.get_species(neut_meta.get('species_id'))
+                        model_obj = neut_meta.get('model_obj')
+                        chr_name = neut_meta.get('chromosome') or getattr(args, 'chromosome', None)
+                        length_n = int(neut_meta.get('length') or 0)
+                        # Choose contig; try bounded first
+                        try:
+                            chosen_contig = sp.get_contig(chr_name, mutation_rate=getattr(model_obj, 'mutation_rate', None), left=0, right=max(0, length_n - 1))
+                        except Exception:
+                            try:
+                                chosen_contig = sp.get_contig(chr_name)
+                            except Exception:
+                                chosen_contig = None
+                        if chosen_contig is None:
+                            return (rc, '', '# ERROR: neutral msprime: could not resolve contig; provide --chromosome.\n', 1, rep_index)
+                        # Samples per pop from hap counts and ploidy
+                        samples_per_pop = {}
+                        pop_order = neut_meta.get('pop_order') or []
+                        counts_disc = neut_meta.get('counts_disc') or []
+                        pl = neut_meta.get('ploidy', 1) or 1
+                        for i,pop in enumerate(pop_order):
+                            try:
+                                samples_per_pop[pop] = int((counts_disc[i] if i < len(counts_disc) else 0) // pl)
+                            except Exception:
+                                samples_per_pop[pop] = 0
+                        # Seed kwargs
+                        kwargs = {}
+                        if 'seed_val_n' in locals() and seed_val_n is not None:
+                            kwargs['seed'] = int(seed_val_n)
+                        # Prefer model mutation rate if available
+                        try:
+                            mr = getattr(model_obj, 'mutation_rate', None)
+                            if mr is not None:
+                                try:
+                                    chosen_contig.mutation_rate = float(mr)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        ts = eng.simulate(model_obj, chosen_contig, samples_per_pop, **kwargs)
+                        buf = io.StringIO()
+                        if hasattr(ts, 'write_ms'):
+                            ts.write_ms(buf)
+                            neut_meta['produced_format'] = 'ms'
+                        elif hasattr(ts, 'write_vcf'):
+                            ts.write_vcf(buf)
+                            neut_meta['produced_format'] = 'vcf'
+                        else:
+                            return (rc, '', '# ERROR: neutral msprime: no writer available on tree sequence.\n', 1, rep_index)
+                        return (rc, buf.getvalue(), '', None, rep_index)
+                    except Exception as e:
+                        tb = traceback.format_exc()
+                        try:
+                            sys.stderr.write(tb + '\n')
+                        except Exception:
+                            pass
+                        return (rc, '', f'# ERROR: neutral msprime simulate failed: {e}\n', 1, rep_index)
                 try:
                     # Prevent simulator subprocesses from spawning many OpenMP/BLAS threads
                     env_n = os.environ.copy()
@@ -3266,9 +3604,13 @@ def main():
             for r in neut_results:
                 if r[3]:
                     sys.stderr.write(f"# ERROR: neutral replicate returned code {r[3]} (engine={neut_engine}).\n")
-            neut_out_path = getattr(args,'neutral_out', None)
-            # Track whether user explicitly supplied --neutral-output (vs derived from main output)
-            user_specified_neut = getattr(args, 'neutral_out', None) is not None
+            # Determine neutral output path or basename from --paired-neutral value (if provided)
+            paired_val = getattr(args, 'paired_neutral', False)
+            neut_out_path = None
+            user_specified_neut = False
+            if isinstance(paired_val, str) and paired_val.strip():
+                neut_out_path = paired_val.strip()
+                user_specified_neut = True
             if neut_out_path is None and getattr(args, '_user_out_provided', False) and args.out and args.out != '-':
                 main_out = args.out
                 if main_out.endswith('.vcf.gz'):
@@ -3292,8 +3634,8 @@ def main():
                                 neut_out_path = neut_out_path[:-len(kext)]
                                 break
                         neut_out_path = neut_out_path + desired_ext
-            # New behavior: if user only wants SFS (no primary --output provided) and explicitly set --neutral-output,
-            # skip writing the neutral ms/vcf file; still compute neutral SFS using the provided path as basename.
+            # If user only wants SFS (no primary --output) and provided a value to --paired-neutral,
+            # skip writing a neutral ms/vcf file; compute neutral SFS using the provided value as basename.
             skip_neut_file = (not getattr(args, '_user_out_provided', False)) and user_specified_neut and getattr(args, 'sfs', False)
             if skip_neut_file:
                 # We'll still compute SFS below using neut_out_txt; adjust root for naming
@@ -3312,7 +3654,39 @@ def main():
                     neut_root = 'neutral'
                 sys.stderr.write('# INFO: skipping neutral output file (no --output provided); writing only neutral SFS.\n')
                 try:
-                    header_nsfs, lines_nsfs = compute_sfs_fast(neut_out_txt, normalized=args.sfs_normalized, mode=args.sfs_mode)
+                    # If msprime produced VCF, convert to ms-like per replicate before SFS
+                    ms_like_for_sfs = neut_out_txt
+                    try:
+                        if neut_meta.get('engine') == 'msprime' and neut_meta.get('produced_format') == 'vcf' and neut_out_txt:
+                            vtxt = neut_out_txt
+                            blocksC = []
+                            if '##fileformat' in vtxt:
+                                partsC = vtxt.split('##fileformat')
+                                for p in partsC:
+                                    p = p.strip()
+                                    if not p:
+                                        continue
+                                    blocksC.append('##fileformat' + p if not p.startswith('##fileformat') else p)
+                            else:
+                                blocksC = [vtxt]
+                            out_ms_chunks = []
+                            for vb in blocksC:
+                                vb_adj = vb
+                                try:
+                                    vb_adj = _adjust_vcf_contig_length(vb_adj, neut_meta.get('chromosome'), neut_meta.get('length'))
+                                except Exception:
+                                    pass
+                                try:
+                                    ms_blk = vcf_to_ms_like(vb_adj, neut_meta.get('length'), ploidy=neut_meta.get('ploidy', 1))
+                                except Exception:
+                                    ms_blk = 'segsites: 0\n'
+                                if not ms_blk.endswith('\n'):
+                                    ms_blk += '\n'
+                                out_ms_chunks.append('//\n' + ms_blk)
+                            ms_like_for_sfs = ''.join(out_ms_chunks)
+                    except Exception:
+                        pass
+                    header_nsfs, lines_nsfs = compute_sfs_fast(ms_like_for_sfs, normalized=args.sfs_normalized, mode=args.sfs_mode)
                     neut_sfs_path = neut_root + '.sfs'
                     nsfs_text = header_nsfs + '\n' + '\n'.join(lines_nsfs) + '\n'
                     with open(neut_sfs_path, 'w') as fns:
@@ -3323,94 +3697,192 @@ def main():
                 except Exception as e:
                     sys.stderr.write(f"# ERROR: failed to compute/write neutral SFS: {e}\n")
                 neut_out_path = None  # prevent file write path block below
+            elif (neut_out_path is None) and getattr(args, 'sfs', False) and not getattr(args, '_user_out_provided', False):
+                # No explicit neutral path given, SFS-only mode: write neutral SFS to default stem with _neutral suffix
+                try:
+                    header_nsfs, lines_nsfs = compute_sfs_fast(neut_out_txt, normalized=args.sfs_normalized, mode=args.sfs_mode)
+                    neut_sfs_path = f"{default_stem}_neutral.sfs"
+                    nsfs_text = header_nsfs + '\n' + '\n'.join(lines_nsfs) + '\n'
+                    with open(neut_sfs_path, 'w') as fns:
+                        fns.write('# SFS output (neutral paired)\n')
+                        fns.write('# normalized=' + str(args.sfs_normalized) + ' mode=' + args.sfs_mode + '\n')
+                        fns.write(nsfs_text)
+                    sys.stderr.write(f"# INFO: wrote neutral SFS to {neut_sfs_path}\n")
+                except Exception as e:
+                    sys.stderr.write(f"# ERROR: failed to compute/write neutral SFS: {e}\n")
+                neut_out_path = None
             if neut_out_path and neut_out_path != '-':
                 try:
-                    if fmt.startswith('vcf'):
-                        vcf_text_neut = ms_like_to_vcf(neut_out_txt, neut_meta['length'], chrom=neut_meta.get('chromosome') or 'chr1', ploidy=neut_meta.get('ploidy',1))
-                        # Build neutral metadata lines analogous to ms output
-                        info_pairs_n = []
-                        info_pairs_n.append(('engine', neut_meta.get('engine', neut_engine)))
-                        info_pairs_n.append(('species', neut_meta.get('species_id')))
-                        info_pairs_n.append(('model', args.model))
-                        info_pairs_n.append(('pop0', neut_meta.get('pop0')))
-                        pop_order_n = neut_meta.get('pop_order') or []
-                        if pop_order_n:
-                            info_pairs_n.append(('order', '|'.join(map(str, pop_order_n))))
-                        counts_disc_n = neut_meta.get('counts_disc') or []
-                        if counts_disc_n:
-                            pl_n = neut_meta.get('ploidy', 1) or 1
-                            try:
-                                sample_list_n = [int(h // pl_n) for h in counts_disc_n]
-                            except Exception:
-                                sample_list_n = counts_disc_n
-                            info_pairs_n.append(('sample_counts', '|'.join(map(str, sample_list_n))))
-                            info_pairs_n.append(('hap_counts', '|'.join(map(str, counts_disc_n))))
-                        theta_val_n = rho_val_n = None
-                        try:
-                            toks_nt = raw_neut.split()
-                            if '-t' in toks_nt:
-                                theta_val_n = toks_nt[toks_nt.index('-t')+1]
-                            if '-r' in toks_nt:
-                                rho_val_n = toks_nt[toks_nt.index('-r')+1]
-                        except Exception:
-                            pass
-                        if theta_val_n: info_pairs_n.append(('theta', theta_val_n))
-                        if rho_val_n: info_pairs_n.append(('rho', rho_val_n))
-                        info_pairs_n.append(('length', neut_meta.get('length')))
-                        info_pairs_n.append(('N0', neut_meta.get('N0')))
-                        info_pairs_n.append(('mu', neut_meta.get('mu')))
-                        info_pairs_n.append(('r', neut_meta.get('rrate')))
-                        info_pairs_n.append(('ploidy', neut_meta.get('ploidy')))
-                        if neut_meta.get('chromosome') is not None:
-                            info_pairs_n.append(('chromosome', neut_meta.get('chromosome')))
-                        kvn = {k:v for k,v in info_pairs_n if v is not None}
-                        core_keys_n = ['engine','species','model','pop0','order','sample_counts','hap_counts']
-                        param_keys_n = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
-                        def build_line_n_vcf(group_name, keys):
-                            vals = [f"{k}={kvn[k]}" for k in keys if k in kvn]
-                            if not vals:
-                                return None
-                            return '# ' + group_name + ': ' + ', '.join(vals)
-                        meta_lines_neut = []
-                        for grp_n, keys_n in (('core', core_keys_n), ('params', param_keys_n)):
-                            ln_n = build_line_n_vcf(grp_n, keys_n)
-                            if ln_n:
-                                meta_lines_neut.append(ln_n)
-                        # Inject before #CHROM
-                        vcf_lines_neut = vcf_text_neut.splitlines()
-                        try:
-                            header_idx_neut = next(i for i,l in enumerate(vcf_lines_neut) if l.startswith('#CHROM'))
-                        except StopIteration:
-                            header_idx_neut = len(vcf_lines_neut)
-                        vcf_meta_lines_neut = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines_neut]
-                        vcf_lines_neut = vcf_lines_neut[:header_idx_neut] + vcf_meta_lines_neut + vcf_lines_neut[header_idx_neut:]
-                        vcf_text_neut_final = '\n'.join(vcf_lines_neut) + ('\n' if not vcf_lines_neut[-1].endswith('\n') else '')
-                        # adjust contig length for msprime neutral outputs
-                        try:
-                            if neut_meta.get('engine') == 'msprime' and neut_meta.get('produced_format') == 'vcf':
-                                chrom_n = neut_meta.get('chromosome') if neut_meta.get('chromosome') is not None else None
-                                length_n = int(neut_meta.get('length')) if neut_meta.get('length') is not None else None
-                                vcf_text_neut_final = _adjust_vcf_contig_length(vcf_text_neut_final, chrom_n, length_n)
-                        except Exception:
-                            pass
-                        if fmt == 'vcf.gz':
-                            _write_bgzip_text(neut_out_path, vcf_text_neut_final)  # type: ignore[arg-type]
-                        elif fmt == 'bcf':
-                            tmp_vcf = None
-                            try:
-                                with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
-                                    tf.write(vcf_text_neut_final)
-                                    tmp_vcf = tf.name
-                                _vcf_text_to_bcf(tmp_vcf, neut_out_path)
-                            finally:
+                    if fmt.startswith('vcf') or fmt == 'bcf':
+                        # Helper to build neutral VCF meta lines once
+                        def _build_neut_vcf_meta_lines():
+                            info_pairs_n = []
+                            info_pairs_n.append(('engine', neut_meta.get('engine', neut_engine)))
+                            info_pairs_n.append(('species', neut_meta.get('species_id')))
+                            info_pairs_n.append(('model', args.model))
+                            info_pairs_n.append(('pop0', neut_meta.get('pop0')))
+                            pop_order_n = neut_meta.get('pop_order') or []
+                            if pop_order_n:
+                                info_pairs_n.append(('order', '|'.join(map(str, pop_order_n))))
+                            counts_disc_n = neut_meta.get('counts_disc') or []
+                            if counts_disc_n:
+                                pl_n = neut_meta.get('ploidy', 1) or 1
                                 try:
-                                    if tmp_vcf is not None and os.path.exists(tmp_vcf):
-                                        os.unlink(tmp_vcf)
+                                    sample_list_n = [int(h // pl_n) for h in counts_disc_n]
+                                except Exception:
+                                    sample_list_n = counts_disc_n
+                                info_pairs_n.append(('sample_counts', '|'.join(map(str, sample_list_n))))
+                                info_pairs_n.append(('hap_counts', '|'.join(map(str, counts_disc_n))))
+                            theta_val_n = rho_val_n = None
+                            try:
+                                toks_nt = raw_neut.split()
+                                if '-t' in toks_nt:
+                                    theta_val_n = toks_nt[toks_nt.index('-t')+1]
+                                if '-r' in toks_nt:
+                                    rho_val_n = toks_nt[toks_nt.index('-r')+1]
+                            except Exception:
+                                pass
+                            if theta_val_n: info_pairs_n.append(('theta', theta_val_n))
+                            if rho_val_n: info_pairs_n.append(('rho', rho_val_n))
+                            info_pairs_n.append(('length', neut_meta.get('length')))
+                            info_pairs_n.append(('N0', neut_meta.get('N0')))
+                            info_pairs_n.append(('mu', neut_meta.get('mu')))
+                            info_pairs_n.append(('r', neut_meta.get('rrate')))
+                            info_pairs_n.append(('ploidy', neut_meta.get('ploidy')))
+                            if neut_meta.get('chromosome') is not None:
+                                info_pairs_n.append(('chromosome', neut_meta.get('chromosome')))
+                            kvn = {k:v for k,v in info_pairs_n if v is not None}
+                            core_keys_n = ['engine','species','model','pop0','order','sample_counts','hap_counts']
+                            param_keys_n = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
+                            def build_line_n_vcf(group_name, keys):
+                                vals = [f"{k}={kvn[k]}" for k in keys if k in kvn]
+                                if not vals:
+                                    return None
+                                return '# ' + group_name + ': ' + ', '.join(vals)
+                            meta_lines_neut_local = []
+                            for grp_n, keys_n in (('core', core_keys_n), ('params', param_keys_n)):
+                                ln_n = build_line_n_vcf(grp_n, keys_n)
+                                if ln_n:
+                                    meta_lines_neut_local.append(ln_n)
+                            return meta_lines_neut_local
+
+                        per_rep_vcfs_neut = []
+                        if neut_meta.get('engine') == 'msprime' and neut_meta.get('produced_format') == 'vcf' and neut_out_txt:
+                            vtxt_n = neut_out_txt
+                            # Split concatenated VCFs on marker
+                            blocks_n = []
+                            if '##fileformat' in vtxt_n:
+                                parts_n = vtxt_n.split('##fileformat')
+                                for p in parts_n:
+                                    p = p.strip()
+                                    if not p:
+                                        continue
+                                    blocks_n.append('##fileformat' + p if not p.startswith('##fileformat') else p)
+                            else:
+                                blocks_n = [vtxt_n]
+                            for vb in blocks_n:
+                                try:
+                                    vb = _adjust_vcf_contig_length(vb, neut_meta.get('chromosome'), neut_meta.get('length'))
                                 except Exception:
                                     pass
+                                vcf_lines_neut = vb.splitlines()
+                                meta_lines_neut = _build_neut_vcf_meta_lines()
+                                try:
+                                    header_idx_neut = next(i for i,l in enumerate(vcf_lines_neut) if l.startswith('#CHROM'))
+                                except StopIteration:
+                                    header_idx_neut = len(vcf_lines_neut)
+                                vcf_meta_lines_neut = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines_neut]
+                                vcf_lines_neut = vcf_lines_neut[:header_idx_neut] + vcf_meta_lines_neut + vcf_lines_neut[header_idx_neut:]
+                                per_rep_vcfs_neut.append('\n'.join(vcf_lines_neut) + ('\n' if vcf_lines_neut and not vcf_lines_neut[-1].endswith('\n') else ''))
                         else:
-                            with open(neut_out_path, 'w') as f2:
-                                f2.write(vcf_text_neut_final)
+                            # Convert ms-like neutral stdout to VCF per replicate
+                            text_n = neut_out_txt or ''
+                            blocks_n = []
+                            cur_n = []
+                            for ln in (text_n.splitlines(True)):
+                                if ln.startswith('//'):
+                                    if cur_n:
+                                        blocks_n.append(''.join(cur_n))
+                                        cur_n = []
+                                    continue
+                                if ln.startswith('ms ') or ln.startswith('msms ') or ln.startswith('discoal ') or ln.startswith('scrm '):
+                                    continue
+                                cur_n.append(ln)
+                            if cur_n:
+                                blocks_n.append(''.join(cur_n))
+                            for blk in blocks_n:
+                                vtxt = ms_like_to_vcf(blk, neut_meta['length'], chrom=neut_meta.get('chromosome') or 'chr1', ploidy=neut_meta.get('ploidy',1))
+                                vcf_lines = vtxt.splitlines()
+                                meta_lines_neut = _build_neut_vcf_meta_lines()
+                                try:
+                                    header_idx_neut = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
+                                except StopIteration:
+                                    header_idx_neut = len(vcf_lines)
+                                vcf_meta_lines_neut = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines_neut]
+                                vcf_lines_final = vcf_lines[:header_idx_neut] + vcf_meta_lines_neut + vcf_lines[header_idx_neut:]
+                                per_rep_vcfs_neut.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
+
+                        # Write outputs: per-replicate into a folder when reps > 1, else single file
+                        if args.reps and args.reps > 1:
+                            parent_n = os.path.dirname(neut_out_path)
+                            base_n = os.path.basename(neut_out_path)
+                            # derive folder name by stripping known extensions
+                            folder_base_n = base_n
+                            if fmt == 'vcf.gz' and base_n.endswith('.vcf.gz'):
+                                folder_base_n = base_n[:-7]
+                            elif fmt == 'vcf' and base_n.endswith('.vcf'):
+                                folder_base_n = base_n[:-4]
+                            elif fmt == 'bcf' and base_n.endswith('.bcf'):
+                                folder_base_n = base_n[:-4]
+                            out_dir_n = os.path.join(parent_n, folder_base_n) if parent_n else folder_base_n
+                            try:
+                                os.makedirs(out_dir_n, exist_ok=True)
+                            except Exception:
+                                pass
+                            root_n = folder_base_n
+                            for i, vtxt in enumerate(per_rep_vcfs_neut, start=1):
+                                if fmt == 'vcf.gz':
+                                    path_out = os.path.join(out_dir_n, f"{root_n}_{i}.vcf.gz")
+                                    _write_bgzip_text(path_out, vtxt)
+                                elif fmt == 'bcf':
+                                    path_out = os.path.join(out_dir_n, f"{root_n}_{i}.bcf")
+                                    tmp_vcf = None
+                                    try:
+                                        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                                            tf.write(vtxt)
+                                            tmp_vcf = tf.name
+                                        _vcf_text_to_bcf(tmp_vcf, path_out)
+                                    finally:
+                                        try:
+                                            if tmp_vcf is not None and os.path.exists(tmp_vcf):
+                                                os.unlink(tmp_vcf)
+                                        except Exception:
+                                            pass
+                                else:
+                                    path_out = os.path.join(out_dir_n, f"{root_n}_{i}.vcf")
+                                    with open(path_out, 'w') as f2:
+                                        f2.write(vtxt)
+                        else:
+                            # Single file
+                            single_vtxt = per_rep_vcfs_neut[0] if per_rep_vcfs_neut else ''
+                            if fmt == 'vcf.gz':
+                                _write_bgzip_text(neut_out_path, single_vtxt)  # type: ignore[arg-type]
+                            elif fmt == 'bcf':
+                                tmp_vcf = None
+                                try:
+                                    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                                        tf.write(single_vtxt)
+                                        tmp_vcf = tf.name
+                                    _vcf_text_to_bcf(tmp_vcf, neut_out_path)
+                                finally:
+                                    try:
+                                        if tmp_vcf is not None and os.path.exists(tmp_vcf):
+                                            os.unlink(tmp_vcf)
+                                    except Exception:
+                                        pass
+                            else:
+                                with open(neut_out_path, 'w') as f2:
+                                    f2.write(single_vtxt)
                     else:
                         # Raw neutral ms-like output (optionally gzipped)
                         f_open_neut = gzip.open if fmt == 'ms.gz' else open
@@ -3463,16 +3935,92 @@ def main():
                                 ln_n = build_line_n(grp_n, keys_n)
                                 if ln_n:
                                     f2.write(ln_n + '\n')  # type: ignore[arg-type]
-                            for ln2 in neut_out_txt.splitlines(True):
-                                if ln2.startswith(neut_engine+' '):
-                                    continue
-                                if neut_engine == 'msms' and ln2.startswith('ms '):
-                                    continue
-                                f2.write(ln2)  # type: ignore[arg-type]
+                            # Body: if msprime produced VCF but requested ms/ms.gz, convert VCF->ms-like per replicate
+                            if neut_meta.get('engine') == 'msprime' and neut_meta.get('produced_format') == 'vcf' and neut_out_txt:
+                                vcf_text_all_n = neut_out_txt
+                                # Build per-rep seed list from seeds_for_chunks_n and neut_chunks
+                                seed_lines_n = []
+                                try:
+                                    if isinstance(neut_chunks, list) and isinstance(seeds_for_chunks_n, list):
+                                        for ci, base_seed in enumerate(seeds_for_chunks_n):
+                                            if base_seed is None:
+                                                continue
+                                            reps_in_chunk = 1 if ci >= len(neut_chunks) else int(neut_chunks[ci])
+                                            for r in range(reps_in_chunk):
+                                                seed_lines_n.append(str(int(base_seed) + int(r)))
+                                except Exception:
+                                    seed_lines_n = []
+                                # Split concatenated VCFs on '##fileformat'
+                                blocks_n = []
+                                if '##fileformat' in vcf_text_all_n:
+                                    parts_n = vcf_text_all_n.split('##fileformat')
+                                    for p in parts_n:
+                                        p = p.strip()
+                                        if not p:
+                                            continue
+                                        blocks_n.append('##fileformat' + p if not p.startswith('##fileformat') else p)
+                                else:
+                                    blocks_n = [vcf_text_all_n]
+                                for ib, vb in enumerate(blocks_n):
+                                    vb_adj = vb
+                                    try:
+                                        vb_adj = _adjust_vcf_contig_length(vb_adj, neut_meta.get('chromosome'), neut_meta.get('length'))
+                                    except Exception:
+                                        pass
+                                    # per-rep seed line
+                                    if ib < len(seed_lines_n):
+                                        f2.write(seed_lines_n[ib] + '\n')  # type: ignore[arg-type]
+                                    f2.write('//\n')  # replicate separator
+                                    try:
+                                        ms_blk_n = vcf_to_ms_like(vb_adj, neut_meta.get('length'), ploidy=neut_meta.get('ploidy', 1))
+                                    except Exception:
+                                        ms_blk_n = 'segsites: 0\n'
+                                    if not ms_blk_n.endswith('\n'):
+                                        ms_blk_n += '\n'
+                                    f2.write(ms_blk_n)  # type: ignore[arg-type]
+                            else:
+                                for ln2 in neut_out_txt.splitlines(True):
+                                    if ln2.startswith(neut_engine+' '):
+                                        continue
+                                    if neut_engine == 'msms' and ln2.startswith('ms '):
+                                        continue
+                                    f2.write(ln2)  # type: ignore[arg-type]
                     sys.stderr.write(f"# INFO: wrote paired neutral output to {neut_out_path}\n")
                     if getattr(args, 'sfs', False):
                         try:
-                            header_nsfs, lines_nsfs = compute_sfs_fast(neut_out_txt, normalized=args.sfs_normalized, mode=args.sfs_mode)
+                            # If msprime produced VCF, convert to ms-like per replicate before SFS
+                            ms_like_for_sfs = neut_out_txt
+                            try:
+                                if neut_meta.get('engine') == 'msprime' and neut_meta.get('produced_format') == 'vcf' and neut_out_txt:
+                                    vtxt = neut_out_txt
+                                    blocksC = []
+                                    if '##fileformat' in vtxt:
+                                        partsC = vtxt.split('##fileformat')
+                                        for p in partsC:
+                                            p = p.strip()
+                                            if not p:
+                                                continue
+                                            blocksC.append('##fileformat' + p if not p.startswith('##fileformat') else p)
+                                    else:
+                                        blocksC = [vtxt]
+                                    out_ms_chunks = []
+                                    for vb in blocksC:
+                                        vb_adj = vb
+                                        try:
+                                            vb_adj = _adjust_vcf_contig_length(vb_adj, neut_meta.get('chromosome'), neut_meta.get('length'))
+                                        except Exception:
+                                            pass
+                                        try:
+                                            ms_blk = vcf_to_ms_like(vb_adj, neut_meta.get('length'), ploidy=neut_meta.get('ploidy', 1))
+                                        except Exception:
+                                            ms_blk = 'segsites: 0\n'
+                                        if not ms_blk.endswith('\n'):
+                                            ms_blk += '\n'
+                                        out_ms_chunks.append('//\n' + ms_blk)
+                                    ms_like_for_sfs = ''.join(out_ms_chunks)
+                            except Exception:
+                                pass
+                            header_nsfs, lines_nsfs = compute_sfs_fast(ms_like_for_sfs, normalized=args.sfs_normalized, mode=args.sfs_mode)
                             neut_root = neut_out_path
                             if neut_root.endswith('.vcf.gz'):
                                 neut_root = neut_root[:-7]
