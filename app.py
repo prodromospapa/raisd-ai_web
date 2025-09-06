@@ -1468,7 +1468,14 @@ def get_chromosomes():
             chromosomes = [line.strip() for line in f if line.strip()]
     except Exception as e:
         return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
-    return json.dumps({'species': species, 'chromosomes': chromosomes}), 200, {'Content-Type': 'application/json'}
+    # Normalize for UI: strip leading 'chr' so dropdowns show consistent values like '1', 'X', etc.
+    norm_chroms = [c.replace('chr', '') if isinstance(c, str) and c.lower().startswith('chr') else c for c in chromosomes]
+    # Deduplicate while preserving order
+    seen = set(); ordered = []
+    for c in norm_chroms:
+        if c not in seen:
+            seen.add(c); ordered.append(c)
+    return json.dumps({'species': species, 'chromosomes': ordered}), 200, {'Content-Type': 'application/json'}
 
 
 @app.route('/genes', methods=['GET'])
@@ -1565,17 +1572,23 @@ def upload():
             contigs = []
         if contigs:
             if len(contigs) == 1:
-                suggested = contigs[0]
+                # normalize suggestion to stripped form
+                suggested = contigs[0].replace('chr', '') if isinstance(contigs[0], str) and contigs[0].lower().startswith('chr') else contigs[0]
             else:
                 # prefer plain numeric contig '1' over 'chr1' when present
-                if '1' in contigs:
+                # normalize contig list for suggestion checks
+                contig_norm = [c.replace('chr', '') if isinstance(c, str) and c.lower().startswith('chr') else c for c in contigs]
+                if '1' in contig_norm:
                     suggested = '1'
-                elif 'chr1' in contigs:
-                    suggested = 'chr1'
+                else:
+                    # As fallback, pick the first normalized contig
+                    suggested = contig_norm[0] if contig_norm else None
     except Exception as e:
         append_log(run_dir, f"Upload-time contig inspection failed: {e}")
 
-    payload = {'run_id': run_id, 'filename': fname, 'contigs': contigs}
+    # Return contigs normalized (strip 'chr') for UI convenience but keep original filename
+    contigs_norm = [c.replace('chr', '') if isinstance(c, str) and c.lower().startswith('chr') else c for c in contigs]
+    payload = {'run_id': run_id, 'filename': fname, 'contigs': contigs_norm}
     if suggested:
         payload['suggested_chromosome'] = suggested
     return json.dumps(payload), 200, {'Content-Type': 'application/json'}
