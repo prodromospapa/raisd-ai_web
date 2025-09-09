@@ -241,9 +241,10 @@ def _ensure_local_tmpdir():
         base = os.path.dirname(__file__) or os.getcwd()
     except Exception:
         base = os.getcwd()
-        # hidden directory to avoid accidental commits; include pid+rand to avoid collisions
-    name = f".simulator_tmp_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
-    path = os.path.join(base, name)
+    # Repo-local parent (hidden) named '.tmp' to group all runs; per-run subfolders inside it
+    repo_parent = os.path.join(base, '.tmp')
+    run_name = f"simulator_run_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
+    path = os.path.join(repo_parent, run_name)
     # Prefer using system tmpdir if it's a tmpfs (in-RAM) for speed.
     try:
         system_tmp = tempfile.gettempdir()
@@ -290,8 +291,9 @@ def _ensure_local_tmpdir():
             except Exception:
                 pass
 
-        # fallback to repo-local hidden folder (as before)
+        # fallback to repo-local hidden '.tmp' parent with per-run subfolder
         try:
+            os.makedirs(repo_parent, exist_ok=True)
             os.makedirs(path, exist_ok=True)
             _LOCAL_TMP_ROOT = path
         except Exception:
@@ -310,7 +312,21 @@ def _cleanup_local_tmpdir():
     try:
         # only remove directories we created (hidden prefix) to be safe
         base_name = os.path.basename(_LOCAL_TMP_ROOT or '')
-        if base_name.startswith('.simulator_tmp_') and os.path.isdir(_LOCAL_TMP_ROOT):
+        parent = os.path.dirname(_LOCAL_TMP_ROOT or '')
+        # If this is a per-run folder inside repo '.tmp', remove run folder and remove parent if empty
+        if parent and os.path.basename(parent) == '.tmp' and os.path.isdir(_LOCAL_TMP_ROOT):
+            try:
+                shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
+            except Exception:
+                pass
+            # remove the .tmp parent if empty
+            try:
+                if os.path.isdir(parent) and not os.listdir(parent):
+                    shutil.rmtree(parent, ignore_errors=True)
+            except Exception:
+                pass
+        # keep previous safety: support older naming convention
+        elif base_name.startswith('.simulator_tmp_') and os.path.isdir(_LOCAL_TMP_ROOT):
             shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
     except Exception:
         pass
@@ -1927,6 +1943,9 @@ def parse_args():
     g.add_argument('--output', dest='out', default=None,
                    help=("Output file path. If omitted, modelid_pop0[_chrom][_sweeppop].EXT is written (EXT per --output-format). "
                          "Use '-' for stdout."))
+    g.add_argument('--temp', dest='temp_loc', choices=['local','tmpfs','auto'], default='local',
+                   help=("Where to place intermediate temporary files: 'local' (repo-local hidden folder),"
+                         " 'tmpfs' (system tmp if it's tmpfs), or 'auto' (use tmpfs if available). Default: local."))
     g.add_argument('--output-format', dest='format', default='ms', choices=['ms','ms.gz','vcf','vcf.gz','bcf'],
                    help="Output format. 'ms'/'ms.gz' write raw ms-like (optionally gzipped); 'vcf'/'vcf.gz' convert single replicate to VCF.")
     g.add_argument('--parallel', dest='parallel', type=int, default=1,
@@ -2061,7 +2080,38 @@ def parse_args():
 
 # ----------------------- Simulation Orchestration -----------------------
 def _pre_run_setup(args):
-    """Placeholder pre-run hook (no-op to preserve behavior)."""
+    """Pre-run hook: set temp dir preference from args.temp_loc.
+
+    Behaviour:
+    - default 'local' to avoid RAM overflow
+    - 'tmpfs' attempts to use system tmpfs (/tmp); if unavailable we warn and fall back to local
+    - 'auto' uses tmpfs only when available
+    """
+    try:
+        pref = getattr(args, 'temp_loc', 'local')
+        if pref == 'local':
+            os.environ['SIMULATOR_USE_REPO_TMP'] = '1'
+            os.environ.pop('SIMULATOR_USE_SYSTEM_TMP', None)
+        elif pref == 'tmpfs':
+            if _system_tmp_is_tmpfs():
+                os.environ['SIMULATOR_USE_SYSTEM_TMP'] = '1'
+                os.environ.pop('SIMULATOR_USE_REPO_TMP', None)
+            else:
+                try:
+                    sys.stderr.write('# WARNING: requested tmpfs but system temp is not a tmpfs; using local repo .tmp instead.\n')
+                except Exception:
+                    pass
+                os.environ['SIMULATOR_USE_REPO_TMP'] = '1'
+                os.environ.pop('SIMULATOR_USE_SYSTEM_TMP', None)
+        else:  # auto
+            if _system_tmp_is_tmpfs():
+                os.environ['SIMULATOR_USE_SYSTEM_TMP'] = '1'
+                os.environ.pop('SIMULATOR_USE_REPO_TMP', None)
+            else:
+                os.environ['SIMULATOR_USE_REPO_TMP'] = '1'
+                os.environ.pop('SIMULATOR_USE_SYSTEM_TMP', None)
+    except Exception:
+        pass
     return None
 
 def _post_run_teardown(args, result):
