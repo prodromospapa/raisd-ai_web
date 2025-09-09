@@ -7,16 +7,18 @@ from tqdm.auto import tqdm
 import stdpopsim
 import subprocess
 
-# Hard-code your inputs here
-parser = argparse.ArgumentParser(description="Simulate allele frequency spectra.")
-parser.add_argument(
-    "--species",
-    type=str,
-    required=True,
-    help="Species name (e.g., 'MusMus')."
-)
-args = parser.parse_args()
-species = args.species
+# # Hard-code your inputs here
+# parser = argparse.ArgumentParser(description="Simulate allele frequency spectra.")
+# parser.add_argument(
+#     "--species",
+#     type=str,
+#     required=True,
+#     help="Species name (e.g., 'MusMus')."
+# )
+# args = parser.parse_args()
+# species = args.species
+
+species = "Homo sapiens"
 
 parallel = 10
 samples = 10_000

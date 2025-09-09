@@ -9,7 +9,7 @@
 #!/usr/bin/env python3
 import argparse, math, sys, subprocess, shlex, concurrent.futures, gzip, re, json
 import shutil, tempfile
-import os, time, random
+import os, time, random, atexit, signal
 import stdpopsim as sps
 import io
 import traceback
@@ -244,11 +244,60 @@ def _ensure_local_tmpdir():
         # hidden directory to avoid accidental commits; include pid+rand to avoid collisions
     name = f".simulator_tmp_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
     path = os.path.join(base, name)
+    # Prefer using system tmpdir if it's a tmpfs (in-RAM) for speed.
     try:
-        os.makedirs(path, exist_ok=True)
-        _LOCAL_TMP_ROOT = path
+        system_tmp = tempfile.gettempdir()
     except Exception:
-        # fallback to system tempdir
+        system_tmp = None
+
+    def _is_tmpfs(p):
+        try:
+            # find best mount match from /proc/mounts
+            mounts = []
+            with open('/proc/mounts', 'rt') as m:
+                for ln in m:
+                    parts = ln.split()
+                    if len(parts) >= 3:
+                        mounts.append((parts[1], parts[2]))
+            # choose longest mountpoint prefix that matches p
+            best = ('', '')
+            for mp, fstype in mounts:
+                if p.startswith(mp) and len(mp) > len(best[0]):
+                    best = (mp, fstype)
+            return best[1] in ('tmpfs', 'ramfs')
+        except Exception:
+            return False
+
+    try:
+        # Allow overriding via environment: force repo-local tmp if set
+        force_repo = os.environ.get('SIMULATOR_USE_REPO_TMP', '')
+        force_system = os.environ.get('SIMULATOR_USE_SYSTEM_TMP', '')
+        if force_repo:
+            use_system = False
+        elif force_system:
+            use_system = True
+        else:
+            use_system = bool(system_tmp and _is_tmpfs(system_tmp))
+
+        if use_system and system_tmp:
+            # create a hidden subdir under system tmp (tmpfs) for speed
+            name2 = f"simulator_tmp_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
+            path2 = os.path.join(system_tmp, name2)
+            try:
+                os.makedirs(path2, exist_ok=True)
+                _LOCAL_TMP_ROOT = path2
+                return _LOCAL_TMP_ROOT
+            except Exception:
+                pass
+
+        # fallback to repo-local hidden folder (as before)
+        try:
+            os.makedirs(path, exist_ok=True)
+            _LOCAL_TMP_ROOT = path
+        except Exception:
+            # final fallback to system tempdir
+            _LOCAL_TMP_ROOT = tempfile.gettempdir()
+    except Exception:
         _LOCAL_TMP_ROOT = tempfile.gettempdir()
     return _LOCAL_TMP_ROOT
 
@@ -267,6 +316,36 @@ def _cleanup_local_tmpdir():
         pass
     finally:
         _LOCAL_TMP_ROOT = None
+
+
+# Register cleanup handlers so tmp dir is removed on process exit or common termination signals
+def _register_cleanup_handlers():
+    try:
+        atexit.register(_cleanup_local_tmpdir)
+    except Exception:
+        pass
+    def _signal_handler(signum, frame):
+        try:
+            _cleanup_local_tmpdir()
+        except Exception:
+            pass
+        # Re-raise default handler if possible
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except Exception:
+            pass
+        try:
+            os.kill(os.getpid(), signum)
+        except Exception:
+            pass
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _signal_handler)
+        except Exception:
+            pass
+
+# call registration at import time
+_register_cleanup_handlers()
 
 # ---------- conversion helpers ----------
 
