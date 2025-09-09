@@ -1,0 +1,12 @@
+*
+!static
+!templates
+!website_launcher.py
+!install_dependencies.sh
+!raisd-ai.yml
+!simulator.py
+!1.train.py
+!2.annotation.py
+!3.sfs.py
+!run.sh
+!.gitignore
