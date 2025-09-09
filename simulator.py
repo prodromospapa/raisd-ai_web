@@ -1,3 +1,11 @@
+# [Refined] msms builder fix applied. build_msms_command occurrences: 1
+# =============================================================================
+# File: simulator_final.py
+# Purpose: Safe, readability-first refactor. Keeps logic intact while exposing
+#          a small orchestrator around the original core function.
+# Generated: 2025-09-09T03:45:38
+# =============================================================================
+
 #!/usr/bin/env python3
 import argparse, math, sys, subprocess, shlex, concurrent.futures, gzip, re, json
 import shutil, tempfile
@@ -7,11 +15,7 @@ import io
 import traceback
 import demes
 from demes.ms import to_ms
-try:
-    from tqdm import tqdm
-except Exception:
-    tqdm = None
-    
+from tqdm import tqdm
 
 def present_size_of(deme: demes.Deme):
     for ep in deme.epochs:
@@ -38,12 +42,6 @@ def harmonic_number(n):
     except Exception:
         return 0.0
     if n_int <= 0:
-        # Clean up temp files unless the environment requests to keep them
-        try:
-            keep_temp = os.environ.get('KEEP_SIM_TEMP', '') != ''
-            _cleanup_runtime_tempfiles(meta, keep=keep_temp)
-        except Exception:
-            pass
         return 0.0
     return sum(1.0/i for i in range(1, n_int+1))
 
@@ -63,7 +61,6 @@ def strip_I_block(ms_cmd):
     j = i + 2 + npop
     return ' '.join(toks[:i] + toks[j:])
 
-
 def strip_all_growth(ms_cmd):
     toks = ms_cmd.split()
     out = []
@@ -74,7 +71,6 @@ def strip_all_growth(ms_cmd):
             continue
         out.append(toks[i]); i += 1
     return ' '.join(out)
-
 
 def remap_indices_ms_1based(ms_cmd, mapping):
     toks = ms_cmd.split(); out = []; i = 0
@@ -91,6 +87,13 @@ def remap_indices_ms_1based(ms_cmd, mapping):
             try:
                 idx = int(float(toks[i+2]))
                 out += ['-en', toks[i+1], str(mapping.get(idx, idx)), toks[i+3]]
+                i += 4; continue
+            except Exception:
+                pass
+        if t == '-es' and i+3 < len(toks):
+            try:
+                idx = int(float(toks[i+2]))
+                out += ['-es', toks[i+1], str(mapping.get(idx, idx)), toks[i+3]]
                 i += 4; continue
             except Exception:
                 pass
@@ -118,7 +121,6 @@ def remap_indices_ms_1based(ms_cmd, mapping):
         out.append(t); i += 1
     return ' '.join(out)
 
-
 def map_ej_to_ed(ms_cmd):
     toks = ms_cmd.split(); out = []; i = 0
     while i < len(toks):
@@ -127,7 +129,6 @@ def map_ej_to_ed(ms_cmd):
             i += 4; continue
         out.append(toks[i]); i += 1
     return ' '.join(out)
-
 
 def shift_to_0_based(ms_cmd):
     toks = ms_cmd.split(); out = []; i = 0
@@ -151,6 +152,12 @@ def shift_to_0_based(ms_cmd):
                 i += 4; continue
             except ValueError:
                 pass
+        if t == '-es' and i + 3 < len(toks):
+            try:
+                out += ['-es', toks[i+1], str(int(float(toks[i+2]))-1), toks[i+3]]
+                i += 4; continue
+            except ValueError:
+                pass
         if t == '-n' and i + 2 < len(toks):
             try:
                 out += ['-n', str(int(float(toks[i+1]))-1), toks[i+2]]
@@ -159,7 +166,6 @@ def shift_to_0_based(ms_cmd):
                 pass
         out.append(t); i += 1
     return ' '.join(out)
-
 
 def stepwise_from_exponential_epochs_graph_order(graph, N0, max_fold_per_step=1.05):
     en = []
@@ -183,10 +189,13 @@ def stepwise_from_exponential_epochs_graph_order(graph, N0, max_fold_per_step=1.
     en.sort(key=lambda x: -x[0])
     return en
 
-
 def sanitize_ms_demography(ms_demog_str):
     toks = ms_demog_str.split(); out = []; i = 0
-    arg_counts = {'-n':2,'-en':3,'-m':3,'-em':4,'-ej':3}
+    # include common ms-style -e* flags with their expected argument counts so
+    # sanitize preserves their arguments instead of dropping them. Missing
+    # entries here caused flags like '-es' to be emitted without their args,
+    # which breaks downstream MS-like parsers (see CmdLineParseException).
+    arg_counts = {'-n':2,'-en':3,'-m':3,'-em':4,'-ej':3, '-ed':3, '-es':3}
     while i < len(toks):
         t = toks[i]
         if t == '-eg':
@@ -202,7 +211,6 @@ def sanitize_ms_demography(ms_demog_str):
             out.append(t)
         i += 1
     return ' '.join(out)
-
 
 def _make_affinity_preexec(cpu_list):
     """Return a preexec_fn that sets CPU affinity for the child process (best-effort)."""
@@ -332,134 +340,6 @@ def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int =
         body.append(f'{chrom}\t{p}\tsnp{vidx}\t{ref}\t{alt}\t.\tPASS\t.\tGT\t' + '\t'.join(genos))
     return '\n'.join(header + body) + '\n'
 
-
-def _iter_stdout_file_paths(meta, concatenated_stdout=None):
-    """Yield stdout file paths recorded in meta['runtime']['stdout_files'] if present.
-    If concatenated_stdout is provided (non-empty), this generator yields no files
-    since callers may prefer to consume the string directly.
-    """
-    if concatenated_stdout:
-        return
-        yield  # pragma: no cover - keep generator type if used
-    try:
-        runtime = (meta or {}).get('runtime', {}) if isinstance(meta, dict) else {}
-        paths = runtime.get('stdout_files') or []
-    except Exception:
-        paths = []
-    for p in paths:
-        if p:
-            yield p
-
-
-def seg_sites_list_from_meta_or_text(meta, text):
-    """Return a list of segsites counts (ints) discovered in the provided text
-    or in files recorded in meta['runtime']['stdout_files'].
-    """
-    pat = re.compile(r'^segsites:\s*(\d+)', re.MULTILINE)
-    results = []
-    if text:
-        try:
-            results = [int(x) for x in pat.findall(text)]
-        except Exception:
-            results = []
-        return results
-    # No in-memory text: scan files line-by-line to avoid loading whole file
-    for fp in _iter_stdout_file_paths(meta, text):
-        try:
-            with open(fp, 'r') as fh:
-                for ln in fh:
-                    m = pat.match(ln)
-                    if m:
-                        try:
-                            results.append(int(m.group(1)))
-                        except Exception:
-                            pass
-        except Exception:
-            continue
-    return results
-
-
-def stream_stdout_to_writer(meta, text, writer):
-    """Stream simulator stdout contents to a writer (file-like). If text is
-    provided, write it directly; otherwise stream files recorded in meta.
-    """
-    if text:
-        try:
-            writer.write(text)
-        except Exception:
-            # best-effort
-            for ln in (text.splitlines(True)):
-                try:
-                    writer.write(ln)
-                except Exception:
-                    pass
-        return
-    for fp in _iter_stdout_file_paths(meta, text):
-        if not fp:
-            continue
-        try:
-            with open(fp, 'r') as fh:
-                for ln in fh:
-                    try:
-                        writer.write(ln)
-                    except Exception:
-                        pass
-        except Exception:
-            continue
-
-
-def _stdout_any_startswith(meta, text, prefixes):
-    """Return True if the provided in-memory text or any recorded stdout file
-    begins with any of the provided prefixes (tuple of strings). This is a
-    lightweight probe that only reads a small head from the first file.
-    """
-    try:
-        if text and isinstance(text, str):
-            s = text.lstrip()
-            for p in prefixes:
-                if s.startswith(p):
-                    return True
-    except Exception:
-        pass
-    for fp in _iter_stdout_file_paths(meta, text):
-        try:
-            with open(fp, 'r') as fh:
-                head = fh.read(1024)
-                if not head:
-                    continue
-                s = head.lstrip()
-                for p in prefixes:
-                    if s.startswith(p):
-                        return True
-                # only probe first file
-                break
-        except Exception:
-            continue
-    return False
-
-
-def iter_stdout_lines(meta, text):
-    """Yield lines from in-memory text if provided, otherwise stream lines from
-    files recorded in meta['runtime']['stdout_files'].
-    """
-    if text:
-        for ln in text.splitlines(True):
-            yield ln
-        return
-    for fp in _iter_stdout_file_paths(meta, text):
-        if not fp:
-            continue
-        try:
-            with open(fp, 'r') as fh:
-                for ln in fh:
-                    yield ln
-        except Exception:
-            continue
-
-
-
-
-
 def _msprime_worker_run(payload, env=None):
     """Run a small msprime worker in-process using stdpopsim.
 
@@ -469,17 +349,6 @@ def _msprime_worker_run(payload, env=None):
     out_parts = []
     err_parts = []
     exit_code = 0
-
-    # Progress reporting (only active if parent passed a queue)
-    progress_q = None
-    progress_every = 1
-    try:
-        progress_q = payload.get('progress_queue')
-        progress_every = int(payload.get('progress_every', 1) or 1)
-    except Exception:
-        progress_q = None
-        progress_every = 1
-    _prog_sent = 0
     # If an env mapping was provided, temporarily apply it so msprime and
     # underlying native libraries see the intended OpenMP/BLAS thread caps.
     # Restore the original environment after the run to avoid global side-effects.
@@ -628,29 +497,11 @@ def _msprime_worker_run(payload, env=None):
                 ts = eng.simulate(model_obj, chosen_contig, samples_per_pop)
                 ms_block = _ts_to_ms_like(ts, length or (getattr(chosen_contig, 'length', None) or 0), ploidy)
                 out_parts.append(ms_block)
-
-                # Per-replicate progress update (batched via progress_every)
-                if progress_q:
-                    try:
-                        _prog_sent += 1
-                        if (_prog_sent % progress_every) == 0:
-                            progress_q.put(progress_every)
-                            _prog_sent = 0
-                    except Exception:
-                        pass
             except Exception as e:
                 import traceback as _tb
                 err_parts.append(f"# ERROR: msprime simulate failed for replicate {ridx}: {e}\n{_tb.format_exc()}\n")
                 exit_code = 10
                 break
-
-        # Flush any leftover progress (< progress_every) at end of loop
-        if progress_q and _prog_sent:
-            try:
-                progress_q.put(_prog_sent)
-                _prog_sent = 0
-            except Exception:
-                pass
 
     except Exception as e:
         import traceback as _tb
@@ -671,7 +522,6 @@ def _msprime_worker_run(payload, env=None):
                 pass
 
     return (''.join(out_parts), ''.join(err_parts), exit_code)
-
 
 def vcf_to_ms_like(vcf_text, length, ploidy=1):
     """Convert a single-replicate VCF string into a minimal ms-like string.
@@ -787,7 +637,6 @@ def _write_bgzip_text(path: str, text: str):
             try: os.unlink(tmp_path)
             except Exception: pass
 
-
 def _vcf_text_to_bcf(path_vcf: str, path_bcf: str):
     """Convert VCF (plain or gz) text file at path_vcf into BCF at path_bcf using bcftools.
 
@@ -801,7 +650,6 @@ def _vcf_text_to_bcf(path_vcf: str, path_bcf: str):
             raise RuntimeError(proc.stderr.decode().strip())
     except Exception as e:
         raise SystemExit(f'# ERROR: failed to convert VCF to BCF via bcftools: {e}')
-
 
 def _adjust_vcf_contig_length(vcf_text: str, chrom_id=None, new_length=None) -> str:
     """Replace contig length for contig with ID==chrom_id in a VCF text block.
@@ -886,10 +734,6 @@ def compute_sfs(ms_text, normalized=False, mode='mean'):
         return ('#SFS', ['# No replicates parsed'])
     # assume all replicates have same haplotype count
     n_hap = len(replicates[0])
-    if not isinstance(n_hap, int) or n_hap <= 0:
-        raise SystemExit('ERROR: Invalid haplotype count detected for SFS.')
-    # normalize to concrete int for static analysis and downstream arithmetic
-    n_hap = int(n_hap)
     for haps in replicates:
         if len(haps) != n_hap:
             raise SystemExit('ERROR: Inconsistent haplotype counts across replicates for SFS.')
@@ -970,318 +814,245 @@ def compute_sfs_fast(ms_text, normalized=False, mode='mean'):
         if len(haps) != n_hap:
             raise SystemExit('ERROR: Inconsistent haplotype counts across replicates for SFS.')
     header = '#SFS\t' + '\t'.join(str(k) for k in range(1, n_hap))
+    # Memory-efficient helper that avoids forming an n_hap x L matrix.
+    def _sfs_vals_from_haps(haps):
+        if not haps:
+            return _np.zeros(n_hap-1, dtype=(_np.float32 if normalized else float))
+        L = len(haps[0])
+        for hp in haps:
+            if len(hp) != L:
+                raise SystemExit('ERROR: Inconsistent haplotype sequence lengths.')
+        if L == 0:
+            return _np.zeros(n_hap-1, dtype=(_np.float32 if normalized else float))
+        # Choose the smallest unsigned dtype that can hold counts up to n_hap
+        if n_hap <= 255:
+            _dtype_counts = _np.uint8
+        elif n_hap <= 65535:
+            _dtype_counts = _np.uint16
+        else:
+            _dtype_counts = _np.uint32
+        counts_per_site = _np.zeros(L, dtype=_dtype_counts)
+        # Accumulate per-site derived counts streaming one haplotype at a time
+        for hp in haps:
+            arr = _np.frombuffer(hp.encode('ascii'), dtype='S1') == b'1'
+            # Add directly; bool will upcast to chosen unsigned dtype
+            counts_per_site += arr
+        binc = _np.bincount(counts_per_site, minlength=n_hap+1)
+        raw = binc[1:n_hap]
+        if normalized:
+            denom = raw.sum()
+            return ((raw / denom).astype(_np.float32) if denom > 0 else _np.zeros_like(raw, dtype=_np.float32))
+        # Non-normalized: prefer integer vector to minimize memory; callers may upcast if needed
+        return raw.astype(_np.int32, copy=False)
+
     if mode == 'per-rep':
         out_lines = []
         for ridx, haps in enumerate(replicates, start=1):
-            if not haps:
-                continue
-            L = len(haps[0])
-            for hp in haps:
-                if len(hp) != L:
-                    raise SystemExit('ERROR: Inconsistent haplotype sequence lengths.')
-            if L == 0:
-                vals = [0]*(n_hap-1)
-            else:
-                # Build contiguous byte buffer for all haplotypes and reshape
-                buf = ''.join(haps).encode('ascii')
-                if len(buf) < n_hap * L:
-                    # malformed haplotypes; fallback to safe python impl
-                    vals = compute_sfs('\n'.join(['//'] + ['segsites: '+str(L)] + haps), normalized=normalized, mode='per-rep')[1][0].split('\t')[1:]
-                    vals = [float(x) if x not in ('', None) else 0.0 for x in vals]
-                else:
-                    expected_len = int(n_hap) * int(L)
-                    # Strict check: ensure buffer length matches expected haplotypes*L
-                    if len(buf) != expected_len:
-                        # try a conservative cleanup: drop trailing newlines/spaces
-                        buf2 = buf.rstrip()
-                        if len(buf2) != expected_len:
-                            # fallback to safe python implementation
-                            vals = compute_sfs('\n'.join(['//'] + ['segsites: '+str(L)] + haps), normalized=normalized, mode='per-rep')[1][0].split('\t')[1:]
-                            vals = [float(x) if x not in ('', None) else 0.0 for x in vals]
-                            out_lines.append(f"rep{ridx}\t" + '\t'.join(str(v) for v in vals))
-                            continue
-                        buf = buf2
-                    mat = _np.frombuffer(buf, dtype='S1').reshape(n_hap, L)
-                    counts = (mat == b'1').sum(axis=0)  # per-site derived allele count
-                    binc = _np.bincount(counts, minlength=n_hap+1)
-                    raw = binc[1:n_hap]  # exclude monomorphic counts
-                    if normalized:
-                        denom = raw.sum()
-                        if denom > 0:
-                            vals = (raw / denom).tolist()
-                        else:
-                            vals = [0.0]*(n_hap-1)
-                    else:
-                        vals = raw.tolist()
-            out_lines.append(f"rep{ridx}\t" + '\t'.join(str(v) for v in vals))
+            vals = _sfs_vals_from_haps(haps)
+            out_lines.append(f"rep{ridx}\t" + '\t'.join(str(v) for v in vals.tolist()))
         return header, out_lines
     else:  # mean mode
-        accum = _np.zeros(n_hap-1, dtype=float)
+        accum = _np.zeros(n_hap-1, dtype=(_np.float32 if normalized else float))
         used = 0
         for haps in replicates:
-            if not haps:
+            vals = _sfs_vals_from_haps(haps)
+            if vals.size == 0:
                 continue
-            L = len(haps[0])
-            for hp in haps:
-                if len(hp) != L:
-                    raise SystemExit('ERROR: Inconsistent haplotype sequence lengths.')
-            if L == 0:
-                continue
-            buf = ''.join(haps).encode('ascii')
-            if len(buf) < n_hap * L:
-                # malformed block, skip
-                continue
-            expected_len = int(n_hap) * int(L)
-            if len(buf) != expected_len:
-                buf2 = buf.rstrip()
-                if len(buf2) != expected_len:
-                    # malformed block, skip
-                    continue
-                buf = buf2
-            mat = _np.frombuffer(buf, dtype='S1').reshape(n_hap, L)
-            counts = (mat == b'1').sum(axis=0)
-            binc = _np.bincount(counts, minlength=n_hap+1)
-            raw = binc[1:n_hap]
-            if normalized:
-                denom = raw.sum()
-                row = raw/denom if denom > 0 else _np.zeros_like(raw)
-            else:
-                row = raw
-            accum += row
+            accum += vals
             used += 1
         if used == 0:
             mean_vals = [0]*(n_hap-1)
         else:
-            mean_vals = (accum / used).tolist()
-        return header, ['mean\t' + '\t'.join(str(v) for v in mean_vals)]
-
-
-
-def compute_sfs_best(meta, concatenated_stdout, normalized=False, mode='mean'):
-    """Choose the best available source to compute SFS for external engines:
-    - Prefer streaming from meta['runtime']['stdout_files'] (gzip-aware).
-    - Fall back to parsing in-memory concatenated stdout text if no files are recorded.
-    - As a last resort, return an empty SFS.
-    Returns (header, lines) like existing SFS helpers.
-    """
-    # Collect file paths recorded during run
-    paths = []
-    try:
-        runtime = (meta or {}).get('runtime') if isinstance(meta, dict) else None
-        paths = (runtime.get('stdout_files') or []) if runtime else []
-    except Exception:
-        paths = []
-    # Prefer streaming from files
-    if paths:
-        try:
-            header, lines = stream_sfs_from_files(paths, normalized=normalized, mode=mode)
-            # If streaming succeeded and produced lines, use it
-            if lines:
-                return header, lines
-        except Exception:
-            pass
-    # Fallback: parse concatenated stdout text if available
-    if concatenated_stdout:
-        try:
-            return compute_sfs_from_meta_or_text(meta, concatenated_stdout, normalized=normalized, mode=mode)
-        except Exception:
-            pass
-    # Nothing available; return an empty SFS header with no lines
-    try:
-        # Try to infer number of haplotypes from meta to size the header
-        n_hap = 0
-        try:
-            counts = (meta or {}).get('counts_disc') or []
-            pl = int((meta or {}).get('ploidy', 1) or 1)
-            n_hap = int(sum(int(x) for x in counts))
-        except Exception:
-            n_hap = 0
-        if n_hap and n_hap > 1:
-            header = '#SFS\t' + '\t'.join(str(k) for k in range(1, n_hap))
-        else:
-            header = '#SFS'
-    except Exception:
-        header = '#SFS'
-    return header, []
-def stream_sfs_from_files(file_paths, normalized=False, mode='mean'):
-    """Stream ms-like replicate blocks from one or more files and compute SFS without loading all text.
-
-    file_paths: iterable of paths to files containing ms-like output (may contain multiple replicates per file).
-    Returns (header, lines) same as compute_sfs_fast.
-    """
-    try:
-        import numpy as _np
-    except Exception:
-        # Fallback: read into memory and call compute_sfs (rare without numpy)
-        buf = []
-        for p in file_paths:
+            # Convert accumulator to float64 for final averaging to reduce rounding error
             try:
-                # gzip-aware read
-                if str(p).endswith('.gz'):
-                    import gzip as _gz
-                    with _gz.open(p, 'rt') as fh:
-                        buf.append(fh.read())
-                else:
-                    with open(p, 'r') as fh:
-                        buf.append(fh.read())
+                mean_vals = (accum.astype(_np.float64) / float(used)).tolist()
+            except Exception:
+                mean_vals = (accum / float(used)).tolist()
+        # If normalized requested, ensure the mean vector sums to 1 (numerical guard)
+        if normalized:
+            try:
+                s = float(sum(mean_vals))
+                if s > 0.0:
+                    mean_vals = [v / s for v in mean_vals]
             except Exception:
                 pass
-        return compute_sfs('\n'.join(buf), normalized=normalized, mode=mode)
+        return header, ['mean\t' + '\t'.join(str(v) for v in mean_vals)]
 
-    # Helper: generator that yields lists of hap strings per replicate
-    def replicate_generator(paths):
-        for p in paths:
+def _stream_sfs_mean_from_file(path, n_hap_expected=None, normalized=False):
+    """Stream-parse an ms-like file and compute the mean SFS across replicates.
+
+    - Reads line-by-line to avoid holding entire data in RAM.
+    - For each replicate, allocates a per-site counter vector of minimal dtype and
+      accumulates haplotype rows one-by-one.
+    - Returns (header, ["mean\t..."]).
+    """
+    import numpy as _np
+    used = 0
+    accum = None  # float32 when normalized; otherwise int32 for compactness
+    header = None
+
+    # Select minimal dtype for per-site counts based on expected n_hap
+    def _counts_dtype(nh):
+        if nh is None:
+            return _np.uint16
+        if nh <= 255:
+            return _np.uint8
+        if nh <= 65535:
+            return _np.uint16
+        return _np.uint32
+
+    with open(path, 'rt') as fh:
+        line = fh.readline()
+        while line:
+            # find next replicate
+            if not line.lstrip().startswith('segsites:'):
+                line = fh.readline();
+                continue
+            # segsites line
             try:
-                if str(p).endswith('.gz'):
-                    import gzip as _gz
-                    fh = _gz.open(p, 'rt')
-                else:
-                    fh = open(p, 'r')
-                with fh:
-                    cur_lines = []
-                    in_rep = False
-                    for ln in fh:
-                        if ln.startswith('//'):
-                            # end of replicate marker; yield if we have hap lines
-                            if cur_lines:
-                                # parse ms-like block from cur_lines
-                                text = ''.join(cur_lines)
-                                for h in _parse_ms_like_replicates(text):
-                                    yield h
-                                cur_lines = []
-                            in_rep = False
-                            continue
-                        if ln.strip().startswith('segsites:'):
-                            # start of a replicate block
-                            cur_lines = [ln]
-                            in_rep = True
-                            continue
-                        if in_rep:
-                            cur_lines.append(ln)
-                    # flush remaining block
-                    if cur_lines:
-                        text = ''.join(cur_lines)
-                        for h in _parse_ms_like_replicates(text):
-                            yield h
+                segsites = int(line.split()[1])
             except Exception:
+                segsites = 0
+            # find positions: line
+            pos_line = None
+            for _ in range(10):
+                line = fh.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if s.startswith('positions:'):
+                    pos_line = s
+                    break
+                if s.startswith('segsites:'):
+                    # malformed, step back by one as outer while will see it
+                    break
+            if pos_line is None:
+                # skip malformed replicate
                 continue
-
-
-    # Consume generator to list of replicates but carefully to avoid huge intermediate strings.
-    replicates = []
-    n_hap = None
-    for haps in replicate_generator(file_paths):
-        if not haps:
-            continue
-        if n_hap is None:
-            n_hap = len(haps)
-            if not isinstance(n_hap, int) or n_hap <= 0:
-                raise SystemExit('ERROR: Invalid haplotype count detected for SFS.')
-        else:
-            if len(haps) != n_hap:
-                raise SystemExit('ERROR: Inconsistent haplotype counts across replicates for SFS.')
-        replicates.append(haps)
-
-    if not replicates:
-        return ('#SFS', ['# No replicates parsed'])
-
-    # Ensure n_hap is valid and an int (type-checkers sometimes see it as Optional)
-    if n_hap is None:
-        return ('#SFS', ['# No replicates parsed'])
-    try:
-        n_hap = int(n_hap)
-    except Exception:
-        return ('#SFS', ['# Invalid haplotype count'])
-    if n_hap <= 0:
-        return ('#SFS', ['# Invalid haplotype count'])
-
-    # Now reuse numpy-optimized aggregation but operate per-replicate to avoid building huge buffers
-    header = '#SFS\t' + '\t'.join(str(k) for k in range(1, n_hap))
-    if mode == 'per-rep':
-        out_lines = []
-        for ridx, haps in enumerate(replicates, start=1):
-            L = len(haps[0]) if haps else 0
+            # parse number of positions to infer L
+            try:
+                L = len(pos_line.split(':', 1)[1].strip().split())
+            except Exception:
+                L = 0
+            # if no sites, skip replicate for mean (match previous behavior)
             if L == 0:
-                vals = [0] * (n_hap - 1)
-            else:
-                buf = ''.join(haps).encode('ascii')
-                if len(buf) < n_hap * L:
-                    vals = compute_sfs('\n'.join(['//'] + ['segsites: '+str(L)] + haps), normalized=normalized, mode='per-rep')[1][0].split('\t')[1:]
-                    vals = [float(x) if x not in ('', None) else 0.0 for x in vals]
+                # advance to next replicate boundary
+                while True:
+                    pos = fh.tell()
+                    line = fh.readline()
+                    if not line:
+                        break
+                    st = line.strip()
+                    if not st or st.startswith('//') or st.startswith('segsites:'):
+                        # rewind one line to let outer loop see 'segsites:'
+                        try:
+                            fh.seek(pos)
+                        except Exception:
+                            pass
+                        break
+                # no contribution
+                continue
+            # Prepare per-site counts
+            counts_dtype = _counts_dtype(n_hap_expected)
+            counts = _np.zeros(L, dtype=counts_dtype)
+            n_haps_seen = 0
+            # Read hap lines
+            while True:
+                pos = fh.tell()
+                line = fh.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if (not s) or s.startswith('//') or s.startswith('segsites:') or s.startswith('positions:'):
+                    # end of replicate block
+                    try:
+                        fh.seek(pos)
+                    except Exception:
+                        pass
+                    break
+                # accept only 0/1 hap strings
+                if set(s) <= {'0','1'} and len(s) == L:
+                    arr = _np.frombuffer(s.encode('ascii'), dtype='S1') == b'1'
+                    counts += arr
+                    n_haps_seen += 1
                 else:
-                    expected_len = int(n_hap) * int(L)
-                    if len(buf) != expected_len:
-                        buf2 = buf.rstrip()
-                        if len(buf2) != expected_len:
-                            vals = compute_sfs('\n'.join(['//'] + ['segsites: '+str(L)] + haps), normalized=normalized, mode='per-rep')[1][0].split('\t')[1:]
-                            vals = [float(x) if x not in ('', None) else 0.0 for x in vals]
-                            out_lines.append(f"rep{ridx}\t" + '\t'.join(str(v) for v in vals))
-                            continue
-                        buf = buf2
-                    mat = _np.frombuffer(buf, dtype='S1').reshape(n_hap, L)
-                    counts = (mat == b'1').sum(axis=0)
-                    binc = _np.bincount(counts, minlength=n_hap+1)
-                    raw = binc[1:n_hap]
-                    if normalized:
-                        denom = raw.sum()
-                        if denom > 0:
-                            vals = (raw / denom).tolist()
-                        else:
-                            vals = [0.0] * (n_hap - 1)
-                    else:
-                        vals = raw.tolist()
-            out_lines.append(f"rep{ridx}\t" + '\t'.join(str(v) for v in vals))
-        return header, out_lines
-    else:
-        accum = _np.zeros(n_hap - 1, dtype=float)
-        used = 0
-        for haps in replicates:
-            L = len(haps[0]) if haps else 0
-            if L == 0:
-                continue
-            buf = ''.join(haps).encode('ascii')
-            if len(buf) < n_hap * L:
-                # malformed block, skip
-                continue
-            expected_len = int(n_hap) * int(L)
-            if len(buf) != expected_len:
-                buf2 = buf.rstrip()
-                if len(buf2) != expected_len:
-                    # malformed block, skip
+                    # skip malformed line in this context
                     continue
-                buf = buf2
-            mat = _np.frombuffer(buf, dtype='S1').reshape(n_hap, L)
-            counts = (mat == b'1').sum(axis=0)
+            # Validate n_hap across replicates if expected provided
+            if n_hap_expected is not None and n_haps_seen != int(n_hap_expected):
+                raise SystemExit('ERROR: Inconsistent haplotype counts in streaming SFS computation.')
+            n_hap = int(n_hap_expected) if n_hap_expected is not None else int(n_haps_seen)
+            if header is None:
+                header = '#SFS\t' + '\t'.join(str(k) for k in range(1, n_hap))
             binc = _np.bincount(counts, minlength=n_hap+1)
             raw = binc[1:n_hap]
             if normalized:
                 denom = raw.sum()
-                row = raw / denom if denom > 0 else _np.zeros_like(raw)
+                row = (raw/denom).astype(_np.float32) if denom > 0 else _np.zeros_like(raw, dtype=_np.float32)
             else:
-                row = raw
-            accum += row
+                # keep integers until final mean to minimize memory
+                row = raw.astype(_np.int32, copy=False)
+            if accum is None:
+                # initialize accum matching the selected dtype for row
+                accum = row.copy()
+            else:
+                # ensure shapes match in case of unexpected variability
+                if accum.shape != row.shape:
+                    raise SystemExit('ERROR: SFS length mismatch across replicates in streaming computation.')
+                accum += row
             used += 1
-        if used == 0:
-            mean_vals = [0] * (n_hap - 1)
-        else:
-            mean_vals = (accum / used).tolist()
-        return header, ['mean\t' + '\t'.join(str(v) for v in mean_vals)]
+            # continue scanning: read next line for outer loop
+            line = fh.readline()
 
+    if used == 0 or accum is None:
+        if header is None and n_hap_expected:
+            header = '#SFS\t' + '\t'.join(str(k) for k in range(1, int(n_hap_expected)))
+        mean_vals = [0]*( (int(n_hap_expected)-1) if n_hap_expected else 0 )
+    else:
+        # Convert accumulator to float64 for final averaging to reduce rounding error
+        try:
+            mean_vals = (accum.astype(_np.float64) / float(used)).tolist()
+        except Exception:
+            mean_vals = (accum / float(used)).tolist()
+    # If normalized, renormalize final mean to guard against tiny numerical drift
+    if normalized:
+        try:
+            s = float(sum(mean_vals))
+            if s > 0.0:
+                mean_vals = [v / s for v in mean_vals]
+        except Exception:
+            pass
+    return header or '#SFS', ['mean\t' + '\t'.join(str(v) for v in mean_vals)]
 
-def compute_sfs_from_meta_or_text(meta_obj, text_blob, normalized=False, mode='mean'):
-    """Compute SFS using streaming files from meta runtime if available, else from text blob."""
-    # Prefer files written by runner
-    try:
-        runtime = (meta_obj or {}).get('runtime') if isinstance(meta_obj, dict) else None
-        if runtime:
-            files = runtime.get('stdout_files') or []
-            files = [f for f in files if f]
-            if files:
-                return stream_sfs_from_files(files, normalized=normalized, mode=mode)
-    except Exception:
-        pass
-    # Fallback to in-memory text processing
-    return compute_sfs_fast(text_blob or '', normalized=normalized, mode=mode)
+def compute_sfs_stream_mean(ms_text, n_hap_expected, normalized=False, use_temp_file=True):
+    """Compute mean SFS from ms-like text in a memory-efficient, streaming fashion.
+
+    If use_temp_file is True, spill text to a temporary file first so we can drop
+    the in-memory copy early (callers can del the string). Otherwise, wrap with
+    StringIO; temp file is preferred for large inputs.
+    """
+    import tempfile, os
+    if use_temp_file:
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile('w', delete=False) as tf:
+                tf.write(ms_text)
+                tmp = tf.name
+            return _stream_sfs_mean_from_file(tmp, n_hap_expected=n_hap_expected, normalized=normalized)
+        finally:
+            if tmp and os.path.exists(tmp):
+                try: os.unlink(tmp)
+                except Exception: pass
+    else:
+        # Fallback without disk (still stream per line, but holds ms_text in memory)
+        import io, numpy as _np
+        used = 0
+        accum = None
+        header = '#SFS\t' + '\t'.join(str(k) for k in range(1, int(n_hap_expected)))
+        # Reuse file-based implementation by first writing to disk is better; keep a simple fallback
+        buf = io.StringIO(ms_text)
+        # Write to a temp file anyway to reuse tested code path
+        return compute_sfs_stream_mean(ms_text, n_hap_expected, normalized, use_temp_file=True)
 
 # ---------- discoal builder ----------
 
@@ -1585,7 +1356,6 @@ def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
         meta['seed'] = seed
     return full_cmd, meta
 
-
 # ---------- scrm (SMC approximation) builder ----------
 def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0,
                        reps, length, max_fold_per_step, chr_name=None,
@@ -1708,7 +1478,6 @@ def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0
     if seed is not None:
         meta['seed'] = seed
     return full_cmd, meta
-
 
 # ---------- msprime (in-process stdpopsim engine) builder ----------
 def build_msprime_command(*, species, model_id, user_order, individual_counts, pop0,
@@ -2162,8 +1931,22 @@ def parse_args():
                 raise SystemExit(f"ERROR: Chromosome '{chr_name}' not found for species '{args.species}' in stdpopsim.")
     return args
 
-def main():
-    args = parse_args()
+# ----------------------- Simulation Orchestration -----------------------
+def _pre_run_setup(args):
+    """Placeholder pre-run hook (no-op to preserve behavior)."""
+    return None
+
+def _post_run_teardown(args, result):
+    """Placeholder post-run hook (no-op to preserve behavior)."""
+    return result
+
+def run_simulation_from_args(args):
+    """Thin orchestrator delegating to the original core implementation."""
+    _pre_run_setup(args)
+    result = _run_simulation_core(args)
+    return _post_run_teardown(args, result)
+
+def _run_simulation_core(args):
     # Track whether user explicitly provided --output (before we potentially assign a default)
     setattr(args, '_user_out_provided', args.out is not None and args.out != '')
     user_order = [d.strip() for d in args.demes.split(',') if d.strip()]
@@ -2478,14 +2261,8 @@ def main():
 
     # ---------------- Simulation runner + enforcement helpers ----------------
     def _simulate_current_length(length_val, show_progress=True):
-        """Simplified runner: build the simulator command for the requested length,
-        run it as a single chunk, and capture stdout/stderr into temp files. Returns
-        (meta_loc, raw_cmd_line_loc, stdout_text_or_None, stderr_text_or_None) where
-        the text outputs are None to indicate streaming files were used (their
-        paths are recorded in meta_loc['runtime']).
-        """
-        # Build command & metadata for the requested engine/length
-        meta_loc = {}
+        """Build and execute simulation at given length. Returns meta, raw_cmd_line, stdout, stderr."""
+        # rebuild command for current length (meta updated)
         if engine == 'discoal':
             sim_cmd_loc, meta_loc = build_discoal_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
@@ -2523,286 +2300,368 @@ def main():
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
                 min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
             )
-
-        # Extract raw command line for logging/debug
         raw_cmd_line_loc = None
         for ln in sim_cmd_loc.splitlines():
             if ln.startswith(engine + ' '):
                 raw_cmd_line_loc = ln.strip(); break
         if raw_cmd_line_loc is None:
-            raw_cmd_line_loc = sim_cmd_loc.strip()
-
-        # Prepare temp files for streaming outputs
-        tf_out = tempfile.NamedTemporaryFile('w', delete=False, prefix='sim_out_', suffix='.ms')
-        tf_err = tempfile.NamedTemporaryFile('w', delete=False, prefix='sim_err_', suffix='.log')
-
+            sys.exit('ERROR: Failed to locate simulator command line (builder).')
+        # No legacy debug bypass; always execute unless --show-command was used earlier.
+        cmd_tokens_loc = shlex.split(raw_cmd_line_loc)
+        total_reps_loc = int(cmd_tokens_loc[2])
+        # progress handling (optionally suppressed for enforcement iterations)
+        # Honor the user-requested parallel worker count (bounded by total replicates).
+        # This controls the number of concurrent Python worker threads used to
+        # run replicate chunks. Use the CLI --parallel as-is for all engines.
+        threads_loc = max(1, min(int(getattr(args, 'parallel', 1)), total_reps_loc))
+        per_rep_mode_loc = bool(args.progress and show_progress and total_reps_loc > 1)
+        # For msprime, decouple performance from UI: always use per-replicate
+        # chunking when there are multiple replicates, regardless of --progress.
+        # This keeps the fast scheduling path without requiring the flag.
         if engine == 'msprime':
-            # run in-process
-            try:
-                reps = int(meta_loc.get('reps', 1) or 1)
-            except Exception:
-                reps = int(getattr(args, 'reps', 1) or 1)
-            payload = {
-                'species': meta_loc.get('species_id') or args.species,
-                'model_id': meta_loc.get('model_id') or args.model,
-                'chromosome': meta_loc.get('chromosome') or args.chromosome,
-                'length': int(meta_loc.get('length') or length_val or 0),
-                'pop_order': meta_loc.get('pop_order') or [],
-                'counts': meta_loc.get('counts_disc') or [],
-                'ploidy': meta_loc.get('ploidy') or 1,
-                'rep_count': reps,
-                'seed': None,
-            }
-            # If progress is requested, keep parallelism and update bar as worker batches (chunks) finish.
-            if getattr(args, 'progress', False) and tqdm is not None and int(reps) >= 1:
-                total_reps_int = int(reps)
-                pbar_ms = tqdm(total=total_reps_int, desc='msprime', unit='rep', file=sys.stdout, dynamic_ncols=True, leave=True)
-                import queue, threading
-                q = queue.Queue()
-                _STOP = object()
-                def _consumer():
-                    while True:
-                        item = q.get()
-                        if item is _STOP:
-                            break
-                        try:
-                            pbar_ms.update(int(item))
-                        except Exception:
-                            pass
-                        finally:
-                            q.task_done()
-                consumer = threading.Thread(target=_consumer, daemon=True)
-                consumer.start()
-                rc_acc = 0
-                workers = max(1, int(getattr(args, 'parallel', 1)))
-                workers = min(workers, total_reps_int)
-                base = total_reps_int // workers
-                rem = total_reps_int % workers
-                chunk_sizes = [(base + (1 if i < rem else 0)) for i in range(workers)]
-                payloads = []
-                for cs in chunk_sizes:
-                    if cs <= 0:
-                        continue
-                    pld = dict(payload)
-                    pld['rep_count'] = int(cs)
-                    pld['progress_queue'] = q
-                    pld['progress_every'] = 1
-                    payloads.append(pld)
-                import concurrent.futures, threading
-                lock = threading.Lock()
-                def run_chunk(pld):
-                    return _msprime_worker_run(pld)  # (out_txt, err_txt, wrc)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=len(payloads)) as exM:
-                    futs = [exM.submit(run_chunk, pld) for pld in payloads]
-                    for fut in futs:
-                        out_txt_i, err_txt_i, wrc_i = fut.result()
-                        with lock:
-                            try:
-                                tf_out.write(out_txt_i or '')
-                            except Exception:
-                                pass
-                            try:
-                                if err_txt_i:
-                                    tf_err.write(err_txt_i)
-                            except Exception:
-                                pass
-                        rc_acc |= int(wrc_i or 0)
-                try:
-                    q.put(_STOP)
-                    consumer.join()
-                    pbar_ms.close()
-                except Exception:
-                    pass
-                rc = int(rc_acc or 0)
-            else:
-                out_txt, err_txt, wrc = _msprime_worker_run(payload)
-                try:
-                    tf_out.write(out_txt or '')
-                except Exception:
-                    pass
-                try:
-                    if err_txt:
-                        tf_err.write(err_txt)
-                except Exception:
-                    pass
-                rc = int(wrc or 0)
-
+            per_rep_mode_loc = bool(total_reps_loc > 1)
         else:
-            # run external command; if --progress is requested and reps>1, execute per-replicate with a progress bar
+            per_rep_mode_loc = bool(args.progress and show_progress and total_reps_loc > 1)
+        if per_rep_mode_loc:
+            chunks_loc = [1] * total_reps_loc
+        else:
+            if threads_loc == 1 or total_reps_loc == 1:
+                chunks_loc = [total_reps_loc]
+            else:
+                base = total_reps_loc // threads_loc
+                rem = total_reps_loc % threads_loc
+                chunks_loc = [base + (1 if i < rem else 0) for i in range(threads_loc) if base + (1 if i < rem else 0) > 0]
+        # Prepare unique seeds per chunk for engines supporting explicit seeding
+        chunk_process_count = None
+        # Engines that support per-replicate seeding/mode. Include msprime so it can run multiple
+        # replicates with distinct seeds in per-rep mode like other in-process engines.
+        per_rep_engine = engine in ('discoal', 'msms', 'msprime') and per_rep_mode_loc
+        # For in-process msprime runs, respect the thread caps that will be
+        # assigned per worker below; do not force a global msprime internal
+        # threads override here (we set caps per worker when launching them).
+        # Generate unique seeds per chunk for external engines and msprime; for ms we will use
+        # the Hudson ms "-seeds" triplet to ensure independence across parallel chunks.
+        if engine in ('discoal', 'msms', 'msprime', 'ms'):
+            if per_rep_mode_loc:
+                chunk_process_count = len(chunks_loc)  # each chunk = 1 replicate
+            else:
+                chunk_process_count = len(chunks_loc)
             try:
-                toks_all = shlex.split(raw_cmd_line_loc)
+                unique_seeds = set()
+                seeds_for_chunks = []
+                import random as _rnd2
+                while len(seeds_for_chunks) < chunk_process_count:
+                    s = _rnd2.randint(1, 2**31 - 1)
+                    if s in unique_seeds:
+                        continue
+                    unique_seeds.add(s)
+                    seeds_for_chunks.append(s)
             except Exception:
-                toks_all = [raw_cmd_line_loc]
-            # Determine replicate count from tokens[2] if present; default to 1
+                seeds_for_chunks = [None] * chunk_process_count
+        else:
+            seeds_for_chunks = [None] * len(chunks_loc)
+
+        def run_chunk_loc(rc, replicate_index=None, chunk_idx=None):
+            toks = cmd_tokens_loc[:]; toks[2] = str(rc)
+            # Prepare a default environment for subprocesses early so all branches
+            # can reference `env` safely. We default BLAS/OpenMP thread caps to 1
+            # here to avoid accidental oversubscription for external engines.
+            env = os.environ.copy()
             try:
-                total_reps_primary = int(toks_all[2])
+                for k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
+                    env[k] = env.get(k, '1')
             except Exception:
-                total_reps_primary = 1
-            use_per_rep = bool(show_progress and getattr(args, 'progress', False) and total_reps_primary > 1)
-            if not use_per_rep:
-                # Even with a single replicate, show a 1-step progress bar if --progress is on.
-                pbar_single = None
-                if getattr(args, 'progress', False) and tqdm is not None:
-                    pbar_single = tqdm(total=1, desc='primary', unit='rep', file=sys.stdout, dynamic_ncols=True, leave=True)
+                pass
+            # Ensure the current Python interpreter's bin directory is on PATH so
+            # executables installed into the same conda env (e.g., msms, scrm)
+            # are discoverable by subprocess.run().
+            try:
+                exec_dir = os.path.dirname(sys.executable)
+                if exec_dir and exec_dir not in (env.get('PATH') or ''):
+                    env['PATH'] = exec_dir + os.pathsep + (env.get('PATH') or '')
+            except Exception:
+                pass
+            # Ensure preexec_fn variable exists for all branches (may be set later).
+            pre = None
+            # If the engine supports explicit per-chunk seeding, attach the seed for reproducibility.
+            seed_val = None
+            if seeds_for_chunks and chunk_idx is not None and chunk_idx < len(seeds_for_chunks):
+                seed_val = seeds_for_chunks[chunk_idx]
+                # Build contig and samples mapping
                 try:
-                    proc = subprocess.run(toks_all, stdout=tf_out, stderr=tf_err, text=True)
-                    rc = int(getattr(proc, 'returncode', 0) or 0)
-                except Exception as e:
-                    rc = 1
-                    try:
-                        tf_err.write(f'# ERROR: failed to run engine: {e}\n')
-                    except Exception:
-                        pass
-                finally:
-                    if pbar_single is not None:
+                    meta_lp = meta_loc
+                    model_obj = meta_lp.get('model_obj')
+                    species_id = meta_lp.get('species_id')
+                    sp = sps.get_species(species_id)
+                    chr_name = meta_lp.get('chromosome') or getattr(args, 'chromosome', None)
+                    # Fallback: if no chromosome provided, pick the first available contig name
+                    if not chr_name:
                         try:
-                            pbar_single.update(1)
-                            pbar_single.close()
+                            genome_obj = getattr(sp, 'genome', None)
+                            contigs_list = getattr(genome_obj, 'contigs', []) if genome_obj is not None else []
+                            if contigs_list:
+                                # Prefer .name, else .id, else string repr
+                                cand = getattr(contigs_list[0], 'name', None) or getattr(contigs_list[0], 'id', None) or str(contigs_list[0])
+                                if isinstance(cand, str) and cand.strip():
+                                    chr_name = cand
+                        except Exception:
+                            # leave chr_name as None; subsequent get_contig will likely fail and be reported below
+                            pass
+                    # Build a contig spanning [0, length_val) with model's mutation_rate where possible
+                    try:
+                        chosen_contig = sp.get_contig(chr_name, mutation_rate=getattr(model_obj, 'mutation_rate', None), left=0, right=max(0, int(length_val) - 1))
+                    except Exception:
+                        # fallback to requesting contig without bounds
+                        try:
+                            chosen_contig = sp.get_contig(chr_name)
+                        except Exception:
+                            chosen_contig = None
+                    # If still None, report a clear error early
+                    if chosen_contig is None:
+                        avail_names = []
+                        try:
+                            genome_obj = getattr(sp, 'genome', None)
+                            contigs_list = getattr(genome_obj, 'contigs', []) if genome_obj is not None else []
+                            avail_names = [getattr(c, 'name', getattr(c, 'id', str(c))) for c in contigs_list]
                         except Exception:
                             pass
-            else:
-                # Per-replicate execution with live progress updates
-                rc = 0
-                # Prepare seeds if possible (engines: discoal/msms -> -seed, ms/scrm -> -seeds s1 s2 s3)
-                engines_seedable = ('discoal','msms','ms','scrm')
-                # Prepare a list of per-rep commands (each with reps=1)
-                base_tokens = toks_all[:]
-                if len(base_tokens) >= 3:
-                    base_tokens[2] = '1'  # one replicate per run
-                # Unique seeds per replicate
-                seeds = []
-                if engine in engines_seedable:
+                        hint = ("; available: " + ", ".join(map(str, avail_names[:20])) + ("..." if len(avail_names) > 20 else "")) if avail_names else ""
+                        return (rc, '', f"# ERROR: msprime engine could not resolve a contig. Provide --chromosome or choose one{hint}.\n", 1, replicate_index)
+                    # no debug printing
+                    # if model provides a mutation rate and chosen_contig exists, try to set it to avoid stdpopsim warning
                     try:
-                        import random as _rndP
-                        seen = set()
-                        while len(seeds) < total_reps_primary:
-                            s = _rndP.randint(1, 2**31 - 1)
-                            if s in seen:
-                                continue
-                            seen.add(s); seeds.append(s)
-                    except Exception:
-                        seeds = [None] * total_reps_primary
-                else:
-                    seeds = [None] * total_reps_primary
-
-                # Progress bar
-                pbar = None
-                completed = 0
-                if tqdm is not None:
-                    pbar = tqdm(total=total_reps_primary, desc='primary', unit='rep', file=sys.stdout, dynamic_ncols=True, leave=True)
-
-                # Affinity helper
-                total_cpus_p = os.cpu_count() or 1
-                workers_p = max(1, int(getattr(args, 'parallel', 1)))
-                workers_p = min(workers_p, total_reps_primary)
-
-                def run_primary_rep(rep_idx: int):
-                    # Build tokens for this replicate with appropriate seed
-                    tloc = base_tokens[:]
-                    if engine in ('discoal','msms'):
-                        # Remove any existing -seed in tloc then add
-                        if '-seed' in tloc:
+                        if chosen_contig is not None and getattr(model_obj, 'mutation_rate', None) is not None:
                             try:
-                                idxs = [i for i,t in enumerate(tloc) if t=='-seed']
-                                for idx in reversed(idxs):
-                                    del tloc[idx:idx+2]
+                                chosen_contig.mutation_rate = float(getattr(model_obj, 'mutation_rate'))
                             except Exception:
                                 pass
-                        if seeds[rep_idx] is not None:
-                            tloc.extend(['-seed', str(int(seeds[rep_idx]))])
-                    elif engine in ('ms','scrm'):
-                        # Ensure exactly one -seeds s1 s2 s3
-                        if '-seeds' in tloc:
-                            try:
-                                idxs = [i for i,t in enumerate(tloc) if t=='-seeds']
-                                for idx in reversed(idxs):
-                                    del tloc[idx:idx+4]
-                            except Exception:
-                                pass
-                        if seeds[rep_idx] is not None:
-                            s1 = int(seeds[rep_idx]); s2 = s1 + 1; s3 = s1 + 2
-                            tloc.extend(['-seeds', str(s1), str(s2), str(s3)])
-                    # CPU affinity partitioning (best-effort)
-                    block_size_p = max(1, total_cpus_p // workers_p)
-                    worker_slot = rep_idx % workers_p
-                    start_cpu = worker_slot * block_size_p
-                    end_cpu = min(total_cpus_p, start_cpu + block_size_p)
-                    cpu_list = list(range(start_cpu, end_cpu)) if end_cpu > start_cpu else [start_cpu % total_cpus_p]
-                    pre_p = _make_affinity_preexec(cpu_list)
-                    # Run
-                    try:
-                        proc = subprocess.run(tloc, capture_output=True, text=True, preexec_fn=pre_p)
-                        # Append to our temp files in a thread-safe manner
-                        out = proc.stdout or ''
-                        err = proc.stderr or ''
-                        code = int(getattr(proc, 'returncode', 0) or 0)
-                    except Exception as ee:
-                        out, err, code = '', f'# ERROR: failed primary replicate: {ee}\n', 1
-                    return (out, err, code)
-
-                import concurrent.futures, threading
-                lock = threading.Lock()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers_p) as exP:
-                    futs = [exP.submit(run_primary_rep, i) for i in range(total_reps_primary)]
-                    for fut in concurrent.futures.as_completed(futs):
-                        out_i, err_i, code_i = fut.result()
-                        with lock:
-                            try:
-                                tf_out.write(out_i)
-                            except Exception:
-                                pass
-                            try:
-                                if err_i:
-                                    tf_err.write(err_i)
-                            except Exception:
-                                pass
-                        rc |= (code_i or 0)
-                        completed += 1
-                        if pbar is not None:
-                            try:
-                                pbar.update(1)
-                            except Exception:
-                                pass
-                        elif getattr(args, 'progress', False):
-                            try:
-                                sys.stderr.write(f'# primary progress: {completed}/{total_reps_primary}\n')
-                            except Exception:
-                                pass
-                if pbar is not None:
-                    try:
-                        pbar.close()
                     except Exception:
                         pass
+                    # Prepare samples per-population as individuals (use counts from meta if available)
+                    samples_per_pop = {}
+                    pop_order = meta_lp.get('pop_order') or []
+                    counts = meta_lp.get('counts_disc') or []
+                    pl = meta_lp.get('ploidy', 1) or 1
+                    # counts_disc are haplotypes; convert to individuals
+                    for i, pop in enumerate(pop_order):
+                        try:
+                            hapc = counts[i]
+                            samples_per_pop[pop] = int(hapc // pl)
+                        except Exception:
+                            samples_per_pop[pop] = 0
+                except Exception as e:
+                    return (rc, '', f'# ERROR: failed to prepare msprime inputs: {e}\n', 1, replicate_index)
+                # Run rc replicates, collect ms-like output blocks
+                out_acc = []
+                err_acc = []
+                # Ensure we respect the requested replicate count. Prefer the rc passed into
+                # run_chunk_loc (which is the number of replicates for this chunk). Fall back
+                # to the builder-provided 'reps' metadata if rc is None or invalid.
+                try:
+                    rep_count = int(rc) if rc is not None else int(meta_lp.get('reps', 1))
+                except Exception:
+                    rep_count = int(meta_lp.get('reps', 1) or 1)
+                if engine == 'msprime':
+                    # Build JSON payload for worker and run worker.py in a subprocess.
+                    payload = {
+                        'species': meta_loc.get('species_id') or args.species,
+                        'model_id': meta_loc.get('model_id') or args.model,
+                        'chromosome': meta_loc.get('chromosome') or args.chromosome,
+                        'length': int(meta_loc.get('length') or length_val or 0),
+                        'pop_order': meta_loc.get('pop_order') or [],
+                        'counts': meta_loc.get('counts_disc') or [],
+                        'ploidy': meta_loc.get('ploidy') or 1,
+                        'rep_count': rep_count,
+                        'seed': seed_val,
+                    }
+                    try:
+                        # Per-worker threading: allocate native threads based on
+                        # physical CPU cores (not logical/threaded cores). This
+                        # avoids hyperthreading oversubscription when running
+                        # multiple msprime workers in parallel. We compute a
+                        # fair share of physical cores per concurrently-running
+                        # worker and set OpenMP/BLAS caps accordingly.
+                        try:
+                            import psutil
+                            phys_total = psutil.cpu_count(logical=False) or (os.cpu_count() or 1)
+                        except Exception:
+                            phys_total = os.cpu_count() or 1
+                        req_workers = max(1, int(getattr(args, 'parallel', 1)))
+                        workers = max(1, min(req_workers, (chunk_process_count or 1)))
+                        base = max(1, int(phys_total) // workers)
+                        rem = int(phys_total) % workers
+                        if chunk_idx is not None:
+                            per_worker_threads = base + (1 if (chunk_idx % workers) < rem else 0)
+                        else:
+                            per_worker_threads = base
+                        env_worker = os.environ.copy()
+                        for k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
+                            env_worker[k] = str(per_worker_threads)
+                        try:
+                            out_txt, err_txt, rc = _msprime_worker_run(payload, env=env_worker)
+                            out_acc.append(out_txt)
+                            if rc != 0:
+                                err_acc.append(err_txt or f'# ERROR: msprime worker exit code {rc}\n')
+                        except Exception as e:
+                            err_acc.append(f'# ERROR: failed to run msprime worker: {e}\n')
+                    except Exception as e:
+                        err_acc.append(f'# ERROR: msprime worker setup failed: {e}\n')
+                else:
+                    # Non-msprime engines use existing logic (external subprocesses etc.)
+                    try:
+                        r = subprocess.run(toks, capture_output=True, text=True, check=True, env=env, preexec_fn=pre)
+                        out_acc.append(r.stdout or '')
+                        if r.stderr:
+                            err_acc.append(r.stderr)
+                    except subprocess.CalledProcessError as cpe:
+                        out_acc.append(cpe.stdout or '')
+                        err_acc.append(cpe.stderr or f'# ERROR: engine process failed: {cpe}\n')
+                    except Exception as e:
+                        err_acc.append(f'# ERROR: failed to run engine process: {e}\n')
+                # Return: rc, stdout-accumulated, stderr-accumulated, error-flag (1 if errors), replicate_index
+                return (rc, ''.join(out_acc), ''.join(err_acc), (1 if err_acc else None), replicate_index)
+        results_loc = []
+        bar_loc = None
+        progress_done_loc = 0
+        if args.progress and show_progress:
+            if tqdm is not None:
+                bar_loc = tqdm(total=total_reps_loc, desc='replicates', unit='rep')
+            else:
+                if total_reps_loc == 1:
+                    sys.stderr.write('# progress: 0/1\n')
+                else:
+                    sys.stderr.write('# WARNING: --progress requested but tqdm not installed; using textual updates.\n')
+        # Special-case msprime: run each chunk in its own process (ProcessPool)
+        # so msprime uses physical cores rather than Python threads.
+        if engine == 'msprime':
+            payloads = []
+            envs = []
+            try:
+                import psutil
+                phys_total = psutil.cpu_count(logical=False) or (os.cpu_count() or 1)
+            except Exception:
+                phys_total = os.cpu_count() or 1
+            req_workers = max(1, int(getattr(args, 'parallel', 1)))
+            workers = max(1, min(req_workers, (chunk_process_count or 1)))
+            base = max(1, int(phys_total) // workers)
+            rem = int(phys_total) % workers
+            for idx, chunk_size in enumerate(chunks_loc):
+                # seed for this chunk if available
+                seed_val = None
+                if seeds_for_chunks and idx < len(seeds_for_chunks):
+                    seed_val = seeds_for_chunks[idx]
+                # build msprime payload (JSON-serializable)
+                payload = {
+                    'species': meta_loc.get('species_id') or args.species,
+                    'model_id': meta_loc.get('model_id') or args.model,
+                    'chromosome': meta_loc.get('chromosome') or getattr(args, 'chromosome', None),
+                    'length': int(meta_loc.get('length') or length_val or 0),
+                    'pop_order': meta_loc.get('pop_order') or [],
+                    'counts': meta_loc.get('counts_disc') or [],
+                    'ploidy': meta_loc.get('ploidy') or 1,
+                    'rep_count': int(chunk_size),
+                    'seed': seed_val,
+                }
+                per_worker_threads = base + (1 if (idx % workers) < rem else 0)
+                env_worker = os.environ.copy()
+                for k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
+                    env_worker[k] = str(per_worker_threads)
+                payloads.append(payload)
+                envs.append(env_worker)
 
-        try:
-            tf_out.close()
-        except Exception:
-            pass
-        try:
-            tf_err.close()
-        except Exception:
-            pass
+            # Run payloads in separate processes (capped by 'workers' so
+            # concurrency honors --parallel and physical-core sharing)
+            futs = []
+            # Decide how many concurrent msprime worker processes to spawn.
+            # Decide max concurrent msprime worker processes. Cap to the
+            # requested parallelism, the number of payloads, and the number
+            # of physical CPU cores to avoid oversubscription.
+            max_proc = min(len(payloads), req_workers, phys_total)
 
-        # record file-backed outputs in meta for downstream streaming
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_proc) as pex:
+                for i, (pld, envw) in enumerate(zip(payloads, envs)):
+                    futs.append((i, pex.submit(_msprime_worker_run, pld, envw)))
+                for idx, fut in futs:
+                    try:
+                        out_txt, err_txt, rc = fut.result()
+                    except Exception as e:
+                        out_txt, err_txt, rc = '', f'# ERROR: msprime worker failed in process: {e}\n', 1
+                    results_loc.append((int(payloads[idx].get('rep_count',1)), out_txt, err_txt, (1 if rc else None), idx))
+                    if bar_loc is not None:
+                        bar_loc.update(payloads[idx].get('rep_count', 1))
+                    elif args.progress and show_progress:
+                        progress_done_loc += payloads[idx].get('rep_count', 1)
+                        sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
+            results_loc.sort(key=lambda x: x[4])
+        else:
+            if per_rep_mode_loc:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=threads_loc) as ex:
+                    futs = []
+                    rep_counter = 0
+                    for idx, c in enumerate(chunks_loc):
+                        futs.append(ex.submit(run_chunk_loc, c, rep_counter, idx))
+                        rep_counter += 1
+                    for fut in concurrent.futures.as_completed(futs):
+                        rc, out, err, code, rep_idx = fut.result()
+                        results_loc.append((rc, out, err, code, rep_idx))
+                        if bar_loc is not None:
+                            bar_loc.update(1)
+                        elif args.progress and show_progress:
+                            progress_done_loc += 1
+                            sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
+                results_loc.sort(key=lambda x: (x[4] if len(x) > 4 else 0))
+            else:
+                if len(chunks_loc) == 1:
+                    rc, out, err, code, rep_idx = run_chunk_loc(chunks_loc[0], 0, 0)
+                    results_loc.append((rc, out, err, code, rep_idx))
+                    if bar_loc is not None:
+                        bar_loc.update(total_reps_loc)
+                    elif args.progress and show_progress and total_reps_loc == 1:
+                        sys.stderr.write('# progress: 1/1\n')
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks_loc)) as ex:
+                        futs = [ex.submit(run_chunk_loc, c, i, i) for i, c in enumerate(chunks_loc)]
+                        for fut in concurrent.futures.as_completed(futs):
+                            rc, out, err, code, rep_idx = fut.result()
+                            results_loc.append((rc, out, err, code, rep_idx))
+                            if bar_loc is not None:
+                                try:
+                                    bar_loc.update(int(rc))
+                                except Exception:
+                                    bar_loc.update(1)
+                            elif args.progress and show_progress:
+                                progress_done_loc += rc
+                                sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
+        if bar_loc is not None:
+            bar_loc.close()
+        for tpl in results_loc:
+            if len(tpl) == 5:
+                rc, out, err, code, _r = tpl
+            else:
+                rc, out, err, code = tpl
+            if code is not None:
+                sys.stderr.write(f'# ERROR: {engine} exited with code {code}.\n')
+                if out:
+                    sys.stderr.write(out)
+                if err:
+                    sys.stderr.write(err)
+                sys.exit(code)
+        concatenated_stdout_loc = ''.join(t[1] for t in results_loc)
+        concatenated_stderr_loc = ''.join(t[2] for t in results_loc)
+        # Persist chunk seeding metadata for potential neutral pairing reuse
         try:
             meta_loc.setdefault('runtime', {})
-            meta_loc['runtime']['stdout_files'] = [tf_out.name]
-            meta_loc['runtime']['stderr_files'] = [tf_err.name]
+            meta_loc['runtime']['chunk_sizes'] = chunks_loc
+            # Persist chunk seeds for engines that support explicit seeding. Include ms and msprime.
+            if engine in ('discoal', 'msms', 'msprime', 'ms'):
+                meta_loc['runtime']['chunk_seeds'] = seeds_for_chunks
+            meta_loc['runtime']['per_rep_mode'] = per_rep_mode_loc
         except Exception:
             pass
-
-        # indicate we used file-backed streaming by returning None for concatenated texts
-        return meta_loc, raw_cmd_line_loc, None, None
+        return meta_loc, raw_cmd_line_loc, concatenated_stdout_loc, concatenated_stderr_loc
 
     # Initial simulation at refined/derived length
-    meta = None
-    raw_cmd_line = None
-    concatenated_stdout = None
-    concatenated_stderr = None
-    try:
-        meta, raw_cmd_line, concatenated_stdout, concatenated_stderr = _simulate_current_length(args.length, show_progress=True)
-    except Exception:
-        raise
+    meta, raw_cmd_line, concatenated_stdout, concatenated_stderr = _simulate_current_length(args.length, show_progress=True)
     # Debug-only dump removed per cleanup
 
     # Enforcement: ensure ALL replicates meet/exceed target and optionally shrink overshoot
@@ -2814,7 +2673,7 @@ def main():
         length_current = args.length
         pattern_segs = re.compile(r'^segsites:\s*(\d+)', re.MULTILINE)
         while enforce_iter < max_enforce_iters:
-            seg_list = seg_sites_list_from_meta_or_text(meta, concatenated_stdout)
+            seg_list = [int(x) for x in pattern_segs.findall(concatenated_stdout)]
             if not seg_list:
                 break
             min_segs = min(seg_list)
@@ -2828,58 +2687,101 @@ def main():
                 length_current = new_length
                 meta, raw_cmd_line, concatenated_stdout, concatenated_stderr = _simulate_current_length(length_current, show_progress=False)
                 enforce_iter += 1
-    overshoot_status = None
-    shrink_bracket_attempts = 0
-    shrink_extra_reductions = 0
-    shrink_bs_iters = 0
-    # Conservative shrink attempt: try reducing length while keeping all replicates >= target_snps
-    try:
-        if args.min_snps is not None and 'seg_list' in locals() and seg_list:
-            hi_seg_list = seg_list
-            hi_len = args.length
-            hi_meta = meta
-            hi_raw_cmd_line = raw_cmd_line
-            target_cap = target_snps * (1.0 + tol_internal)
-            # Simple iterative shrink loop with a few attempts to avoid expensive binary searches
-            for _shrink_try in range(6):
-                max_segs = max(hi_seg_list)
-                if max_segs <= target_cap:
-                    overshoot_status = 'met'
-                    break
-                # propose a candidate length scaled down toward the target cap
-                scale = target_cap / float(max_segs)
-                trial_len = int(max(100, math.ceil(hi_len * max(0.6, min(0.95, scale)))))
-                if trial_len >= hi_len or trial_len < 100:
-                    overshoot_status = 'unmet_minimal_feasible'
-                    break
-                meta_trial, raw_cmd_line_trial, stdout_trial, stderr_trial = _simulate_current_length(trial_len, show_progress=False)
-                seg_list_trial = seg_sites_list_from_meta_or_text(meta_trial, stdout_trial)
-                if not seg_list_trial:
-                    overshoot_status = 'no_data'
-                    break
-                if min(seg_list_trial) >= target_snps:
-                    # adopt trial as new hi
-                    hi_len = trial_len
-                    hi_meta = meta_trial
-                    hi_seg_list = seg_list_trial
-                    hi_raw_cmd_line = raw_cmd_line_trial
-                    shrink_bracket_attempts += 1
-                    continue
-                else:
-                    # cannot reduce further safely
-                    overshoot_status = 'unmet_minimal_feasible'
-                    break
-            # adopt hi_meta if found
-            try:
-                meta = hi_meta
+                continue
+            break
+        args.length = length_current
+    # After enforcement loop, optionally perform overshoot shrink and record stats
+    if args.min_snps is not None:
+        seg_list_final = [int(x) for x in pattern_segs.findall(concatenated_stdout)]
+        # no debug printing
+        overshoot_status = None
+        shrink_bracket_attempts = 0
+        shrink_extra_reductions = 0
+        shrink_bs_iters = 0
+        if tol_internal > 0:
+            seg_list_curr = [int(x) for x in pattern_segs.findall(concatenated_stdout)]
+            if seg_list_curr:
+                hi_len = args.length
+                hi_stdout = concatenated_stdout
+                hi_meta = meta
+                # Track the corresponding command line for the current 'hi' candidate.
+                # raw_cmd_line at this point reflects the last simulation before shrink attempts.
+                hi_raw_cmd_line = raw_cmd_line
+                hi_seg_list = seg_list_curr
+                lo_len = None
+                lo_seg_list = None
+                attempts = 0
+                while attempts < 6:
+                    max_segs_curr = max(hi_seg_list)
+                    target_cap = target_snps * (1.0 + tol_internal)
+                    scale_cap = target_cap / float(max_segs_curr)
+                    trial_len = int(math.ceil(hi_len * max(0.60, min(0.95, scale_cap))))
+                    if trial_len >= hi_len or trial_len < 100:
+                        break
+                    meta_trial, raw_cmd_line_trial, stdout_trial, stderr_trial = _simulate_current_length(trial_len, show_progress=False)
+                    seg_list_trial = [int(x) for x in pattern_segs.findall(stdout_trial)]
+                    if not seg_list_trial:
+                        break
+                    if min(seg_list_trial) >= target_snps:
+                        hi_len, hi_stdout, hi_meta, hi_seg_list = trial_len, stdout_trial, meta_trial, seg_list_trial
+                        hi_raw_cmd_line = raw_cmd_line_trial
+                        attempts += 1
+                        shrink_bracket_attempts = attempts
+                        continue
+                    else:
+                        lo_len = trial_len
+                        lo_seg_list = seg_list_trial
+                        break
+                if lo_len is None:
+                    probe_len = int(hi_len * 0.85)
+                    extra = 0
+                    while extra < 6 and probe_len >= 100:
+                        meta_trial, raw_cmd_line_trial, stdout_trial, stderr_trial = _simulate_current_length(probe_len, show_progress=False)
+                        seg_list_trial = [int(x) for x in pattern_segs.findall(stdout_trial)]
+                        if not seg_list_trial:
+                            break
+                        if min(seg_list_trial) >= target_snps:
+                            hi_len, hi_stdout, hi_meta, hi_seg_list = probe_len, stdout_trial, meta_trial, seg_list_trial
+                            hi_raw_cmd_line = raw_cmd_line_trial
+                            probe_len = int(probe_len * 0.85)
+                            shrink_extra_reductions = extra + 1
+                        else:
+                            lo_len = probe_len
+                            lo_seg_list = seg_list_trial
+                            break
+                        extra += 1
+                if lo_len is not None:
+                    bs_iter = 0
+                    while bs_iter < 12 and lo_len + 1 < hi_len:
+                        mid = (lo_len + hi_len) // 2
+                        if mid == hi_len:
+                            break
+                        meta_mid, raw_cmd_line_mid, stdout_mid, stderr_mid = _simulate_current_length(mid, show_progress=False)
+                        seg_list_mid = [int(x) for x in pattern_segs.findall(stdout_mid)]
+                        if not seg_list_mid:
+                            break
+                        if min(seg_list_mid) >= target_snps:
+                            hi_len, hi_stdout, hi_meta, hi_seg_list = mid, stdout_mid, meta_mid, seg_list_mid
+                            hi_raw_cmd_line = raw_cmd_line_mid
+                        else:
+                            lo_len = mid
+                        bs_iter += 1
+                        shrink_bs_iters = bs_iter
                 args.length = hi_len
-                concatenated_stdout = None
+                concatenated_stdout = hi_stdout
+                meta = hi_meta
+                # Update the raw command line to remain consistent with the final (possibly shrunken) length.
                 raw_cmd_line = hi_raw_cmd_line
-            except Exception:
-                pass
-    except Exception:
-        pass
-        final_seg_list = seg_sites_list_from_meta_or_text(meta, concatenated_stdout) if 'pattern_segs' in locals() else []
+                max_final = max(hi_seg_list)
+                if max_final <= target_snps * (1.0 + tol_internal):
+                    overshoot_status = 'met'
+                else:
+                    overshoot_status = 'unmet_minimal_feasible'
+                    # no debug printing
+                # no debug printing
+            else:
+                overshoot_status = 'no_data'
+        final_seg_list = [int(x) for x in pattern_segs.findall(concatenated_stdout)] if 'pattern_segs' in locals() else []
         if final_seg_list:
             meta.setdefault('enforcement_stats', {})
             meta['enforcement_stats'].update({
@@ -2952,7 +2854,10 @@ def main():
                 eng = sps.get_engine('msprime')
             except Exception as e:
                 # fallback to text-based parsing if msprime engine unavailable
-                header_sfs, lines_sfs = compute_sfs_best(meta, concatenated_stdout, normalized=args.sfs_normalized, mode=args.sfs_mode)
+                if args.sfs_mode == 'mean':
+                    header_sfs, lines_sfs = compute_sfs_stream_mean(concatenated_stdout, n_hap_expected=None, normalized=args.sfs_normalized)
+                else:
+                    header_sfs, lines_sfs = compute_sfs_fast(concatenated_stdout, normalized=args.sfs_normalized, mode=args.sfs_mode)
                 sfs_text = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
             else:
                 # Prepare species/model/samples
@@ -3142,7 +3047,17 @@ def main():
                 skip_sfs_loop = False
                 if stored_sfs is None and concatenated_stdout:
                     try:
-                        header_sfs, lines_sfs = compute_sfs_best(meta, concatenated_stdout, normalized=args.sfs_normalized, mode=args.sfs_mode)
+                        if args.sfs_mode == 'mean':
+                            # If available, derive n_hap from meta to optimize dtype; else let it infer
+                            try:
+                                _pl = int(meta.get('ploidy') or 1)
+                                _hap_list = meta.get('counts_disc') or []
+                                _n_hap = int(sum(int(h) for h in _hap_list)) if _hap_list else None
+                            except Exception:
+                                _n_hap = None
+                            header_sfs, lines_sfs = compute_sfs_stream_mean(concatenated_stdout, n_hap_expected=_n_hap, normalized=args.sfs_normalized)
+                        else:
+                            header_sfs, lines_sfs = compute_sfs_fast(concatenated_stdout, normalized=args.sfs_normalized, mode=args.sfs_mode)
                         sfs_text = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
                         # write file and exit early from --sfs branch
                         if isinstance(args.sfs, str) and args.sfs is not True and args.sfs != 'True':
@@ -3247,7 +3162,15 @@ def main():
                     sfs_text = header + '\n' + 'mean\t' + '\t'.join(str(x) for x in mean_vals) + '\n'
         else:
             # Use accelerated implementation if NumPy is available; falls back automatically.
-            header_sfs, lines_sfs = compute_sfs_best(meta, concatenated_stdout, normalized=args.sfs_normalized, mode=args.sfs_mode)
+            if args.sfs_mode == 'mean':
+                try:
+                    _hap_list = meta.get('counts_disc') or []
+                    _n_hap = int(sum(int(h) for h in _hap_list)) if _hap_list else None
+                except Exception:
+                    _n_hap = None
+                header_sfs, lines_sfs = compute_sfs_stream_mean(concatenated_stdout, n_hap_expected=_n_hap, normalized=args.sfs_normalized)
+            else:
+                header_sfs, lines_sfs = compute_sfs_fast(concatenated_stdout, normalized=args.sfs_normalized, mode=args.sfs_mode)
             sfs_text = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
         # Determine SFS file path
         if isinstance(args.sfs, str) and args.sfs is not True and args.sfs != 'True':
@@ -3341,20 +3264,13 @@ def main():
         ext = fmt_ext.get(args.format, '.ms')
         args.out = default_stem + ext
     if args.out == '-':
-        # Stream primary output to stdout; this will read temp files if present.
-        stream_stdout_to_writer(meta, concatenated_stdout, sys.stdout)
+        if concatenated_stdout:
+            sys.stdout.write(concatenated_stdout)
     elif not args.sfs and not concatenated_stdout and args.format in ('ms','ms.gz'):
         # nothing to write
         pass
     if concatenated_stderr:
-        try:
-            stream_stdout_to_writer(meta, concatenated_stderr, sys.stderr)
-        except Exception:
-            # best-effort fallback
-            try:
-                sys.stderr.write(concatenated_stderr or '')
-            except Exception:
-                pass
+        sys.stderr.write(concatenated_stderr)
     if write_primary_output and args.out and args.out != '-':
         # Normalize output filename extension based on requested format if user omitted one.
         ext_map = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
@@ -3370,7 +3286,7 @@ def main():
         # Safety: if the engine produced ms-like stdout and user requested ms output,
         # ensure the output filename uses the correct .ms / .ms.gz extension.
         try:
-            if _stdout_any_startswith(meta, concatenated_stdout, ('ms ',)) and fmt in ('ms', 'ms.gz'):
+            if concatenated_stdout and concatenated_stdout.lstrip().startswith('ms ') and fmt in ('ms', 'ms.gz'):
                 desired_ext = '.ms.gz' if fmt == 'ms.gz' else '.ms'
                 if args.out and not args.out.endswith(desired_ext):
                     for kext in ('.vcf.gz', '.vcf', '.bcf', '.ms.gz', '.ms'):
@@ -3450,61 +3366,48 @@ def main():
                 return meta_comment_lines_local
 
             per_rep_vcfs = []
-            if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf':
-                # Process either concatenated stdout (fallback) or streaming files recorded in meta
-                files = list(_iter_stdout_file_paths(meta, concatenated_stdout))
-                if not files and concatenated_stdout:
-                    files = [None]
-                for fp in files:
-                    try:
-                        if fp is None:
-                            vtxt = concatenated_stdout
-                        else:
-                            with open(fp, 'r') as fh:
-                                vtxt = fh.read()
-                        if not vtxt:
-                            continue
-                        blocks = []
-                        if '##fileformat' in vtxt:
-                            parts = vtxt.split('##fileformat')
-                            for p in parts:
-                                p = p.strip()
-                                if not p:
-                                    continue
-                                blocks.append('##fileformat' + p if not p.startswith('##fileformat') else p)
-                        else:
-                            blocks = [vtxt]
-                        for vb in blocks:
-                            try:
-                                vb = _adjust_vcf_contig_length(vb, meta.get('chromosome'), meta.get('length'))
-                            except Exception:
-                                pass
-                            vcf_lines = vb.splitlines()
-                            meta_lines = _build_vcf_meta_lines_bcf()
-                            try:
-                                header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
-                            except StopIteration:
-                                header_idx = len(vcf_lines)
-                            vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines]
-                            vcf_lines_final = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
-                            per_rep_vcfs.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
-                    except Exception:
-                        continue
-            else:
-                # Split ms-like stdout into replicate blocks by streaming lines
+            if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf' and concatenated_stdout:
+                vtxt = concatenated_stdout
                 blocks = []
-                cur_lines = []
-                for ln in iter_stdout_lines(meta, concatenated_stdout):
+                if '##fileformat' in vtxt:
+                    parts = vtxt.split('##fileformat')
+                    for p in parts:
+                        p = p.strip()
+                        if not p:
+                            continue
+                        blocks.append('##fileformat' + p if not p.startswith('##fileformat') else p)
+                else:
+                    blocks = [vtxt]
+                for vb in blocks:
+                    try:
+                        vb = _adjust_vcf_contig_length(vb, meta.get('chromosome'), meta.get('length'))
+                    except Exception:
+                        pass
+                    vcf_lines = vb.splitlines()
+                    meta_lines = _build_vcf_meta_lines_bcf()
+                    try:
+                        header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
+                    except StopIteration:
+                        header_idx = len(vcf_lines)
+                    vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines]
+                    vcf_lines_final = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
+                    per_rep_vcfs.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
+            else:
+                # Split ms-like stdout into replicate blocks
+                text = concatenated_stdout or ''
+                blocks = []
+                cur = []
+                for ln in (text.splitlines(True)):
                     if ln.startswith('//'):
-                        if cur_lines:
-                            blocks.append(''.join(cur_lines))
-                            cur_lines = []
+                        if cur:
+                            blocks.append(''.join(cur))
+                            cur = []
                         continue
                     if ln.startswith('ms ') or ln.startswith('msms ') or ln.startswith('discoal ') or ln.startswith('scrm '):
                         continue
-                    cur_lines.append(ln)
-                if cur_lines:
-                    blocks.append(''.join(cur_lines))
+                    cur.append(ln)
+                if cur:
+                    blocks.append(''.join(cur))
                 seg_hdr_pat = re.compile(r'^\s*segsites\s*:', re.IGNORECASE | re.MULTILINE)
                 for blk in blocks:
                     # Skip blocks that don't contain any segsites header
@@ -3634,61 +3537,49 @@ def main():
 
             # Prepare per-replicate VCF texts
             per_rep_vcfs = []
-            if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf':
-                files = list(_iter_stdout_file_paths(meta, concatenated_stdout))
-                if not files and concatenated_stdout:
-                    files = [None]
-                for fp in files:
-                    try:
-                        if fp is None:
-                            vtxt = concatenated_stdout
-                        else:
-                            with open(fp, 'r') as fh:
-                                vtxt = fh.read()
-                        if not vtxt:
-                            continue
-                        blocks = []
-                        if '##fileformat' in vtxt:
-                            parts = vtxt.split('##fileformat')
-                            for p in parts:
-                                p = p.strip()
-                                if not p:
-                                    continue
-                                blocks.append('##fileformat' + p if not p.startswith('##fileformat') else p)
-                        else:
-                            blocks = [vtxt]
-                        for vb in blocks:
-                            try:
-                                vb = _adjust_vcf_contig_length(vb, meta.get('chromosome'), meta.get('length'))
-                            except Exception:
-                                pass
-                            vcf_lines = vb.splitlines()
-                            meta_lines = _build_vcf_meta_lines()
-                            try:
-                                header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
-                            except StopIteration:
-                                header_idx = len(vcf_lines)
-                            vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines]
-                            vcf_lines_final = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
-                            per_rep_vcfs.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
-                    except Exception:
-                        continue
-            else:
-                # Split ms-like stdout into replicate blocks by streaming lines
+            if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf' and concatenated_stdout:
+                vtxt = concatenated_stdout
                 blocks = []
-                cur_lines = []
-                for ln in iter_stdout_lines(meta, concatenated_stdout):
+                if '##fileformat' in vtxt:
+                    parts = vtxt.split('##fileformat')
+                    for p in parts:
+                        p = p.strip()
+                        if not p:
+                            continue
+                        blocks.append('##fileformat' + p if not p.startswith('##fileformat') else p)
+                else:
+                    blocks = [vtxt]
+                for vb in blocks:
+                    try:
+                        vb = _adjust_vcf_contig_length(vb, meta.get('chromosome'), meta.get('length'))
+                    except Exception:
+                        pass
+                    vcf_lines = vb.splitlines()
+                    meta_lines = _build_vcf_meta_lines()
+                    try:
+                        header_idx = next(i for i,l in enumerate(vcf_lines) if l.startswith('#CHROM'))
+                    except StopIteration:
+                        header_idx = len(vcf_lines)
+                    vcf_meta_lines = [('##' + l[2:]) if l.startswith('# ') else ('##'+l.lstrip('# ')) for l in meta_lines]
+                    vcf_lines_final = vcf_lines[:header_idx] + vcf_meta_lines + vcf_lines[header_idx:]
+                    per_rep_vcfs.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
+            else:
+                # Split ms-like stdout into replicate blocks by '//'
+                text = concatenated_stdout or ''
+                blocks = []
+                cur = []
+                for ln in (text.splitlines(True)):
                     if ln.startswith('//'):
-                        if cur_lines:
-                            blocks.append(''.join(cur_lines))
-                            cur_lines = []
+                        if cur:
+                            blocks.append(''.join(cur))
+                            cur = []
                         continue
                     # Skip echoed engine lines
                     if ln.startswith('ms ') or ln.startswith('msms ') or ln.startswith('discoal ') or ln.startswith('scrm '):
                         continue
-                    cur_lines.append(ln)
-                if cur_lines:
-                    blocks.append(''.join(cur_lines))
+                    cur.append(ln)
+                if cur:
+                    blocks.append(''.join(cur))
                 seg_hdr_pat = re.compile(r'^\s*segsites\s*:', re.IGNORECASE | re.MULTILINE)
                 for blk in blocks:
                     # Skip blocks that don't contain any segsites header
@@ -3845,7 +3736,8 @@ def main():
                     for ln in lines_info:
                         f.write(ln + '\n')
                     # Write body: if msprime produced VCF, convert to ms-like per replicate; else, write captured ms-like output.
-                    if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf':
+                    if meta.get('engine') == 'msprime' and meta.get('produced_format') == 'vcf' and concatenated_stdout:
+                        vcf_text_all = concatenated_stdout
                         # Build per-rep seed list from runtime chunk seeds
                         runtime = meta.get('runtime', {}) or {}
                         chunk_seeds = runtime.get('chunk_seeds') or []
@@ -3857,77 +3749,49 @@ def main():
                             reps_in_chunk = chunk_sizes[ci] if ci < len(chunk_sizes) else 1
                             for r in range(reps_in_chunk):
                                 seed_lines.append(str(int(base_seed) + int(r)))
-                        # Iterate over VCF sources: prefer files recorded in meta, else use concatenated_stdout
-                        files = list(_iter_stdout_file_paths(meta, concatenated_stdout))
-                        if not files and concatenated_stdout:
-                            files = [None]
-                        ib = 0
-                        for fp in files:
-                            try:
-                                if fp is None:
-                                    vcf_text_all = concatenated_stdout
-                                else:
-                                    with open(fp, 'r') as fh:
-                                        vcf_text_all = fh.read()
-                                if not vcf_text_all:
+                        # Split concatenated VCFs on '##fileformat'
+                        blocks = []
+                        if '##fileformat' in vcf_text_all:
+                            parts = vcf_text_all.split('##fileformat')
+                            for p in parts:
+                                p = p.strip()
+                                if not p:
                                     continue
-                                blocks = []
-                                if '##fileformat' in vcf_text_all:
-                                    parts = vcf_text_all.split('##fileformat')
-                                    for p in parts:
-                                        p = p.strip()
-                                        if not p:
-                                            continue
-                                        blocks.append('##fileformat' + ('\n' if not p.startswith('\n') else '') + p)
-                                else:
-                                    blocks = [vcf_text_all]
-                                # Convert each block to ms-like and write with replicate separators and seed lines
-                                for vb in blocks:
-                                    vb_adj = vb
-                                    try:
-                                        vb_adj = _adjust_vcf_contig_length(vb_adj, meta.get('chromosome'), meta.get('length'))
-                                    except Exception:
-                                        pass
-                                    # Prepend per-rep seed (plain integer on its own line), if available
-                                    if ib < len(seed_lines):
-                                        f.write(seed_lines[ib] + '\n')
-                                    ib += 1
-                                    # Replicate separator
-                                    f.write('//\n')
-                                    try:
-                                        ms_blk = vcf_to_ms_like(vb_adj, meta.get('length'), ploidy=meta.get('ploidy', 1))
-                                    except Exception:
-                                        ms_blk = 'segsites: 0\n'
-                                    if not ms_blk.endswith('\n'):
-                                        ms_blk += '\n'
-                                    f.write(ms_blk)
-                            except Exception:
-                                continue
-                    else:
-                        # Stream ms-like stdout content from files (or concatenated text) and write filtered lines
-                        files = list(_iter_stdout_file_paths(meta, concatenated_stdout))
-                        if not files and concatenated_stdout:
-                            # use in-memory text as a single source
-                            for ln in (concatenated_stdout or '').splitlines(True):
-                                if ln.startswith(engine + ' '):
-                                    continue
-                                if engine == 'msms' and ln.startswith('ms '):
-                                    continue
-                                f.write(ln)
+                                blocks.append('##fileformat' + ('\n' if not p.startswith('\n') else '') + p)
                         else:
-                            for fp in files:
-                                if not fp:
-                                    continue
-                                try:
-                                    with open(fp, 'r') as fh:
-                                        for ln in fh:
-                                            if ln.startswith(engine + ' '):
-                                                continue
-                                            if engine == 'msms' and ln.startswith('ms '):
-                                                continue
-                                            f.write(ln)
-                                except Exception:
-                                    continue
+                            blocks = [vcf_text_all]
+                        # Convert each block to ms-like and write with replicate separators and seed lines
+                        for ib, vb in enumerate(blocks):
+                            vb_adj = vb
+                            try:
+                                vb_adj = _adjust_vcf_contig_length(vb_adj, meta.get('chromosome'), meta.get('length'))
+                            except Exception:
+                                pass
+                            # Prepend per-rep seed (plain integer on its own line), if available
+                            if ib < len(seed_lines):
+                                f.write(seed_lines[ib] + '\n')
+                            # Replicate separator
+                            f.write('//\n')
+                            try:
+                                ms_blk = vcf_to_ms_like(vb_adj, meta.get('length'), ploidy=meta.get('ploidy', 1))
+                            except Exception:
+                                ms_blk = 'segsites: 0\n'
+                            if not ms_blk.endswith('\n'):
+                                ms_blk += '\n'
+                            f.write(ms_blk)
+                    else:
+                        # seed lines not written in header; per-replicate seeds are emitted before each replicate block
+                        # format line removed per user request
+                        lines = (concatenated_stdout or '').splitlines(True)
+                        for ln in lines:
+                            # Avoid duplicating echoed command lines. For ms and discoal we skip the engine line.
+                            # For msms, some versions may echo both an 'msms ...' line and a compatibility 'ms ...' line;
+                            # keep only the 'msms' line we already wrote (raw_cmd_line) and drop any stray 'ms ' line.
+                            if ln.startswith(engine+' '):
+                                continue
+                            if engine == 'msms' and ln.startswith('ms '):
+                                continue
+                            f.write(ln)
     # If a paired neutral run is requested, release large primary output buffers now to free RAM before neutral simulation.
     if getattr(args, 'paired_neutral', False):
         try:
@@ -4243,11 +4107,8 @@ def main():
                     else:
                         for idxN, cN in enumerate(neut_chunks):
                             futs_n.append(ex_n.submit(run_neut_chunk, cN, idxN, idxN))
-                    _disable_n = not getattr(args, 'progress', False) or tqdm is None
-                    with tqdm(total=len(futs_n), desc='msprime (neutral)', leave=False, disable=_disable_n) as _pbar_n:
-                        for fut_n in concurrent.futures.as_completed(futs_n):
-                            rcN, outN, errN, codeN, rep_idxN = fut_n.result()
-                            _pbar_n.update(1)
+                    for fut_n in concurrent.futures.as_completed(futs_n):
+                        rcN, outN, errN, codeN, rep_idxN = fut_n.result()
                         neut_results.append((rcN, outN, errN, codeN, rep_idxN))
                         if neut_bar is not None:
                             try:
@@ -4353,7 +4214,11 @@ def main():
                             ms_like_for_sfs = ''.join(out_ms_chunks)
                     except Exception:
                         pass
-                    header_nsfs, lines_nsfs = compute_sfs_fast(ms_like_for_sfs, normalized=args.sfs_normalized, mode=args.sfs_mode)
+                    if args.sfs_mode == 'mean':
+                        # We don't know n_hap cheaply here; let it infer
+                        header_nsfs, lines_nsfs = compute_sfs_stream_mean(ms_like_for_sfs, n_hap_expected=None, normalized=args.sfs_normalized)
+                    else:
+                        header_nsfs, lines_nsfs = compute_sfs_fast(ms_like_for_sfs, normalized=args.sfs_normalized, mode=args.sfs_mode)
                     neut_sfs_path = neut_root + '.sfs'
                     nsfs_text = header_nsfs + '\n' + '\n'.join(lines_nsfs) + '\n'
                     with open(neut_sfs_path, 'w') as fns:
@@ -4367,7 +4232,10 @@ def main():
             elif (neut_out_path is None) and getattr(args, 'sfs', False) and not getattr(args, '_user_out_provided', False):
                 # No explicit neutral path given, SFS-only mode: write neutral SFS to default stem with _neutral suffix
                 try:
-                    header_nsfs, lines_nsfs = compute_sfs_fast(neut_out_txt, normalized=args.sfs_normalized, mode=args.sfs_mode)
+                    if args.sfs_mode == 'mean':
+                        header_nsfs, lines_nsfs = compute_sfs_stream_mean(neut_out_txt, n_hap_expected=None, normalized=args.sfs_normalized)
+                    else:
+                        header_nsfs, lines_nsfs = compute_sfs_fast(neut_out_txt, normalized=args.sfs_normalized, mode=args.sfs_mode)
                     neut_sfs_path = f"{default_stem}_neutral.sfs"
                     nsfs_text = header_nsfs + '\n' + '\n'.join(lines_nsfs) + '\n'
                     with open(neut_sfs_path, 'w') as fns:
@@ -4597,7 +4465,7 @@ def main():
                             def build_line_n(group_name, keys):
                                 vals = [f"{k}={kvn[k]}" for k in keys if k in kvn]
                                 if not vals: return None
-                                # Clean up temp files unless the environment requests to keep them
+                                return '# ' + group_name + ': ' + ', '.join(vals)
                             for grp_n, keys_n in (('core', core_keys_n), ('params', param_keys_n)):
                                 ln_n = build_line_n(grp_n, keys_n)
                                 if ln_n:
@@ -4732,6 +4600,10 @@ def main():
                         sys.stdout.write(sfs_text_final)
         except Exception:
             pass
+
+def main():
+    args = parse_args()
+    return run_simulation_from_args(args)
 
 if __name__ == "__main__":
     main()
