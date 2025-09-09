@@ -9,7 +9,7 @@
 #!/usr/bin/env python3
 import argparse, math, sys, subprocess, shlex, concurrent.futures, gzip, re, json
 import shutil, tempfile
-import os
+import os, time, random
 import stdpopsim as sps
 import io
 import traceback
@@ -220,6 +220,53 @@ def _make_affinity_preexec(cpu_list):
         except Exception:
             pass
     return _set_affinity
+
+
+# ---------- local temp-dir helpers ----------
+# Use a per-run temporary directory placed next to this script so callers
+# can inspect files if needed and so cleanup can remove the entire folder.
+_LOCAL_TMP_ROOT = None
+
+def _ensure_local_tmpdir():
+    """Create and return a local tmp directory inside the simulator script dir.
+
+    The directory is created lazily on first call and returned for reuse. Files
+    should be created inside this directory. Cleanup is performed by
+    _cleanup_local_tmpdir().
+    """
+    global _LOCAL_TMP_ROOT
+    if _LOCAL_TMP_ROOT and os.path.isdir(_LOCAL_TMP_ROOT):
+        return _LOCAL_TMP_ROOT
+    try:
+        base = os.path.dirname(__file__) or os.getcwd()
+    except Exception:
+        base = os.getcwd()
+        # hidden directory to avoid accidental commits; include pid+rand to avoid collisions
+    name = f".simulator_tmp_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
+    path = os.path.join(base, name)
+    try:
+        os.makedirs(path, exist_ok=True)
+        _LOCAL_TMP_ROOT = path
+    except Exception:
+        # fallback to system tempdir
+        _LOCAL_TMP_ROOT = tempfile.gettempdir()
+    return _LOCAL_TMP_ROOT
+
+
+def _cleanup_local_tmpdir():
+    """Remove the local tmp directory and its contents if it exists."""
+    global _LOCAL_TMP_ROOT
+    if not _LOCAL_TMP_ROOT:
+        return
+    try:
+        # only remove directories we created (hidden prefix) to be safe
+        base_name = os.path.basename(_LOCAL_TMP_ROOT or '')
+        if base_name.startswith('.simulator_tmp_') and os.path.isdir(_LOCAL_TMP_ROOT):
+            shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
+    except Exception:
+        pass
+    finally:
+        _LOCAL_TMP_ROOT = None
 
 # ---------- conversion helpers ----------
 
@@ -606,7 +653,8 @@ def _write_bgzip_text(path: str, text: str):
     tmp_path = None
     bgzip_exe = shutil.which('bgzip')
     try:
-        with tempfile.NamedTemporaryFile('w', delete=False) as tf:
+        tmpdir = _ensure_local_tmpdir()
+        with tempfile.NamedTemporaryFile('w', delete=False, dir=tmpdir) as tf:
             tf.write(text)
             tmp_path = tf.name
         if bgzip_exe:
@@ -1034,8 +1082,9 @@ def compute_sfs_stream_mean(ms_text, n_hap_expected, normalized=False, use_temp_
     import tempfile, os
     if use_temp_file:
         tmp = None
+        tmpdir = _ensure_local_tmpdir()
         try:
-            with tempfile.NamedTemporaryFile('w', delete=False) as tf:
+            with tempfile.NamedTemporaryFile('w', delete=False, dir=tmpdir) as tf:
                 tf.write(ms_text)
                 tmp = tf.name
             return _stream_sfs_mean_from_file(tmp, n_hap_expected=n_hap_expected, normalized=normalized)
@@ -1937,7 +1986,11 @@ def _pre_run_setup(args):
     return None
 
 def _post_run_teardown(args, result):
-    """Placeholder post-run hook (no-op to preserve behavior)."""
+    """Post-run hook: perform cleanup of local temporary directory."""
+    try:
+        _cleanup_local_tmpdir()
+    except Exception:
+        pass
     return result
 
 def run_simulation_from_args(args):
@@ -3444,7 +3497,8 @@ def _run_simulation_core(args):
                     path_out = os.path.join(out_dir, f"{root}_{i}.bcf")
                     tmp_vcf = None
                     try:
-                        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                        tmpdir = _ensure_local_tmpdir()
+                        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf', dir=tmpdir) as tf:
                             tf.write(vtxt)
                             tmp_vcf = tf.name
                         _vcf_text_to_bcf(tmp_vcf, path_out)
@@ -3457,7 +3511,8 @@ def _run_simulation_core(args):
             else:
                 tmp_vcf = None
                 try:
-                    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                    tmpdir = _ensure_local_tmpdir()
+                    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf', dir=tmpdir) as tf:
                         tf.write(per_rep_vcfs[0] if per_rep_vcfs else '')
                         tmp_vcf = tf.name
                     _vcf_text_to_bcf(tmp_vcf, args.out)
@@ -3631,7 +3686,8 @@ def _run_simulation_core(args):
                     elif fmt == 'bcf':
                         tmp_vcf = None
                         try:
-                            with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                            tmpdir = _ensure_local_tmpdir()
+                            with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf', dir=tmpdir) as tf:
                                 tf.write(vtxt)
                                 tmp_vcf = tf.name
                             _vcf_text_to_bcf(tmp_vcf, path_out)
@@ -4383,7 +4439,8 @@ def _run_simulation_core(args):
                                     path_out = os.path.join(out_dir_n, f"{root_n}_{i}.bcf")
                                     tmp_vcf = None
                                     try:
-                                        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                                        tmpdir = _ensure_local_tmpdir()
+                                        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf', dir=tmpdir) as tf:
                                             tf.write(vtxt)
                                             tmp_vcf = tf.name
                                         _vcf_text_to_bcf(tmp_vcf, path_out)
@@ -4405,7 +4462,8 @@ def _run_simulation_core(args):
                             elif fmt == 'bcf':
                                 tmp_vcf = None
                                 try:
-                                    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf') as tf:
+                                    tmpdir = _ensure_local_tmpdir()
+                                    with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf', dir=tmpdir) as tf:
                                         tf.write(single_vtxt)
                                         tmp_vcf = tf.name
                                     _vcf_text_to_bcf(tmp_vcf, neut_out_path)
