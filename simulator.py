@@ -14,6 +14,51 @@ import stdpopsim as sps
 import io
 import traceback
 import demes
+
+
+# --- Added by patch: ensure non-zero SFS by adding neutral mutations if needed ---
+def _ensure_mutations_on_ts(ts, mu_fallback=1e-8):
+    """
+    If a tree sequence has zero segregating sites, add neutral mutations using msprime.sim_mutations.
+    Attempts to respect discrete genome if present. Returns the (possibly) mutated ts.
+    """
+    try:
+        ns = int(getattr(ts, "num_sites", 0))
+    except Exception:
+        ns = 0
+    if ns and ns > 0:
+        return ts
+    try:
+        import msprime as _msp
+    except Exception:
+        # If msprime not available, return as-is
+        return ts
+    # Pick a rate: try to infer from ts or its metadata; otherwise use fallback
+    rate = None
+    # Some stdpopsim tree sequences carry mutation_rate in metadata/contig; best-effort probe
+    try:
+        if hasattr(ts, "sequence_length") and ts.sequence_length and ts.sequence_length > 0:
+            # Leave rate as None here; actual recomb/mut rates aren't stored on ts by default
+            pass
+    except Exception:
+        pass
+    if rate is None:
+        rate = float(mu_fallback)
+    # discrete genome flag if present
+    try:
+        dg = bool(getattr(ts, "discrete_genome", False))
+    except Exception:
+        dg = False
+    try:
+        ts2 = _msp.sim_mutations(ts, rate=rate, discrete_genome=dg)
+        return ts2
+    except Exception:
+        try:
+            ts2 = _msp.sim_mutations(ts, rate=rate)
+            return ts2
+        except Exception:
+            return ts
+# --- End patch helper ---
 from demes.ms import to_ms
 from tqdm import tqdm
 
@@ -556,6 +601,37 @@ def _msprime_worker_run(payload, env=None):
         if chosen_contig is None:
             return ('', '# ERROR: could not determine contig for msprime worker; provide --chromosome.\n', 8)
 
+        
+        # Resolve a robust mutation rate for msprime mutations if needed
+        mu_local = None
+        try:
+            # 1) contig-specific mutation rate
+            if hasattr(chosen_contig, 'mutation_rate') and chosen_contig.mutation_rate is not None:
+                mu_local = float(chosen_contig.mutation_rate)
+        except Exception:
+            mu_local = None
+        if mu_local is None:
+            try:
+                # 2) model-level mutation rate
+                model_mu = getattr(model_obj, 'mutation_rate', None)
+                if model_mu is not None:
+                    mu_local = float(model_mu)
+            except Exception:
+                mu_local = None
+        if mu_local is None:
+            try:
+                # 3) species genome default
+                genome = getattr(sp, 'genome', None)
+                for attr in ('per_site_mutation_rate','mutation_rate','mu'):
+                    if genome is not None and hasattr(genome, attr):
+                        val = getattr(genome, attr)
+                        if val is not None:
+                            mu_local = float(val)
+                            break
+            except Exception:
+                mu_local = None
+        if mu_local is None:
+            mu_local = 1e-8
         samples_per_pop = {}
         try:
             for i, pop in enumerate(pop_order):
@@ -582,61 +658,87 @@ def _msprime_worker_run(payload, env=None):
             return ('', f"# ERROR: failed to get msprime engine: {e}\n", 9)
 
         # local converter from tree sequence to ms-like (simple)
+        
         def _ts_to_ms_like(ts, length_val, pl=1):
+            # Stream haplotypes and compute per-replicate SFS without building a genotype matrix.
             if ts is None:
                 return 'segsites: 0\n'
             try:
-                num_sites = ts.num_sites
+                n_hap = int(ts.num_samples)
             except Exception:
-                num_sites = 0
-            if num_sites == 0:
+                n_hap = 0
+            if n_hap <= 0:
                 return 'segsites: 0\n'
+            # Prepare per-haplotype buffers and per-site derived counts
+            hap_buffers = [bytearray() for _ in range(n_hap)]
+            counts = []
             pos_vals = []
             try:
-                for v in ts.variants():
+                it = ts.variants()
+            except Exception:
+                it = []
+            for v in it:
+                try:
+                    g = v.genotypes
+                    # append one column to each hap buffer
+                    for i in range(n_hap):
+                        hap_buffers[i].append(49 if g[i] == 1 else 48)  # '1' or '0'
+                    # store per-site derived count
+                    try:
+                        counts.append(int(g.sum()))
+                    except Exception:
+                        # fallback if sum not available
+                        c = 0
+                        for i in range(n_hap):
+                            if g[i] == 1:
+                                c += 1
+                        counts.append(int(c))
+                    # positions: normalized to [0,1] if length provided
                     p = getattr(v, 'position', 0.0)
-                    if length_val and float(length_val) > 0:
-                        pos_vals.append(float(p) / float(length_val))
+                    if length_val:
+                        try:
+                            denom = float(length_val)
+                        except Exception:
+                            denom = None
+                        if denom and denom > 0:
+                            pos_vals.append(float(p) / denom)
+                        else:
+                            pos_vals.append(float(p))
                     else:
-                        pos_vals.append(float(p) if p is not None else 0.0)
-            except Exception:
-                try:
-                    pos_vals = [site.position for site in ts.tables.sites]
+                        pos_vals.append(float(p))
                 except Exception:
-                    pos_vals = []
-            # genotype matrix
-            try:
-                gm = ts.genotype_matrix()
-                import numpy as _np
-                mat = _np.asarray(gm).T
-            except Exception:
-                mat = []
-                try:
-                    rows = []
-                    for v in ts.variants():
-                        rows.append(list(v.genotypes))
-                    if rows:
-                        mat = [list(col) for col in zip(*rows)]
-                except Exception:
-                    mat = []
+                    continue
+            segsites = len(counts)
+            if segsites == 0:
+                return 'segsites: 0\n'
+            # Build ms-like text
             out_lines = []
-            out_lines.append(f"segsites: {len(pos_vals)}")
+            out_lines.append(f"segsites: {segsites}")
             out_lines.append('positions: ' + ' '.join(str(p) for p in pos_vals))
+            out_lines.extend(b.decode('ascii') for b in hap_buffers)
+            # Also append a per-replicate SFS line to make downstream SFS robust
             try:
-                for samp in range(len(mat)):
-                    row = mat[samp]
-                    out_lines.append(''.join('1' if int(x) == 1 else '0' for x in row))
+                import numpy as _np_local
+                binc = _np_local.bincount(_np_local.asarray(counts, dtype=_np_local.int32), minlength=n_hap+1)
+                sfs_vec = binc[1:n_hap]
+                # store raw counts (un-normalized) so the writer can choose normalization
+                out_lines.append('#SFS_PER_REP\t' + '\t'.join(str(int(x)) for x in sfs_vec.tolist()))
             except Exception:
-                try:
-                    for r in mat:
-                        out_lines.append(''.join('1' if int(x) == 1 else '0' for x in r))
-                except Exception:
-                    pass
+                pass
             return '\n'.join(out_lines) + '\n'
-
         for ridx in range(rep_count):
             try:
                 ts = eng.simulate(model_obj, chosen_contig, samples_per_pop)
+                ts = _ensure_mutations_on_ts(ts)
+                try:
+                    import msprime as _msp
+                    _num_sites = int(getattr(ts, 'num_sites', 0))
+                    if _num_sites == 0:
+                        _dg = bool(getattr(ts, 'discrete_genome', False)) if hasattr(ts, 'discrete_genome') else False
+                        _mu = mu_local if isinstance(mu_local, (int,float)) and mu_local>0 else 1e-8
+                        ts = _msp.sim_mutations(ts, rate=_mu, discrete_genome=_dg)
+                except Exception:
+                    pass
                 ms_block = _ts_to_ms_like(ts, length or (getattr(chosen_contig, 'length', None) or 0), ploidy)
                 out_parts.append(ms_block)
             except Exception as e:
@@ -1943,9 +2045,9 @@ def parse_args():
     g.add_argument('--output', dest='out', default=None,
                    help=("Output file path. If omitted, modelid_pop0[_chrom][_sweeppop].EXT is written (EXT per --output-format). "
                          "Use '-' for stdout."))
-    g.add_argument('--temp', dest='temp_loc', choices=['local','tmpfs','auto'], default='local',
-                   help=("Where to place intermediate temporary files: 'local' (repo-local hidden folder),"
-                         " 'tmpfs' (system tmp if it's tmpfs), or 'auto' (use tmpfs if available). Default: local."))
+    g.add_argument('--temp', dest='temp_loc', choices=['local','system'], default='local',
+                   help=("Where to place intermediate temporary files: 'local' (repo-local hidden folder)"
+                         " or 'system' (use Python's tempfile.gettempdir()). Default: local."))
     g.add_argument('--output-format', dest='format', default='ms', choices=['ms','ms.gz','vcf','vcf.gz','bcf'],
                    help="Output format. 'ms'/'ms.gz' write raw ms-like (optionally gzipped); 'vcf'/'vcf.gz' convert single replicate to VCF.")
     g.add_argument('--parallel', dest='parallel', type=int, default=1,
@@ -2084,32 +2186,14 @@ def _pre_run_setup(args):
 
     Behaviour:
     - default 'local' to avoid RAM overflow
-    - 'tmpfs' attempts to use system tmpfs (/tmp); if unavailable we warn and fall back to local
-    - 'auto' uses tmpfs only when available
+    - 'system' uses Python's system tempdir (e.g. /tmp via tempfile.gettempdir())
     """
     try:
         pref = getattr(args, 'temp_loc', 'local')
         if pref == 'local':
             os.environ['SIMULATOR_USE_REPO_TMP'] = '1'
-            os.environ.pop('SIMULATOR_USE_SYSTEM_TMP', None)
-        elif pref == 'tmpfs':
-            if _system_tmp_is_tmpfs():
-                os.environ['SIMULATOR_USE_SYSTEM_TMP'] = '1'
-                os.environ.pop('SIMULATOR_USE_REPO_TMP', None)
-            else:
-                try:
-                    sys.stderr.write('# WARNING: requested tmpfs but system temp is not a tmpfs; using local repo .tmp instead.\n')
-                except Exception:
-                    pass
-                os.environ['SIMULATOR_USE_REPO_TMP'] = '1'
-                os.environ.pop('SIMULATOR_USE_SYSTEM_TMP', None)
-        else:  # auto
-            if _system_tmp_is_tmpfs():
-                os.environ['SIMULATOR_USE_SYSTEM_TMP'] = '1'
-                os.environ.pop('SIMULATOR_USE_REPO_TMP', None)
-            else:
-                os.environ['SIMULATOR_USE_REPO_TMP'] = '1'
-                os.environ.pop('SIMULATOR_USE_SYSTEM_TMP', None)
+        else:  # 'system'
+            os.environ.pop('SIMULATOR_USE_REPO_TMP', None)
     except Exception:
         pass
     return None
@@ -3296,6 +3380,16 @@ def _run_simulation_core(args):
                             # No stored SFS available: run simulate to obtain ts and compute SFS
                             try:
                                 ts = eng.simulate(model_obj, chosen_contig, samples_per_pop)
+                                ts = _ensure_mutations_on_ts(ts)
+                                try:
+                                    import msprime as _msp
+                                    _num_sites = int(getattr(ts, 'num_sites', 0))
+                                    if _num_sites == 0:
+                                        _dg = bool(getattr(ts, 'discrete_genome', False)) if hasattr(ts, 'discrete_genome') else False
+                                        _mu = mu_local if isinstance(mu_local, (int,float)) and mu_local>0 else 1e-8
+                                        ts = _msp.sim_mutations(ts, rate=_mu, discrete_genome=_dg)
+                                except Exception:
+                                    pass
                             except Exception as e:
                                 if args.sfs_mode == 'per-rep':
                                     per_rep_lines.append(f"rep{ridx+1}\t" + '\t'.join('0' for _ in range(n_hap-1)))
@@ -4234,6 +4328,7 @@ def _run_simulation_core(args):
                         except Exception:
                             pass
                         ts = eng.simulate(model_obj, chosen_contig, samples_per_pop, **kwargs)
+                        ts = _ensure_mutations_on_ts(ts)
                         buf = io.StringIO()
                         if hasattr(ts, 'write_ms'):
                             ts.write_ms(buf)

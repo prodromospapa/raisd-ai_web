@@ -20,7 +20,7 @@ import subprocess
 
 species = "Homo sapiens"
 
-parallel = 10
+parallel = 5
 samples = 10_000
 
 def biggest_chrom(species_std):
@@ -71,36 +71,37 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
 
             args = [
                 "simulator.py",
-                "--engine", "scrm",
+                "--engine", "msprime",#"scrm",
                 "--species-id", str(species),
                 "--model-id", str(model_id),
                 "--pop-order", str(population),
                 "--sample-individuals", str(samples),
                 "--chromosome", "21",#str(biggest_chromosome),
-                "--replicates", "20",
+                "--replicates", "5",
                 "--parallel", str(parallel),
                 "--sfs", "sfs.sfs",
-                "--sfs-normalized"
+                "--sfs-normalized",
+                "--length", "10000000"
             ]
-            try:
-                subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except subprocess.CalledProcessError:
-                # switch engine to msprime and retry once
-                if "--engine" in args:
-                    i = args.index("--engine")
-                    args[i+1] = "msprime"
-                else:
-                    args.extend(["--engine", "msprime"])
-                    # halve parallel (integer division), ensure at least 1, and update args if present
-                    if "--parallel" in args:
-                        p_idx = args.index("--parallel")
-                        new_parallel = max(1, int(int(args[p_idx+1]) // 2))
-                        args[p_idx+1] = str(new_parallel)
-                        parallel = new_parallel
-                    else:
-                        parallel = max(1, parallel // 2)
-                        args.extend(["--parallel", str(parallel)])
-                subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # try:
+            subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # except subprocess.CalledProcessError:
+            #     # switch engine to msprime and retry once
+            #     if "--engine" in args:
+            #         i = args.index("--engine")
+            #         args[i+1] = "msprime"
+            #     else:
+            #         args.extend(["--engine", "msprime"])
+            #         # halve parallel (integer division), ensure at least 1, and update args if present
+            #         if "--parallel" in args:
+            #             p_idx = args.index("--parallel")
+            #             new_parallel = max(1, int(int(args[p_idx+1]) // 2))
+            #             args[p_idx+1] = str(new_parallel)
+            #             parallel = new_parallel
+            #         else:
+            #             parallel = max(1, parallel // 2)
+            #             args.extend(["--parallel", str(parallel)])
+            #     subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             sfs.loc[f"{model_id}={population}"] = read_sfs_file("sfs.sfs")
             os.remove("sfs.sfs")
             sfs.to_csv(f"data/{species_folder_name}/sfs.csv")
