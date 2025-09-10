@@ -3112,6 +3112,10 @@ def _run_simulation_core(args):
         sfs_pending = None
         # If engine is msprime, prefer in-process allele_frequency_spectrum() to compute SFS
         if engine == 'msprime':
+            try:
+                sys.stderr.write('#DEBUG: entering msprime in-process SFS branch\n')
+            except Exception:
+                pass
             # Use a simple, serial in-process msprime SFS approach (like junk/1.sfs.py):
             # - no windows, no multithreading
             # - run reps sequentially, compute ts.allele_frequency_spectrum
@@ -3207,6 +3211,12 @@ def _run_simulation_core(args):
                 per_rep_lines = []
                 accum = [0.0] * (n_hap - 1)
                 used = 0
+
+                # Debug: print msprime SFS context
+                try:
+                    sys.stderr.write(f"#DEBUG msprime SFS context: counts_disc={counts_disc} total_hap={total_hap} n_hap={n_hap} mu_local={mu_local}\n")
+                except Exception:
+                    pass
 
                 # Check for per-rep SFS stored from the primary simulate loop
                 stored_sfs = None
@@ -3309,57 +3319,84 @@ def _run_simulation_core(args):
                         pass
 
                 # If stored_sfs is not available but we have captured simulator output
-                # (concatenated_stdout), parse that instead of re-simulating to build the SFS.
+                # (concatenated_stdout), try to extract any per-replicate SFS markers
+                # produced by in-process msprime sim ("#SFS_PER_REP\t...") and use
+                # them directly. If none are present, fall back to parsing haplotype
+                # blocks via the streaming/text parsers.
                 skip_sfs_loop = False
                 if stored_sfs is None and concatenated_stdout:
                     try:
-                        if args.sfs_mode == 'mean':
-                            # If available, derive n_hap from meta to optimize dtype; else let it infer
-                            try:
-                                _pl = int(meta.get('ploidy') or 1)
-                                _hap_list = meta.get('counts_disc') or []
-                                _n_hap = int(sum(int(h) for h in _hap_list)) if _hap_list else None
-                            except Exception:
-                                _n_hap = None
-                            header_sfs, lines_sfs = compute_sfs_stream_mean(concatenated_stdout, n_hap_expected=_n_hap, normalized=args.sfs_normalized)
-                        else:
-                            header_sfs, lines_sfs = compute_sfs_fast(concatenated_stdout, normalized=args.sfs_normalized, mode=args.sfs_mode)
-                        sfs_text = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
-                        # write file and exit early from --sfs branch
-                        if isinstance(args.sfs, str) and args.sfs is not True and args.sfs != 'True':
-                            if args.sfs.endswith('.sfs'):
-                                sfs_path = args.sfs
-                            else:
-                                sfs_path = args.sfs + '.sfs'
-                        else:
-                            if getattr(args, 'out', None) and args.out not in (None, '-'):
-                                base = args.out
-                                for ext_candidate in ('.vcf.gz', '.vcf', '.bcf', '.ms.gz', '.ms'):
-                                    if base.endswith(ext_candidate):
-                                        base = base[:-len(ext_candidate)]; break
-                                sfs_path = base + '.sfs'
-                            else:
-                                sfs_path = default_stem + '.sfs'
+                        # First, look for explicit per-rep SFS markers written by _ts_to_ms_like
                         try:
-                            with open(sfs_path, 'w') as f:
-                                f.write('# SFS output\n')
-                                f.write('# normalized=' + str(args.sfs_normalized) + ' mode=' + args.sfs_mode + '\n')
-                                f.write(sfs_text)
+                            import re as _re
+                            sfs_lines = _re.findall(r'(?m)^#SFS_PER_REP\s+(.+)$', concatenated_stdout)
+                        except Exception:
+                            sfs_lines = []
+                        if sfs_lines:
+                            # Parse each found line into a float list and treat as stored_sfs
+                            parsed = []
+                            for ln in sfs_lines:
                                 try:
-                                    f.flush()
-                                    os.fsync(f.fileno())
+                                    vals = [float(x) for x in ln.strip().split() if x is not None and x != '']
                                 except Exception:
-                                    pass
-                            if not sfs_written:
-                                sys.stderr.write(f"# INFO: wrote SFS to {sfs_path}\n")
-                                sfs_written = True
-                        except Exception as e:
-                            sys.stderr.write(f"# ERROR: failed to write SFS file {sfs_path}: {e}\n")
-                            if not args.out or args.out == '-':
-                                sys.stdout.write(sfs_text)
-                        # skip the rest of msprime in-process SFS logic
-                        skip_sfs_loop = True
-                        stored_sfs = []
+                                    vals = []
+                                parsed.append(vals)
+                            stored_sfs = parsed
+
+                        if stored_sfs:
+                            # If we obtained stored_sfs from the stdout markers, reuse the
+                            # existing stored_sfs-handling above by letting the code fall
+                            # through (it will detect stored_sfs and format output).
+                            pass
+                        else:
+                            # No explicit markers found: fall back to the text-based SFS parsers
+                            if args.sfs_mode == 'mean':
+                                # If available, derive n_hap from meta to optimize dtype; else let it infer
+                                try:
+                                    _pl = int(meta.get('ploidy') or 1)
+                                    _hap_list = meta.get('counts_disc') or []
+                                    _n_hap = int(sum(int(h) for h in _hap_list)) if _hap_list else None
+                                except Exception:
+                                    _n_hap = None
+                                header_sfs, lines_sfs = compute_sfs_stream_mean(concatenated_stdout, n_hap_expected=_n_hap, normalized=args.sfs_normalized)
+                            else:
+                                header_sfs, lines_sfs = compute_sfs_fast(concatenated_stdout, normalized=args.sfs_normalized, mode=args.sfs_mode)
+                            sfs_text = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
+                            # write file and exit early from --sfs branch
+                            if isinstance(args.sfs, str) and args.sfs is not True and args.sfs != 'True':
+                                if args.sfs.endswith('.sfs'):
+                                    sfs_path = args.sfs
+                                else:
+                                    sfs_path = args.sfs + '.sfs'
+                            else:
+                                if getattr(args, 'out', None) and args.out not in (None, '-'):
+                                    base = args.out
+                                    for ext_candidate in ('.vcf.gz', '.vcf', '.bcf', '.ms.gz', '.ms'):
+                                        if base.endswith(ext_candidate):
+                                            base = base[:-len(ext_candidate)]; break
+                                    sfs_path = base + '.sfs'
+                                else:
+                                    sfs_path = default_stem + '.sfs'
+                            try:
+                                with open(sfs_path, 'w') as f:
+                                    f.write('# SFS output\n')
+                                    f.write('# normalized=' + str(args.sfs_normalized) + ' mode=' + args.sfs_mode + '\n')
+                                    f.write(sfs_text)
+                                    try:
+                                        f.flush()
+                                        os.fsync(f.fileno())
+                                    except Exception:
+                                        pass
+                                if not sfs_written:
+                                    sys.stderr.write(f"# INFO: wrote SFS to {sfs_path}\n")
+                                    sfs_written = True
+                            except Exception as e:
+                                sys.stderr.write(f"# ERROR: failed to write SFS file {sfs_path}: {e}\n")
+                                if not args.out or args.out == '-':
+                                    sys.stdout.write(sfs_text)
+                            # skip the rest of msprime in-process SFS logic
+                            skip_sfs_loop = True
+                            stored_sfs = []
                     except Exception:
                         # fallback to re-simulate below if parsing fails
                         stored_sfs = None
@@ -3400,25 +3437,30 @@ def _run_simulation_core(args):
                                 if args.sfs_mode == 'per-rep':
                                     per_rep_lines.append(f"rep{ridx+1}\t" + '\t'.join('0' for _ in range(n_hap-1)))
                                 continue
-                        arr = list(map(float, sfs_raw))
-                    if len(arr) < n_hap + 1:
-                        arr = arr + [0.0] * (n_hap + 1 - len(arr))
-                    vals = arr[1:n_hap]
-                    if args.sfs_normalized:
-                        denom = sum(vals)
-                        if denom > 0:
-                            vals_out = [v/denom for v in vals]
-                        else:
-                            vals_out = [0.0] * len(vals)
-                    else:
-                        # non-normalized per-rep: present integer counts like other engines
-                        vals_out = [int(v) for v in vals]
 
-                    if args.sfs_mode == 'per-rep':
-                        per_rep_lines.append(f"rep{ridx+1}\t" + '\t'.join(str(x) for x in vals_out))
-                    else:
-                        accum = [a + float(b) for a, b in zip(accum, vals_out)]
-                        used += 1
+                        # Process this replicate's SFS values (ensure this runs inside the loop)
+                        try:
+                            arr = list(map(float, sfs_raw))
+                        except Exception:
+                            arr = []
+                        if len(arr) < n_hap + 1:
+                            arr = arr + [0.0] * (n_hap + 1 - len(arr))
+                        vals = arr[1:n_hap]
+                        if args.sfs_normalized:
+                            denom = sum(vals)
+                            if denom > 0:
+                                vals_out = [v/denom for v in vals]
+                            else:
+                                vals_out = [0.0] * len(vals)
+                        else:
+                            # non-normalized per-rep: present integer counts like other engines
+                            vals_out = [int(v) for v in vals]
+
+                        if args.sfs_mode == 'per-rep':
+                            per_rep_lines.append(f"rep{ridx+1}\t" + '\t'.join(str(x) for x in vals_out))
+                        else:
+                            accum = [a + float(b) for a, b in zip(accum, vals_out)]
+                            used += 1
 
                 # finalize text
                 if args.sfs_mode == 'per-rep':

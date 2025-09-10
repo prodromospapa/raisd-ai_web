@@ -92,7 +92,7 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
         msg = f"Model '{model_id}' population '{population}'\n"
         species_dir = os.path.join(os.getcwd(), "data", species_folder_name)
         os.makedirs(species_dir, exist_ok=True)
-        log_path = os.path.join(species_dir, "simulation.log")
+        log_path = os.path.join(species_dir, "check_train_model.log")
         if os.path.exists(log_path):
             with open(log_path, "r", encoding="utf-8") as log_f:
                 if msg not in log_f.read():
@@ -210,6 +210,7 @@ tasks_done = sum(
     if _model_done(model_id, population, chromosome)
 )
 
+first = True
 with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as total_bar:
     for model_id, populations in demographic_models.items():
         for population in populations:
@@ -217,9 +218,13 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                 if _model_done(model_id, population, chromosome):
                     total_bar.update(1)
                     total_bar.refresh()
+                    first = False
                     # already counted in initial; just continue
                     continue
                 try: 
+                    if first:
+                        os.remove(f"data/{species_folder_name}/check_train_model.log") if os.path.exists(f"data/{species_folder_name}/check_train_model.log") else None
+                    first = False
                     sweep_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep.ms"
                     neutral_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/neutral.ms"
                     if not os.path.exists(sweep_path) or not os.path.exists(neutral_path):

@@ -53,13 +53,19 @@ demographic_models = {
 species_folder_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in str(species_full_name)).strip().replace(" ", "_")
 
 ploidy = species_std.ploidy
-sfs = pd.DataFrame(columns= range(1,ploidy*(samples)))
+
 
 os.system(f'mkdir -p "data/{species_folder_name}"')
 
 if os.path.exists(f"data/{species_folder_name}/sfs.csv"):
     sfs = pd.read_csv(f"data/{species_folder_name}/sfs.csv",index_col=0)
+    samples = (sfs.shape[1] // ploidy)+1
+    print(f"Resuming with {samples} samples per population")
+else:
+    sfs = pd.DataFrame(columns= range(1,ploidy*(samples)))
 
+#os.remove(f"data/{species_folder_name}/warning.log") if os.path.exists(f"data/{species_folder_name}/warning.log") else None
+first = True
 total = sum(len(pops) for pops in demographic_models.values())
 with tqdm(total=total, desc="Simulations", unit="run") as pbar:
     for model_id, populations in demographic_models.items():
@@ -67,11 +73,15 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
             if f"{model_id}={population}" in sfs.index:
                 pbar.update(1)
                 pbar.refresh()
+                first = False
                 continue
+            if first:
+                os.remove(f"data/{species_folder_name}/check_sfs_models.log") if os.path.exists(f"data/{species_folder_name}/check_sfs_models.log") else None
+            first = False
 
             args = [
                 "simulator.py",
-                "--engine", "msprime",#"scrm",
+                "--engine", "msprime",
                 "--species-id", str(species),
                 "--model-id", str(model_id),
                 "--pop-order", str(population),
@@ -82,26 +92,15 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 "--sfs", "sfs.sfs",
                 "--sfs-normalized",
                 "--length", "10000000"
-            ]
-            # try:
-            subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # except subprocess.CalledProcessError:
-            #     # switch engine to msprime and retry once
-            #     if "--engine" in args:
-            #         i = args.index("--engine")
-            #         args[i+1] = "msprime"
-            #     else:
-            #         args.extend(["--engine", "msprime"])
-            #         # halve parallel (integer division), ensure at least 1, and update args if present
-            #         if "--parallel" in args:
-            #             p_idx = args.index("--parallel")
-            #             new_parallel = max(1, int(int(args[p_idx+1]) // 2))
-            #             args[p_idx+1] = str(new_parallel)
-            #             parallel = new_parallel
-            #         else:
-            #             parallel = max(1, parallel // 2)
-            #             args.extend(["--parallel", str(parallel)])
-            #     subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                ]
+            try:
+                subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except subprocess.CalledProcessError:
+                i = args.index("--engine")
+                args[i+1] = "scrm"
+                with open(f"data/{species_folder_name}/check_sfs_models.log", "a") as wf:
+                    wf.write(f"Warning: msprime failed for {model_id} {population}.\n")
+                subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             sfs.loc[f"{model_id}={population}"] = read_sfs_file("sfs.sfs")
             os.remove("sfs.sfs")
             sfs.to_csv(f"data/{species_folder_name}/sfs.csv")
