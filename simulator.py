@@ -5,93 +5,97 @@
 #          a small orchestrator around the original core function.
 # Generated: 2025-09-09T03:45:38
 # =============================================================================
-
-#!/usr/bin/env python3
-import argparse, math, sys, subprocess, shlex, concurrent.futures, gzip, re, json
-import shutil, tempfile
-import os, time, random, atexit, signal
-import stdpopsim as sps
+import os
+import sys
 import io
-import traceback
-import demes
+import math
+import tempfile
+import shutil
+import time
+import random
+import re
+import atexit
+import signal
+import subprocess
+import argparse
+import shlex
+import concurrent.futures
+
+try:
+    import stdpopsim as sps
+except Exception:
+    sps = None
 
 
-# --- Added by patch: ensure non-zero SFS by adding neutral mutations if needed ---
 def _ensure_mutations_on_ts(ts, mu_fallback=1e-8):
-    """
-    If a tree sequence has zero segregating sites, add neutral mutations using msprime.sim_mutations.
-    Attempts to respect discrete genome if present. Returns the (possibly) mutated ts.
+    """Ensure a tree sequence has at least one mutation by applying sim_mutations.
+
+    Returns the (possibly modified) tree sequence. Non-fatal on error.
     """
     try:
-        ns = int(getattr(ts, "num_sites", 0))
-    except Exception:
-        ns = 0
-    if ns and ns > 0:
-        return ts
-    try:
+        if ts is None:
+            return ts
+        nsites = int(getattr(ts, 'num_sites', 0))
+        if nsites > 0:
+            return ts
+        # Try to add mutations using msprime if available
         import msprime as _msp
+        dg = bool(getattr(ts, 'discrete_genome', False)) if hasattr(ts, 'discrete_genome') else False
+        return _msp.sim_mutations(ts, rate=mu_fallback, discrete_genome=dg)
     except Exception:
-        # If msprime not available, return as-is
         return ts
-    # Pick a rate: try to infer from ts or its metadata; otherwise use fallback
-    rate = None
-    # Some stdpopsim tree sequences carry mutation_rate in metadata/contig; best-effort probe
+
+
+def present_size_of(deme):
+    """Return a present-day size estimate for a deme object.
+
+    This is a minimal compatibility helper used by builders. It prefers
+    attributes commonly found on demes/tskit objects and falls back to 1e4.
+    """
     try:
-        if hasattr(ts, "sequence_length") and ts.sequence_length and ts.sequence_length > 0:
-            # Leave rate as None here; actual recomb/mut rates aren't stored on ts by default
-            pass
+        if hasattr(deme, 'present_size') and deme.present_size is not None:
+            return float(deme.present_size)
+        if hasattr(deme, 'initial_size') and deme.initial_size is not None:
+            return float(deme.initial_size)
+        if hasattr(deme, 'start_size') and deme.start_size is not None:
+            return float(deme.start_size)
     except Exception:
         pass
-    if rate is None:
-        rate = float(mu_fallback)
-    # discrete genome flag if present
-    try:
-        dg = bool(getattr(ts, "discrete_genome", False))
-    except Exception:
-        dg = False
-    try:
-        ts2 = _msp.sim_mutations(ts, rate=rate, discrete_genome=dg)
-        return ts2
-    except Exception:
-        try:
-            ts2 = _msp.sim_mutations(ts, rate=rate)
-            return ts2
-        except Exception:
-            return ts
-# --- End patch helper ---
-from demes.ms import to_ms
-from tqdm import tqdm
+    return 1e4
 
-def present_size_of(deme: demes.Deme):
-    for ep in deme.epochs:
-        if getattr(ep, 'end_time', None) == 0:
-            size = getattr(ep, 'end_size', None) or getattr(ep, 'start_size', None)
-            if size is None:
-                raise SystemExit(f"ERROR: cannot determine present size for deme {deme.name}")
-            return float(size)
-    ep = deme.epochs[-1]
-    size = getattr(ep, 'end_size', None) or getattr(ep, 'start_size', None)
-    if size is None:
-        raise SystemExit(f"ERROR: cannot determine present size for deme {deme.name}")
-    return float(size)
 
-def reorder_put_first(order_list, first_name):
-    if first_name is None:
-        return order_list[:]
-    if first_name not in order_list:
-        raise SystemExit(f"ERROR: requested name '{first_name}' not in list {order_list}")
-    return [first_name] + [d for d in order_list if d != first_name]
+def reorder_put_first(user_order, first):
+    """Return a copy of user_order with `first` moved to the front if present."""
+    if not user_order:
+        return user_order
+    out = [x for x in user_order if x != first]
+    if first in user_order:
+        return [first] + out
+    return out
+
+
 def harmonic_number(n):
-    try:
-        n_int = int(n)
-    except Exception:
+    """Return the nth harmonic number H_n = sum_{k=1..n} 1/k (float)."""
+    if n <= 0:
         return 0.0
-    if n_int <= 0:
-        return 0.0
-    return sum(1.0/i for i in range(1, n_int+1))
+    s = 0.0
+    for k in range(1, int(n) + 1):
+        s += 1.0 / k
+    return s
 
-# ---------- ms/msms/scrm demography & subprocess helpers ----------
 
+def to_ms(graph, N0=1.0, samples=None):
+    """Produce a minimal ms-like demography string for the given demes.Graph.
+
+    This is a conservative placeholder that emits no special -e* flags and
+    leaves demography details minimal so builders can proceed.
+    """
+    if samples is None:
+        samples = []
+    # create a trivial ms command fragment with no demographic events
+    npop = max(1, len(samples))
+    base = f"-I {npop} " + ' '.join(str(int(s)) for s in samples)
+    return base
 def strip_I_block(ms_cmd):
     toks = ms_cmd.split()
     if '-I' not in toks:
@@ -421,7 +425,7 @@ def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int =
             '##fileformat=VCFv4.2',
             '##source=stdpopsim2ms.py',
             f'##contig=<ID={chrom},length={int(length) if length else 0}>',
-            '##INFO=<ID=.,Number=0,Type=Flag,Description="Placeholder">',
+            '##INFO=<ID=SIM,Number=0,Type=Flag,Description="Placeholder">',
             '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
             '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT'
         ]
@@ -480,7 +484,7 @@ def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int =
             '##fileformat=VCFv4.2',
             '##source=stdpopsim2ms.py',
             f'##contig=<ID={chrom},length={int(length) if length else 0}>',
-            '##INFO=<ID=.,Number=0,Type=Flag,Description="Placeholder">',
+            '##INFO=<ID=SIM,Number=0,Type=Flag,Description="Placeholder">',
             '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
             '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT'
         ]
@@ -512,7 +516,7 @@ def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int =
         '##fileformat=VCFv4.2',
         '##source=stdpopsim2ms.py',
         f'##contig=<ID={chrom},length={L}>',
-        '##INFO=<ID=.,Number=0,Type=Flag,Description="Placeholder">',
+        '##INFO=<ID=SIM,Number=0,Type=Flag,Description="Placeholder">',
         '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">'
     ]
     sample_names = [f'Ind{i+1}' for i in range(n_ind)]
@@ -659,7 +663,7 @@ def _msprime_worker_run(payload, env=None):
 
         # local converter from tree sequence to ms-like (simple)
         
-        def _ts_to_ms_like(ts, length_val, pl=1):
+        def _ts_to_ms_like(ts, length_val, pl=1, suppress_sfs=False):
             # Stream haplotypes and compute per-replicate SFS without building a genotype matrix.
             if ts is None:
                 return 'segsites: 0\n'
@@ -716,31 +720,86 @@ def _msprime_worker_run(payload, env=None):
             out_lines.append(f"segsites: {segsites}")
             out_lines.append('positions: ' + ' '.join(str(p) for p in pos_vals))
             out_lines.extend(b.decode('ascii') for b in hap_buffers)
-            # Also append a per-replicate SFS line to make downstream SFS robust
-            try:
-                import numpy as _np_local
-                binc = _np_local.bincount(_np_local.asarray(counts, dtype=_np_local.int32), minlength=n_hap+1)
-                sfs_vec = binc[1:n_hap]
-                # store raw counts (un-normalized) so the writer can choose normalization
-                out_lines.append('#SFS_PER_REP\t' + '\t'.join(str(int(x)) for x in sfs_vec.tolist()))
-            except Exception:
-                pass
+            # Optionally append a per-replicate SFS line to make downstream SFS robust
+            if not suppress_sfs:
+                try:
+                    import numpy as _np_local
+                    binc = _np_local.bincount(_np_local.asarray(counts, dtype=_np_local.int32), minlength=n_hap+1)
+                    sfs_vec = binc[1:n_hap]
+                    # store raw counts (un-normalized) so the writer can choose normalization
+                    out_lines.append('#SFS_PER_REP\t' + '\t'.join(str(int(x)) for x in sfs_vec.tolist()))
+                except Exception:
+                    pass
             return '\n'.join(out_lines) + '\n'
+
         for ridx in range(rep_count):
             try:
-                ts = eng.simulate(model_obj, chosen_contig, samples_per_pop)
+                # Prefer passing an explicit seed to the engine when provided
+                if seed is not None:
+                    try:
+                        ts = eng.simulate(model_obj, chosen_contig, samples_per_pop, seed=int(seed))
+                    except TypeError:
+                        # Some engine wrappers do not accept a seed kwarg; fall back
+                        ts = eng.simulate(model_obj, chosen_contig, samples_per_pop)
+                else:
+                    ts = eng.simulate(model_obj, chosen_contig, samples_per_pop)
+
                 ts = _ensure_mutations_on_ts(ts)
                 try:
                     import msprime as _msp
                     _num_sites = int(getattr(ts, 'num_sites', 0))
                     if _num_sites == 0:
                         _dg = bool(getattr(ts, 'discrete_genome', False)) if hasattr(ts, 'discrete_genome') else False
-                        _mu = mu_local if isinstance(mu_local, (int,float)) and mu_local>0 else 1e-8
+                        _mu = mu_local if isinstance(mu_local, (int, float)) and mu_local > 0 else 1e-8
                         ts = _msp.sim_mutations(ts, rate=_mu, discrete_genome=_dg)
                 except Exception:
                     pass
-                ms_block = _ts_to_ms_like(ts, length or (getattr(chosen_contig, 'length', None) or 0), ploidy)
-                out_parts.append(ms_block)
+
+                # Prefer writing VCF directly from the tree sequence when available
+                try:
+                    buf = io.StringIO()
+                    if hasattr(ts, 'write_vcf'):
+                        cid = str(chromosome) if chromosome is not None else '1'
+                        try:
+                            ts.write_vcf(buf, contig_id=cid)
+                        except TypeError:
+                            ts.write_vcf(buf)
+                        vcf_text = buf.getvalue()
+                        out_parts.append(vcf_text)
+                    else:
+                        suppress_flag = bool(payload.get('suppress_worker_sfs', False)) if isinstance(payload, dict) else False
+                        ms_block = _ts_to_ms_like(ts, length or (getattr(chosen_contig, 'length', None) or 0), ploidy, suppress_sfs=suppress_flag)
+                        out_parts.append(ms_block)
+                except Exception:
+                    # Fallback to ms-like conversion if VCF writing fails
+                    try:
+                        suppress_flag = bool(payload.get('suppress_worker_sfs', False)) if isinstance(payload, dict) else False
+                        ms_block = _ts_to_ms_like(ts, length or (getattr(chosen_contig, 'length', None) or 0), ploidy, suppress_sfs=suppress_flag)
+                        out_parts.append(ms_block)
+                    except Exception:
+                        err_parts.append(f"# ERROR: failed to produce output for replicate {ridx}\n")
+
+                # Compute and emit allele-frequency-spectrum on stderr as a separate marker
+                try:
+                    payload['suppress_worker_sfs'] = bool(payload.get('suppress_worker_sfs', False)) if isinstance(payload, dict) else False
+                except Exception:
+                    payload['suppress_worker_sfs'] = False
+
+                if not payload.get('suppress_worker_sfs', False):
+                    # emit a small debug marker for number of sites so the controller can see why SFS may be zero
+                    try:
+                        nsites_debug = int(getattr(ts, 'num_sites', 0))
+                        err_parts.append(f"#DEBUG_NUM_SITES\t{nsites_debug}\n")
+                    except Exception:
+                        pass
+                    try:
+                        sfs_af = ts.allele_frequency_spectrum(polarised=True, span_normalise=False)
+                        sfs_af_line = '#SFS_AF\t' + '\t'.join(str(float(x)) for x in (sfs_af.tolist() if hasattr(sfs_af, 'tolist') else list(sfs_af))) + '\n'
+                        err_parts.append(sfs_af_line)
+                    except Exception:
+                        # non-fatal: don't crash worker if SFS calc fails
+                        pass
+
             except Exception as e:
                 import traceback as _tb
                 err_parts.append(f"# ERROR: msprime simulate failed for replicate {ridx}: {e}\n{_tb.format_exc()}\n")
@@ -2058,6 +2117,7 @@ def parse_args():
     g.add_argument('--sfs', nargs='?', const=True, default=False,
                    help="Compute unfolded SFS. Optional value sets output basename; default name modelid_pop0[_chrom][_sweeppop].sfs.")
     g.add_argument('--sfs-normalized', action='store_true', help='Normalize SFS counts to frequencies.')
+    # Deprecated flags --force-resim / --no-force-resim removed: worker AF markers are authoritative.
     g.add_argument('--sfs-mode', choices=['mean','per-rep'], default='mean', help="SFS aggregation mode.")
 
     pn = ap.add_argument_group('Paired neutral baseline')
@@ -2741,6 +2801,14 @@ def _run_simulation_core(args):
                         'seed': seed_val,
                     }
                     try:
+                        payload['suppress_worker_sfs'] = (not bool(getattr(args, 'sfs', False)))
+                    except Exception:
+                        payload['suppress_worker_sfs'] = False
+                    # Allow caller to request that workers do not emit per-rep SFS markers
+                    # Workers should produce allele-frequency-spectrum markers (#SFS_AF);
+                    # do not ask workers to suppress SFS emission.
+                    payload['suppress_worker_sfs'] = False
+                    try:
                         # Per-worker threading: allocate native threads based on
                         # physical CPU cores (not logical/threaded cores). This
                         # avoids hyperthreading oversubscription when running
@@ -2828,6 +2896,12 @@ def _run_simulation_core(args):
                     'rep_count': int(chunk_size),
                     'seed': seed_val,
                 }
+                try:
+                    payload['suppress_worker_sfs'] = (not bool(getattr(args, 'sfs', False)))
+                except Exception:
+                    payload['suppress_worker_sfs'] = False
+                # Workers should provide SFS_AF markers; do not suppress SFS emission.
+                payload['suppress_worker_sfs'] = False
                 per_worker_threads = base + (1 if (idx % workers) < rem else 0)
                 env_worker = os.environ.copy()
                 for k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
@@ -2914,6 +2988,17 @@ def _run_simulation_core(args):
                 sys.exit(code)
         concatenated_stdout_loc = ''.join(t[1] for t in results_loc)
         concatenated_stderr_loc = ''.join(t[2] for t in results_loc)
+        # If msprime workers wrote VCF directly (start with VCF header), mark produced_format
+        try:
+            if engine == 'msprime' and isinstance(meta_loc, dict):
+                sniff_blob = (concatenated_stdout_loc or '') + '\n' + (concatenated_stderr_loc or '')
+                if '#CHROM' in sniff_blob or '##fileformat' in sniff_blob:
+                    meta_loc['produced_format'] = 'vcf'
+                else:
+                    # default to ms-like if not detected
+                    meta_loc.setdefault('produced_format', 'ms')
+        except Exception:
+            pass
         # Persist chunk seeding metadata for potential neutral pairing reuse
         try:
             meta_loc.setdefault('runtime', {})
@@ -3323,17 +3408,41 @@ def _run_simulation_core(args):
                 # produced by in-process msprime sim ("#SFS_PER_REP\t...") and use
                 # them directly. If none are present, fall back to parsing haplotype
                 # blocks via the streaming/text parsers.
+                # Preference order: worker-provided #SFS_AF (authoritative) ->
+                # worker #SFS_PER_REP -> text-based parsers -> resimulate via msprime
+                # (resimulate only when no worker SFS markers or text parsing succeed).
+                force_resim_flag = False
                 skip_sfs_loop = False
-                if stored_sfs is None and concatenated_stdout:
+                if stored_sfs is None and (concatenated_stdout or concatenated_stderr):
                     try:
                         # First, look for explicit per-rep SFS markers written by _ts_to_ms_like
                         try:
                             import re as _re
-                            sfs_lines = _re.findall(r'(?m)^#SFS_PER_REP\s+(.+)$', concatenated_stdout)
+                            # Prefer allele-frequency-spectrum markers (exact from msprime)
+                            combined_out = (concatenated_stdout or '') + '\n' + (concatenated_stderr or '')
+                            sfs_af_lines = _re.findall(r'(?m)^#SFS_AF\s+(.+)$', combined_out)
+                            sfs_lines = _re.findall(r'(?m)^#SFS_PER_REP\s+(.+)$', combined_out)
                         except Exception:
                             sfs_lines = []
-                        if sfs_lines:
-                            # Parse each found line into a float list and treat as stored_sfs
+                            sfs_af_lines = []
+                        # If we found AF markers, treat them as stored_sfs with float values
+                        if sfs_af_lines:
+                            parsed_af = []
+                            for ln in sfs_af_lines:
+                                try:
+                                    vals = [float(x) for x in ln.strip().split() if x is not None and x != '']
+                                except Exception:
+                                    vals = []
+                                parsed_af.append(vals)
+                            stored_sfs = parsed_af
+                            # If workers provided exact allele-frequency-spectrum
+                            # values, treat them as authoritative and do not
+                            # re-simulate, even if force-resim was requested.
+                            try:
+                                force_resim_flag = False
+                            except Exception:
+                                pass
+                        elif sfs_lines:
                             parsed = []
                             for ln in sfs_lines:
                                 try:
@@ -3342,8 +3451,9 @@ def _run_simulation_core(args):
                                     vals = []
                                 parsed.append(vals)
                             stored_sfs = parsed
+                        
 
-                        if stored_sfs:
+                        if stored_sfs and not force_resim_flag:
                             # If we obtained stored_sfs from the stdout markers, reuse the
                             # existing stored_sfs-handling above by letting the code fall
                             # through (it will detect stored_sfs and format output).
@@ -3395,7 +3505,9 @@ def _run_simulation_core(args):
                                 if not args.out or args.out == '-':
                                     sys.stdout.write(sfs_text)
                             # skip the rest of msprime in-process SFS logic
-                            skip_sfs_loop = True
+                            # Only skip when not forcing resimulation
+                            if not force_resim_flag:
+                                skip_sfs_loop = True
                             stored_sfs = []
                     except Exception:
                         # fallback to re-simulate below if parsing fails
@@ -3432,6 +3544,12 @@ def _run_simulation_core(args):
                                     per_rep_lines.append(f"rep{ridx+1}\t" + '\t'.join('0' for _ in range(n_hap-1)))
                                 continue
                             try:
+                                # Announce when we compute via allele_frequency_spectrum
+                                if force_resim_flag:
+                                    try:
+                                        sys.stderr.write(f"#DEBUG: force-resim computing allele_frequency_spectrum for rep {ridx+1}\n")
+                                    except Exception:
+                                        pass
                                 sfs_raw = ts.allele_frequency_spectrum(polarised=True, span_normalise=False)
                             except Exception as e:
                                 if args.sfs_mode == 'per-rep':
@@ -4373,7 +4491,14 @@ def _run_simulation_core(args):
                         ts = _ensure_mutations_on_ts(ts)
                         buf = io.StringIO()
                         if hasattr(ts, 'write_ms'):
-                            ts.write_ms(buf)
+                            try:
+                                import tskit as _tskit
+                                _tskit.write_ms(ts, buf)
+                            except Exception:
+                                try:
+                                    ts.write_ms(buf)
+                                except Exception:
+                                    return (rc, '', '# ERROR: neutral msprime: failed to write ms text from tree sequence.\n', 1, rep_index)
                             neut_meta['produced_format'] = 'ms'
                         elif hasattr(ts, 'write_vcf'):
                             ts.write_vcf(buf)

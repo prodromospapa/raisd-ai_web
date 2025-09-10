@@ -81,7 +81,7 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
 
             args = [
                 "simulator.py",
-                "--engine", "msprime",
+                "--engine", "scrm",
                 "--species-id", str(species),
                 "--model-id", str(model_id),
                 "--pop-order", str(population),
@@ -93,6 +93,7 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 "--sfs-normalized",
                 "--length", "10000000"
                 ]
+
             try:
                 subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except subprocess.CalledProcessError:
