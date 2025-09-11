@@ -1,10 +1,3 @@
-# [Refined] msms builder fix applied. build_msms_command occurrences: 1
-# =============================================================================
-# File: simulator_final.py
-# Purpose: Safe, readability-first refactor. Keeps logic intact while exposing
-#          a small orchestrator around the original core function.
-# Generated: 2025-09-09T03:45:38
-# =============================================================================
 import os
 import sys
 import io
@@ -19,12 +12,16 @@ import signal
 import subprocess
 import argparse
 import shlex
+import gzip
 import concurrent.futures
+import stdpopsim as sps
 
+# Try to import demes.ms.to_ms once at module import time for reliability
 try:
-    import stdpopsim as sps
+    from demes.ms import to_ms as _demes_to_ms
 except Exception:
-    sps = None
+    _demes_to_ms = None
+
 
 
 def _ensure_mutations_on_ts(ts, mu_fallback=1e-8):
@@ -90,6 +87,32 @@ def to_ms(graph, N0=1.0, samples=None):
     This is a conservative placeholder that emits no special -e* flags and
     leaves demography details minimal so builders can proceed.
     """
+    # Prefer using demes.ms.to_ms if demes is available so migration and
+    # other demography flags are emitted properly. Fall back to a simple -I
+    # block otherwise.
+    if _demes_to_ms is not None:
+        try:
+            # demes.ms.to_ms in recent versions requires N0 as a keyword-only arg.
+            # Try the most complete signature first, then fallback to older variants.
+            if samples is not None:
+                try:
+                    return _demes_to_ms(graph, N0=N0, samples=samples)
+                except TypeError:
+                    # signature may not accept samples or N0 together; try other combos
+                    pass
+            try:
+                return _demes_to_ms(graph, N0=N0)
+            except TypeError:
+                # Try older signatures: samples only, then bare graph
+                if samples is not None:
+                    try:
+                        return _demes_to_ms(graph, samples=samples)
+                    except TypeError:
+                        return _demes_to_ms(graph)
+                return _demes_to_ms(graph)
+        except Exception:
+            # fall through to simple fallback on any runtime error
+            pass
     if samples is None:
         samples = []
     # create a trivial ms command fragment with no demographic events
@@ -195,6 +218,13 @@ def shift_to_0_based(ms_cmd):
                 i += 5; continue
             except ValueError:
                 pass
+        if t == '-m' and i + 3 < len(toks):
+            # migration rate: -m i j rate  (convert population indices to 0-based)
+            try:
+                out += ['-m', str(int(float(toks[i+1]))-1), str(int(float(toks[i+2]))-1), toks[i+3]]
+                i += 4; continue
+            except ValueError:
+                pass
         if t == '-ed' and i + 3 < len(toks):
             try:
                 out += ['-ed', toks[i+1], str(int(float(toks[i+2]))-1), str(int(float(toks[i+3]))-1)]
@@ -244,21 +274,30 @@ def sanitize_ms_demography(ms_demog_str):
     # sanitize preserves their arguments instead of dropping them. Missing
     # entries here caused flags like '-es' to be emitted without their args,
     # which breaks downstream MS-like parsers (see CmdLineParseException).
-    arg_counts = {'-n':2,'-en':3,'-m':3,'-em':4,'-ej':3, '-ed':3, '-es':3}
+    # Flags with fixed argument counts
+    arg_counts = {'-n':2,'-en':3,'-m':3,'-em':4,'-ej':3, '-ed':3, '-es':3, '-eg':4}
+    def is_flag(tok):
+        return tok.startswith('-')
+
     while i < len(toks):
         t = toks[i]
-        if t == '-eg':
-            i += 4 if i+3 < len(toks) else 1
-            continue
         if t in arg_counts:
             need = arg_counts[t]
-            if i + need < len(toks)+1:
-                out.extend(toks[i:i+1+need]); i += 1 + need; continue
-            else:
-                break
-        if t.startswith('-'):
+            # if insufficient tokens remain, attach whatever is left and break
+            take_end = min(len(toks), i + 1 + need)
+            out.extend(toks[i:take_end])
+            i = take_end
+            continue
+        if is_flag(t):
+            # Unknown flag: keep the flag and also keep following tokens until next flag
             out.append(t)
-        i += 1
+            j = i + 1
+            while j < len(toks) and not is_flag(toks[j]):
+                out.append(toks[j]); j += 1
+            i = j
+            continue
+        # bare token (shouldn't usually happen) - keep it
+        out.append(t); i += 1
     return ' '.join(out)
 
 def _make_affinity_preexec(cpu_list):
@@ -3502,8 +3541,10 @@ def _run_simulation_core(args):
                                     sfs_written = True
                             except Exception as e:
                                 sys.stderr.write(f"# ERROR: failed to write SFS file {sfs_path}: {e}\n")
+                                # Per user preference, never dump the full SFS to terminal stdout.
+                                # Do not print sfs_text; only emit an error summary.
                                 if not args.out or args.out == '-':
-                                    sys.stdout.write(sfs_text)
+                                    sys.stderr.write(f"# ERROR: SFS not written to file and will not be printed to terminal.\n")
                             # skip the rest of msprime in-process SFS logic
                             # Only skip when not forcing resimulation
                             if not force_resim_flag:
@@ -3642,8 +3683,9 @@ def _run_simulation_core(args):
                 sfs_written = True
         except Exception as e:
             sys.stderr.write(f"# ERROR: failed to write SFS file {sfs_path}: {e}\n")
+            # Do not print the SFS to terminal stdout per user request.
             if not args.out or args.out == '-':
-                sys.stdout.write(sfs_text)
+                sys.stderr.write(f"# ERROR: SFS not written to file and will not be printed to terminal.\n")
         # If user requested only SFS (no explicit --output provided), exit now
         # EXCEPT when a paired neutral run is requested, in which case we continue
         # so we can also generate the neutral paired output/SFS.
@@ -3706,7 +3748,21 @@ def _run_simulation_core(args):
         # nothing to write
         pass
     if concatenated_stderr:
-        sys.stderr.write(concatenated_stderr)
+        # Filter out worker-emitted SFS/debug marker lines so we don't print
+        # the full SFS or debug site counts to the terminal. Keep other stderr.
+        try:
+            filtered_lines = []
+            for ln in concatenated_stderr.splitlines(True):
+                stripped = ln.lstrip()
+                if stripped.startswith('#SFS_AF') or stripped.startswith('#SFS_PER_REP') or stripped.startswith('#DEBUG_NUM_SITES'):
+                    # swallow marker line
+                    continue
+                filtered_lines.append(ln)
+            if filtered_lines:
+                sys.stderr.write(''.join(filtered_lines))
+        except Exception:
+            # on any issue, fall back to writing the original stderr
+            sys.stderr.write(concatenated_stderr)
     if write_primary_output and args.out and args.out != '-':
         # Normalize output filename extension based on requested format if user omitted one.
         ext_map = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
@@ -5045,8 +5101,11 @@ def _run_simulation_core(args):
                         sfs_written = True
                 except Exception as e:
                     sys.stderr.write(f"# ERROR: failed to write deferred SFS file {sfs_path_final}: {e}\n")
+                    # Do not print the full SFS text to stdout per user preference.
+                    # Previously the code would fall back to writing the SFS to stdout
+                    # when no output file was specified; that behavior is suppressed.
                     if not args.out or args.out == '-':
-                        sys.stdout.write(sfs_text_final)
+                        sys.stderr.write("# INFO: deferred SFS could not be written to file; not printing SFS to stdout by user preference\n")
         except Exception:
             pass
 
