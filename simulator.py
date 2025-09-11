@@ -283,7 +283,32 @@ def sanitize_ms_demography(ms_demog_str):
         t = toks[i]
         if t in arg_counts:
             need = arg_counts[t]
-            # if insufficient tokens remain, attach whatever is left and break
+            # Special-case '-n': it may be followed by multiple size values for the same index
+            # (demes.ms.to_ms can emit multiple sizes in sequence). Convert sequences like
+            # '-n IDX SIZE1 SIZE2' into '-n IDX SIZE1 -n IDX SIZE2' so downstream ms-like
+            # parsers don't see orphan numeric tokens.
+            if t == '-n':
+                # ensure index token exists
+                if i + 1 >= len(toks):
+                    i += 1
+                    continue
+                idx_tok = toks[i+1]
+                # collect following non-flag tokens as sizes
+                j = i + 2
+                sizes = []
+                while j < len(toks) and not is_flag(toks[j]):
+                    sizes.append(toks[j]); j += 1
+                # if no sizes found, just emit the original -n and index (defensive)
+                if not sizes:
+                    out.extend(toks[i:min(len(toks), i+1+need)])
+                    i = min(len(toks), i+1+need)
+                    continue
+                # emit one '-n idx size' for each size token
+                for sz in sizes:
+                    out.extend(['-n', idx_tok, sz])
+                i = j
+                continue
+            # default handling for flags with fixed argument counts
             take_end = min(len(toks), i + 1 + need)
             out.extend(toks[i:take_end])
             i = take_end
