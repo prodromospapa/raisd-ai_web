@@ -85,6 +85,23 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 os.remove(f"data/{species_folder_name}/check_sfs_models.log") if os.path.exists(f"data/{species_folder_name}/check_sfs_models.log") else None
             first = False
 
+            # helper to append logs both to species folder and current working dir
+            def append_log(msg: str):
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                line = f"[{ts}] {msg}\n"
+                species_log = f"data/{species_folder_name}/check_sfs_models.log"
+                local_log = os.path.join(os.getcwd(), "check_sfs_models.log")
+                try:
+                    with open(species_log, "a") as wf:
+                        wf.write(line)
+                except Exception:
+                    pass
+                try:
+                    with open(local_log, "a") as wf:
+                        wf.write(line)
+                except Exception:
+                    pass
+
             # prepare base args; we'll modify --parallel dynamically on retries
             base_args = [
                 "simulator.py",
@@ -96,10 +113,10 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 "--chromosome", "21",#str(biggest_chromosome),
                 "--replicates", "5",
                 "--parallel",
-                "--sfs", "sfs.sfs",
                 "--sfs-normalized"
             ]
-
+            # whether to include --sfs sfs.sfs in simulator args for this model/pop
+            include_sfs = True
             current_parallel = MAX_PARALLEL
             skipped = False
             # We'll attempt runs, lowering parallel if RAM threshold is exceeded
@@ -113,17 +130,29 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                     args += ["--parallel", str(current_parallel)]
 
                 # start the subprocess
+                # build args list; include --sfs only if requested
+                if include_sfs:
+                    # insert sfs args right after the --parallel value later
+                    pass
+
                 if MAX_RAM_PERCENT is None or psutil is None:
                     # no monitoring requested or psutil not available: run normally
                     try:
+                        # ensure args include sfs if requested
+                        if include_sfs and "--sfs" not in args:
+                            try:
+                                pi = args.index("--parallel")
+                                args.insert(pi+2, "sfs.sfs")
+                                args.insert(pi+1, "--sfs")
+                            except Exception:
+                                args += ["--sfs", "sfs.sfs"]
                         subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         break
                     except subprocess.CalledProcessError:
                         # fallback behavior: swap engine to scrm and retry once
                         i = args.index("--engine")
                         args[i+1] = "scrm"
-                        with open(f"data/{species_folder_name}/check_sfs_models.log", "a") as wf:
-                            wf.write(f"Warning: msprime failed for {model_id} {population}.\n")
+                        append_log(f"Warning: msprime failed for {model_id} {population}.")
                         subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         break
                 else:
@@ -185,18 +214,16 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                             proc.wait(timeout=1)
                         except Exception:
                             pass
-
+                    # after monitoring loop, decide what happened
                     if exceeded:
                         # reduce parallel and retry unless already at 1
                         if current_parallel > 1:
-                            with open(f"data/{species_folder_name}/check_sfs_models.log", "a") as wf:
-                                wf.write(f"Exceeded RAM {MAX_RAM_PERCENT}% for {model_id} {population} at parallel={current_parallel}; retrying with {current_parallel-1}\n")
+                            append_log(f"Exceeded RAM {MAX_RAM_PERCENT}% for {model_id} {population} at parallel={current_parallel}; retrying with {current_parallel-1}")
                             current_parallel -= 1
                             continue
                         else:
                             # failed even at parallel==1; skip this model/population
-                            with open(f"data/{species_folder_name}/check_sfs_models.log", "a") as wf:
-                                wf.write(f"Skipped {model_id} {population}: exceeded RAM {MAX_RAM_PERCENT}% even at parallel=1.\n")
+                            append_log(f"Skipped {model_id} {population}: exceeded RAM {MAX_RAM_PERCENT}% even at parallel=1.")
                             skipped = True
                             break
                     else:
@@ -210,16 +237,37 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                                 args[i+1] = "scrm"
                             except Exception:
                                 pass
-                            with open(f"data/{species_folder_name}/check_sfs_models.log", "a") as wf:
-                                wf.write(f"Warning: simulator failed (rc={proc.returncode}) for {model_id} {population} at parallel={current_parallel}. Trying scrm.\n")
+                            append_log(f"Warning: simulator failed (rc={proc.returncode}) for {model_id} {population} at parallel={current_parallel}. Trying scrm.")
+                            # ensure sfs flag only present if requested
+                            if include_sfs and "--sfs" not in args:
+                                try:
+                                    pi = args.index("--parallel")
+                                    args.insert(pi+2, "sfs.sfs")
+                                    args.insert(pi+1, "--sfs")
+                                except Exception:
+                                    args += ["--sfs", "sfs.sfs"]
                             subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                             break
             if skipped:
                 # mark skipped row with NaNs to preserve index and continue
                 sfs.loc[f"{model_id}={population}"] = np.nan
             else:
-                sfs.loc[f"{model_id}={population}"] = read_sfs_file("sfs.sfs")
-                os.remove("sfs.sfs")
+                # only read sfs.sfs if it exists; otherwise do not pass it in future runs
+                if os.path.exists("sfs.sfs"):
+                    try:
+                        sfs.loc[f"{model_id}={population}"] = read_sfs_file("sfs.sfs")
+                    except Exception:
+                        append_log(f"Failed to read sfs.sfs for {model_id} {population}; treating as no SFS produced.")
+                        sfs.loc[f"{model_id}={population}"] = np.nan
+                        include_sfs = False
+                    try:
+                        os.remove("sfs.sfs")
+                    except Exception:
+                        pass
+                else:
+                    append_log(f"No sfs.sfs produced for {model_id} {population}; will not pass --sfs on retries.")
+                    sfs.loc[f"{model_id}={population}"] = np.nan
+                    include_sfs = False
             sfs.to_csv(f"data/{species_folder_name}/sfs.csv")
             pbar.update(1)
             pbar.refresh()

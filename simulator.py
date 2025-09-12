@@ -10,6 +10,7 @@ import re
 import atexit
 import signal
 import subprocess
+import threading
 import argparse
 import shlex
 import gzip
@@ -335,6 +336,134 @@ def _make_affinity_preexec(cpu_list):
     return _set_affinity
 
 
+# ----- child process tracking for safer cleanup -----
+# Keep a thread-safe set of child PIDs started by this process so we can
+# attempt to terminate them if the parent receives SIGINT/SIGTERM.
+_child_pids_lock = threading.Lock()
+_child_pids = set()
+
+def _register_child_pid(pid: int):
+    try:
+        with _child_pids_lock:
+            _child_pids.add(int(pid))
+    except Exception:
+        pass
+
+def _unregister_child_pid(pid: int):
+    try:
+        with _child_pids_lock:
+            _child_pids.discard(int(pid))
+    except Exception:
+        pass
+
+def _terminate_children(timeout=2.0):
+    """Best-effort: send SIGTERM to known child PIDs, then SIGKILL if needed."""
+    try:
+        with _child_pids_lock:
+            pids = list(_child_pids)
+    except Exception:
+        pids = []
+    if not pids:
+        return
+    # Attempt graceful termination
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+        # Also attempt to terminate the child's process group if possible
+        try:
+            pg = os.getpgid(pid)
+            if pg:
+                try:
+                    os.kill(-pg, signal.SIGTERM)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    # brief wait
+    try:
+        end = time.time() + float(timeout)
+        while time.time() < end:
+            alive = []
+            for pid in pids:
+                try:
+                    # 0 signal checks existence
+                    os.kill(pid, 0)
+                    alive.append(pid)
+                except Exception:
+                    pass
+            if not alive:
+                break
+            time.sleep(0.05)
+            pids = alive
+    except Exception:
+        pass
+    # Force kill any remaining
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            pg = os.getpgid(pid)
+            if pg:
+                try:
+                    os.kill(-pg, signal.SIGKILL)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def _run_and_register(*popen_args, **popen_kwargs):
+    """Lightweight wrapper around subprocess.Popen that registers child PID.
+
+    Mirrors the common subset of subprocess.run(...) used in this file and
+    returns a subprocess.CompletedProcess-like object with attributes
+    stdout, stderr, returncode. If 'check=True' is passed and the returncode
+    is non-zero, raise subprocess.CalledProcessError like subprocess.run.
+    """
+    # Map signature to Popen constructor
+    stdin = popen_kwargs.pop('stdin', None)
+    capture_output = popen_kwargs.pop('capture_output', False)
+    text_mode = popen_kwargs.pop('text', False)
+    check = popen_kwargs.pop('check', False)
+    env = popen_kwargs.pop('env', None)
+    pre = popen_kwargs.pop('preexec_fn', None)
+    # Build Popen args
+    try:
+        proc = subprocess.Popen(*popen_args, stdin=stdin, stdout=subprocess.PIPE if capture_output else None,
+                                stderr=subprocess.PIPE if capture_output else None, env=env, preexec_fn=pre, text=text_mode)
+    except TypeError:
+        # fallback for older Python versions without text in Popen
+        proc = subprocess.Popen(*popen_args, stdin=stdin, stdout=subprocess.PIPE if capture_output else None,
+                                stderr=subprocess.PIPE if capture_output else None, env=env, preexec_fn=pre)
+    # register pid
+    try:
+        _register_child_pid(proc.pid)
+    except Exception:
+        pass
+    try:
+        out, err = proc.communicate()
+        rc = proc.returncode
+    finally:
+        # unregister regardless of outcome
+        try:
+            _unregister_child_pid(proc.pid)
+        except Exception:
+            pass
+    class _CP:
+        def __init__(self, stdout, stderr, returncode):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+    cp = _CP(out, err, rc)
+    if check and cp.returncode and cp.returncode != 0:
+        raise subprocess.CalledProcessError(cp.returncode, popen_args[0] if popen_args else None, output=cp.stdout, stderr=cp.stderr)
+    return cp
+
+
 # ---------- local temp-dir helpers ----------
 # Use a per-run temporary directory placed next to this script so callers
 # can inspect files if needed and so cleanup can remove the entire folder.
@@ -348,6 +477,15 @@ def _ensure_local_tmpdir():
     _cleanup_local_tmpdir().
     """
     global _LOCAL_TMP_ROOT
+    # If a worker-specific tmpdir is requested via env, prefer and return it
+    worker_tmp_env = os.environ.get('SIMULATOR_WORKER_TMP')
+    if worker_tmp_env:
+        try:
+            os.makedirs(worker_tmp_env, exist_ok=True)
+            return worker_tmp_env
+        except Exception:
+            # fallback to normal behaviour
+            pass
     if _LOCAL_TMP_ROOT and os.path.isdir(_LOCAL_TMP_ROOT):
         return _LOCAL_TMP_ROOT
     try:
@@ -400,6 +538,10 @@ def _ensure_local_tmpdir():
             try:
                 os.makedirs(path2, exist_ok=True)
                 _LOCAL_TMP_ROOT = path2
+                # debug print
+                if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                    sys.stderr.write(f"DEBUG: using system tmpdir: {_LOCAL_TMP_ROOT}\n")
+                    sys.stderr.flush()
                 return _LOCAL_TMP_ROOT
             except Exception:
                 pass
@@ -409,6 +551,9 @@ def _ensure_local_tmpdir():
             os.makedirs(repo_parent, exist_ok=True)
             os.makedirs(path, exist_ok=True)
             _LOCAL_TMP_ROOT = path
+            if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                sys.stderr.write(f"DEBUG: using repo-local tmpdir: {_LOCAL_TMP_ROOT}\n")
+                sys.stderr.flush()
         except Exception:
             # final fallback to system tempdir
             _LOCAL_TMP_ROOT = tempfile.gettempdir()
@@ -426,21 +571,42 @@ def _cleanup_local_tmpdir():
         # only remove directories we created (hidden prefix) to be safe
         base_name = os.path.basename(_LOCAL_TMP_ROOT or '')
         parent = os.path.dirname(_LOCAL_TMP_ROOT or '')
-        # If this is a per-run folder inside repo '.tmp', remove run folder and remove parent if empty
+        # If this is a per-run folder inside repo '.tmp', remove run folder and remove parent
         if parent and os.path.basename(parent) == '.tmp' and os.path.isdir(_LOCAL_TMP_ROOT):
-            try:
-                shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
-            except Exception:
-                pass
-            # remove the .tmp parent if empty
-            try:
-                if os.path.isdir(parent) and not os.listdir(parent):
-                    shutil.rmtree(parent, ignore_errors=True)
-            except Exception:
-                pass
+            # allow preserving tmp for inspection when requested
+            if not os.environ.get('SIMULATOR_PRESERVE_TMP'):
+                try:
+                    # remove the entire run folder
+                    shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
+                except Exception:
+                    pass
+                if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                    try:
+                        sys.stderr.write(f"DEBUG: removed repo-local tmpdir: {_LOCAL_TMP_ROOT}\n")
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                # Attempt to remove the .tmp parent directory and all its contents to free space
+                try:
+                    if os.path.isdir(parent):
+                        shutil.rmtree(parent, ignore_errors=True)
+                        if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                            try:
+                                sys.stderr.write(f"DEBUG: removed .tmp parent directory: {parent}\n")
+                                sys.stderr.flush()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
         # keep previous safety: support older naming convention
         elif base_name.startswith('.simulator_tmp_') and os.path.isdir(_LOCAL_TMP_ROOT):
             shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
+            if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                try:
+                    sys.stderr.write(f"DEBUG: removed old-style tmpdir: {_LOCAL_TMP_ROOT}\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
@@ -454,17 +620,27 @@ def _register_cleanup_handlers():
     except Exception:
         pass
     def _signal_handler(signum, frame):
+        # Cleanup local temporary directory
         try:
             _cleanup_local_tmpdir()
         except Exception:
             pass
-        # Re-raise default handler if possible
+        # Revert handler to default first to avoid recursive invocation
         try:
             signal.signal(signum, signal.SIG_DFL)
         except Exception:
             pass
+        # Attempt to terminate any known child PIDs
         try:
-            os.kill(os.getpid(), signum)
+            _terminate_children()
+        except Exception:
+            pass
+        # As a best-effort, try killing the whole process group so
+        # subprocesses sharing our group receive the signal too. Using
+        # the default handler above prevents our custom handler re-entry.
+        try:
+            pgid = os.getpgid(os.getpid())
+            os.kill(-pgid, signum)
         except Exception:
             pass
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -619,6 +795,83 @@ def _msprime_worker_run(payload, env=None):
         except Exception:
             # If we fail to set env, continue without failing the worker
             applied_env = False
+    # Optional per-worker peak sampler: when SIMULATOR_PEAK_DIR is set in the
+    # worker env (or in the process env), spawn a small background thread that
+    # samples this process RSS and writes peak_<pid>.txt in that directory.
+    peak_thread = None
+    peak_stop_event = None
+    try:
+        peak_dir = None
+        try:
+            if env and isinstance(env, dict) and env.get('SIMULATOR_PEAK_DIR'):
+                peak_dir = env.get('SIMULATOR_PEAK_DIR')
+            else:
+                peak_dir = os.environ.get('SIMULATOR_PEAK_DIR')
+        except Exception:
+            peak_dir = None
+
+        peak_interval = None
+        try:
+            if env and isinstance(env, dict) and env.get('SIMULATOR_PEAK_INTERVAL'):
+                peak_interval = float(env.get('SIMULATOR_PEAK_INTERVAL'))
+            else:
+                peak_interval = float(os.environ.get('SIMULATOR_PEAK_INTERVAL', 0.02))
+        except Exception:
+            peak_interval = 0.02
+
+        if peak_dir:
+            try:
+                os.makedirs(peak_dir, exist_ok=True)
+            except Exception:
+                pass
+
+            def _sampler_current_process(peak_dir_local, stop_event, interval):
+                try:
+                    import psutil
+                except Exception:
+                    return
+                try:
+                    p = psutil.Process(os.getpid())
+                except Exception:
+                    return
+                peak = 0
+                try:
+                    while not stop_event.is_set():
+                        try:
+                            rss = int(getattr(p.memory_info(), 'rss', 0) or 0)
+                            if rss > peak:
+                                peak = rss
+                        except Exception:
+                            break
+                        stop_event.wait(interval)
+                    # final sample
+                    try:
+                        rss = int(getattr(p.memory_info(), 'rss', 0) or 0)
+                        if rss > peak:
+                            peak = rss
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        path = os.path.join(peak_dir_local, f"peak_{os.getpid()}.txt")
+                        with open(path, 'w') as pf:
+                            pf.write(str(peak))
+                    except Exception:
+                        pass
+
+            peak_stop_event = threading.Event()
+            peak_thread = threading.Thread(target=_sampler_current_process, args=(peak_dir, peak_stop_event, peak_interval), daemon=True)
+            try:
+                peak_thread.start()
+            except Exception:
+                peak_thread = None
+                peak_stop_event = None
+
+    except Exception:
+        # If sampler setup fails, continue without breaking the worker
+        peak_thread = None
+        peak_stop_event = None
+
     try:
         species = payload.get('species')
         model_id = payload.get('model_id') or payload.get('model')
@@ -821,25 +1074,48 @@ def _msprime_worker_run(payload, env=None):
 
                 # Prefer writing VCF directly from the tree sequence when available
                 try:
-                    buf = io.StringIO()
-                    if hasattr(ts, 'write_vcf'):
-                        cid = str(chromosome) if chromosome is not None else '1'
+                    only_sfs_worker = bool(payload.get('only_sfs', False)) if isinstance(payload, dict) else False
+                    if only_sfs_worker:
+                        # Compute SFS but avoid producing the main ms/vcf text to save memory.
                         try:
-                            ts.write_vcf(buf, contig_id=cid)
-                        except TypeError:
-                            ts.write_vcf(buf)
-                        vcf_text = buf.getvalue()
-                        out_parts.append(vcf_text)
+                            sfs_af = ts.allele_frequency_spectrum(polarised=True, span_normalise=False)
+                            sfs_af_line = '#SFS_AF\t' + '\t'.join(str(float(x)) for x in (sfs_af.tolist() if hasattr(sfs_af, 'tolist') else list(sfs_af))) + '\n'
+                            err_parts.append(sfs_af_line)
+                        except Exception:
+                            # non-fatal: fall back to emitting zero SFS marker
+                            try:
+                                err_parts.append('#SFS_AF\t' + '\t'.join('0' for _ in range(max(0, int(getattr(ts, "num_samples", 0)) - 0))))
+                            except Exception:
+                                pass
                     else:
-                        suppress_flag = bool(payload.get('suppress_worker_sfs', False)) if isinstance(payload, dict) else False
-                        ms_block = _ts_to_ms_like(ts, length or (getattr(chosen_contig, 'length', None) or 0), ploidy, suppress_sfs=suppress_flag)
-                        out_parts.append(ms_block)
+                        buf = io.StringIO()
+                        if hasattr(ts, 'write_vcf'):
+                            cid = str(chromosome) if chromosome is not None else '1'
+                            try:
+                                ts.write_vcf(buf, contig_id=cid)
+                            except TypeError:
+                                ts.write_vcf(buf)
+                            vcf_text = buf.getvalue()
+                            out_parts.append(vcf_text)
+                        else:
+                            suppress_flag = bool(payload.get('suppress_worker_sfs', False)) if isinstance(payload, dict) else False
+                            ms_block = _ts_to_ms_like(ts, length or (getattr(chosen_contig, 'length', None) or 0), ploidy, suppress_sfs=suppress_flag)
+                            out_parts.append(ms_block)
                 except Exception:
-                    # Fallback to ms-like conversion if VCF writing fails
+                    # Fallback to ms-like conversion if VCF writing fails (or SFS-only fails)
                     try:
-                        suppress_flag = bool(payload.get('suppress_worker_sfs', False)) if isinstance(payload, dict) else False
-                        ms_block = _ts_to_ms_like(ts, length or (getattr(chosen_contig, 'length', None) or 0), ploidy, suppress_sfs=suppress_flag)
-                        out_parts.append(ms_block)
+                        if not bool(payload.get('only_sfs', False)):
+                            suppress_flag = bool(payload.get('suppress_worker_sfs', False)) if isinstance(payload, dict) else False
+                            ms_block = _ts_to_ms_like(ts, length or (getattr(chosen_contig, 'length', None) or 0), ploidy, suppress_sfs=suppress_flag)
+                            out_parts.append(ms_block)
+                        else:
+                            # If only_sfs, ensure an SFS marker is emitted
+                            try:
+                                sfs_af = ts.allele_frequency_spectrum(polarised=True, span_normalise=False)
+                                sfs_af_line = '#SFS_AF\t' + '\t'.join(str(float(x)) for x in (sfs_af.tolist() if hasattr(sfs_af, 'tolist') else list(sfs_af))) + '\n'
+                                err_parts.append(sfs_af_line)
+                            except Exception:
+                                pass
                     except Exception:
                         err_parts.append(f"# ERROR: failed to produce output for replicate {ridx}\n")
 
@@ -887,6 +1163,42 @@ def _msprime_worker_run(payload, env=None):
                         os.environ[k] = old
             except Exception:
                 pass
+
+    # Stop peak sampler thread if it was started
+    try:
+        if peak_stop_event is not None:
+            try:
+                peak_stop_event.set()
+            except Exception:
+                pass
+        if peak_thread is not None:
+            try:
+                peak_thread.join(timeout=1.0)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Attempt to cleanup any worker-specific tmpdir referenced in env
+    try:
+        wk = None
+        try:
+            wk = os.environ.get('SIMULATOR_WORKER_TMP')
+        except Exception:
+            wk = None
+        if wk and os.path.isdir(wk):
+            try:
+                shutil.rmtree(wk, ignore_errors=True)
+                if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                    try:
+                        sys.stderr.write(f"DEBUG: removed worker tmpdir at process exit: {wk}\n")
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     return (''.join(out_parts), ''.join(err_parts), exit_code)
 
@@ -2171,6 +2483,7 @@ def parse_args():
     g.add_argument('--temp', dest='temp_loc', choices=['local','system'], default='local',
                    help=("Where to place intermediate temporary files: 'local' (repo-local hidden folder)"
                          " or 'system' (use Python's tempfile.gettempdir()). Default: local."))
+    # Note: --debug-temp and --preserve-tmp removed; temporary files are not preserved.
     g.add_argument('--output-format', dest='format', default='ms', choices=['ms','ms.gz','vcf','vcf.gz','bcf'],
                    help="Output format. 'ms'/'ms.gz' write raw ms-like (optionally gzipped); 'vcf'/'vcf.gz' convert single replicate to VCF.")
     g.add_argument('--parallel', dest='parallel', type=int, default=1,
@@ -2318,6 +2631,7 @@ def _pre_run_setup(args):
             os.environ['SIMULATOR_USE_REPO_TMP'] = '1'
         else:  # 'system'
             os.environ.pop('SIMULATOR_USE_REPO_TMP', None)
+    # Do not set debug or preserve env flags; temporary files are not preserved
     except Exception:
         pass
     return None
@@ -2537,7 +2851,7 @@ def _run_simulation_core(args):
                 # assign the pilot run to CPUs 0..min(1,total_cpus-1)
                 pilot_cpus = list(range(min(1, total_cpus))) if total_cpus > 0 else [0]
                 pre = _make_affinity_preexec(pilot_cpus)
-                r = subprocess.run(toks, capture_output=True, text=True, check=True, preexec_fn=pre)
+                r = _run_and_register(toks, capture_output=True, text=True, check=True, preexec_fn=pre)
                 out_txt = r.stdout
             except Exception:
                 break
@@ -2574,7 +2888,7 @@ def _run_simulation_core(args):
                     total_cpus = os.cpu_count() or 1
                     pilot_cpus = list(range(min(1, total_cpus))) if total_cpus > 0 else [0]
                     pre = _make_affinity_preexec(pilot_cpus)
-                    r = subprocess.run(toks, capture_output=True, text=True, check=True, preexec_fn=pre)
+                    r = _run_and_register(toks, capture_output=True, text=True, check=True, preexec_fn=pre)
                     out_txt = r.stdout
                 except Exception:
                     break
@@ -2905,19 +3219,167 @@ def _run_simulation_core(args):
                     except Exception as e:
                         err_acc.append(f'# ERROR: msprime worker setup failed: {e}\n')
                 else:
-                    # Non-msprime engines use existing logic (external subprocesses etc.)
+                    # Non-msprime engines: run the external process and stream its output
+                    # to a per-worker output file to avoid returning large strings to the parent.
                     try:
-                        r = subprocess.run(toks, capture_output=True, text=True, check=True, env=env, preexec_fn=pre)
-                        out_acc.append(r.stdout or '')
-                        if r.stderr:
-                            err_acc.append(r.stderr)
-                    except subprocess.CalledProcessError as cpe:
-                        out_acc.append(cpe.stdout or '')
-                        err_acc.append(cpe.stderr or f'# ERROR: engine process failed: {cpe}\n')
+                        # Determine worker tmpdir
+                        try:
+                            only_sfs_local = bool(getattr(args, '_suppress_primary_output', False) or (getattr(args, 'sfs', False) and not getattr(args, '_user_out_provided', False)))
+                        except Exception:
+                            only_sfs_local = False
+                        # Do not preserve per-worker tmpdirs automatically; they are removed after use.
+                        worker_tmp = env.get('SIMULATOR_WORKER_TMP') or _ensure_local_tmpdir()
+                        try:
+                            os.makedirs(worker_tmp, exist_ok=True)
+                        except Exception:
+                            pass
+                        out_path = None
+                        try:
+                            # create a unique output file per chunk
+                            out_name = f"worker_out_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}.out"
+                            out_path = os.path.join(worker_tmp, out_name)
+                            # Redirect child stdout/stderr directly to files to avoid
+                            # any parent-side buffering. This is the most memory-safe
+                            # approach: the parent never receives the child's stdout
+                            # bytes over a pipe.
+                            err_path = None
+                            try:
+                                err_name = f"worker_err_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}.err"
+                                err_path = os.path.join(worker_tmp, err_name)
+                                with open(out_path, 'wb') as ofh, open(err_path, 'wb') as efh:
+                                    proc = subprocess.Popen(toks, stdout=ofh, stderr=efh, env=env, preexec_fn=pre)
+                                    _register_child_pid(proc.pid)
+                                    # Optional external-worker peak sampler: monitor child pid RSS
+                                    ext_peak_thread = None
+                                    ext_peak_stop = None
+                                    try:
+                                        peak_dir_ext = os.environ.get('SIMULATOR_PEAK_DIR') if os.environ.get('SIMULATOR_PEAK_DIR') else (env.get('SIMULATOR_PEAK_DIR') if env and isinstance(env, dict) else None)
+                                    except Exception:
+                                        peak_dir_ext = None
+                                    try:
+                                        peak_interval_ext = float(os.environ.get('SIMULATOR_PEAK_INTERVAL', 0.02))
+                                    except Exception:
+                                        peak_interval_ext = 0.02
+                                    if peak_dir_ext:
+                                        try:
+                                            os.makedirs(peak_dir_ext, exist_ok=True)
+                                        except Exception:
+                                            pass
+                                        def _sampler_child_pid(child_pid, peak_dir_local, stop_event, interval):
+                                            try:
+                                                import psutil
+                                            except Exception:
+                                                return
+                                            try:
+                                                p = psutil.Process(child_pid)
+                                            except Exception:
+                                                return
+                                            peak = 0
+                                            try:
+                                                while not stop_event.is_set():
+                                                    try:
+                                                        rss = int(getattr(p.memory_info(), 'rss', 0) or 0)
+                                                        if rss > peak:
+                                                            peak = rss
+                                                    except Exception:
+                                                        break
+                                                    stop_event.wait(interval)
+                                                # final sample
+                                                try:
+                                                    rss = int(getattr(p.memory_info(), 'rss', 0) or 0)
+                                                    if rss > peak:
+                                                        peak = rss
+                                                except Exception:
+                                                    pass
+                                            finally:
+                                                try:
+                                                    path = os.path.join(peak_dir_local, f"peak_{child_pid}.txt")
+                                                    with open(path, 'w') as pf:
+                                                        pf.write(str(peak))
+                                                except Exception:
+                                                    pass
+                                        try:
+                                            ext_peak_stop = threading.Event()
+                                            ext_peak_thread = threading.Thread(target=_sampler_child_pid, args=(proc.pid, peak_dir_ext, ext_peak_stop, peak_interval_ext), daemon=True)
+                                            ext_peak_thread.start()
+                                        except Exception:
+                                            ext_peak_thread = None
+                                            ext_peak_stop = None
+                                    try:
+                                        rc_proc = proc.wait()
+                                    finally:
+                                        try: _unregister_child_pid(proc.pid)
+                                        except Exception: pass
+                                        # signal sampler to stop and join
+                                        try:
+                                            if ext_peak_stop is not None:
+                                                ext_peak_stop.set()
+                                            if ext_peak_thread is not None:
+                                                ext_peak_thread.join(timeout=1.0)
+                                        except Exception:
+                                            pass
+                                # record output file path
+                                out_acc.append(out_path)
+                                # record stderr only if the file has content (avoid treating empty stderr as an error)
+                                try:
+                                    if err_path and os.path.isfile(err_path) and os.path.getsize(err_path) > 0:
+                                        err_acc.append(f'FILE:{err_path}')
+                                except Exception:
+                                    # If anything goes wrong checking stderr, fall back to recording the marker
+                                    try:
+                                        if err_path:
+                                            err_acc.append(f'FILE:{err_path}')
+                                    except Exception:
+                                        pass
+                                # If the process exit code indicates failure, add an explicit error marker
+                                if rc_proc and rc_proc != 0:
+                                    err_acc.append(f'# ERROR: engine process failed with code {rc_proc}\n')
+                            except Exception as e:
+                                err_acc.append(f'# ERROR: running engine process to file failed: {e}\n')
+                        except Exception as e:
+                            err_acc.append(f'# ERROR: running engine process to file failed: {e}\n')
                     except Exception as e:
                         err_acc.append(f'# ERROR: failed to run engine process: {e}\n')
                 # Return: rc, stdout-accumulated, stderr-accumulated, error-flag (1 if errors), replicate_index
-                return (rc, ''.join(out_acc), ''.join(err_acc), (1 if err_acc else None), replicate_index)
+                # Attempt to cleanup per-chunk tmpdir if it was created
+                try:
+                    wk = None
+                    try:
+                        wk = env.get('SIMULATOR_WORKER_TMP')
+                    except Exception:
+                        wk = None
+                    # Determine whether to preserve the worker tmpdir.
+                    preserve_local = False
+                    try:
+                        if env.get('SIMULATOR_PRESERVE_WORKER_TMP'):
+                            preserve_local = True
+                    except Exception:
+                        pass
+                    try:
+                        if os.environ.get('SIMULATOR_PRESERVE_TMP'):
+                            preserve_local = True
+                    except Exception:
+                        pass
+                    # If the caller requested primary output (args._user_out_provided),
+                    # keep worker tmpdirs until parent streams them; otherwise remove.
+                    try:
+                        user_wants_out = bool(getattr(args, '_user_out_provided', False))
+                    except Exception:
+                        user_wants_out = False
+                    if wk and os.path.isdir(wk) and not preserve_local and not user_wants_out:
+                        try:
+                            shutil.rmtree(wk, ignore_errors=True)
+                            if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                                try:
+                                    sys.stderr.write(f"DEBUG: removed worker tmpdir at chunk end: {wk}\n")
+                                    sys.stderr.flush()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return (rc, out_acc, err_acc, (1 if err_acc else None), replicate_index)
         results_loc = []
         bar_loc = None
         progress_done_loc = 0
@@ -2966,10 +3428,40 @@ def _run_simulation_core(args):
                     payload['suppress_worker_sfs'] = False
                 # Workers should provide SFS_AF markers; do not suppress SFS emission.
                 payload['suppress_worker_sfs'] = False
+                # If the top-level invocation requested only SFS (no primary output), ask workers
+                # to avoid producing the full ms/vcf text to save memory/time.
+                try:
+                    only_sfs_top = bool(getattr(args, '_suppress_primary_output', False) or (getattr(args, 'sfs', False) and not getattr(args, '_user_out_provided', False)))
+                except Exception:
+                    only_sfs_top = False
+                payload['only_sfs'] = bool(only_sfs_top)
+                # Preserve per-worker tmpdirs automatically when the user requested
+                # a primary output (user provided --out) and this is not a
+                # SFS-only invocation; workers' outputs are needed for combining.
+                # Never preserve per-worker tmpdirs; always clean up after workers.
+                payload['preserve_worker_tmp'] = False
                 per_worker_threads = base + (1 if (idx % workers) < rem else 0)
                 env_worker = os.environ.copy()
                 for k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS','VECLIB_MAXIMUM_THREADS'):
                     env_worker[k] = str(per_worker_threads)
+                # allocate a per-worker tmpdir beneath the chosen root so workers don't share one global dir
+                try:
+                    root_tmp = _ensure_local_tmpdir()
+                    # child workers may run on other hosts/processes; use deterministic subdir name per idx
+                    worker_name = f"worker_{idx}_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
+                    worker_tmp = os.path.join(root_tmp, worker_name) if root_tmp else None
+                    if worker_tmp:
+                        try:
+                            os.makedirs(worker_tmp, exist_ok=True)
+                            env_worker['SIMULATOR_WORKER_TMP'] = worker_tmp
+                            # ask external subprocesses to use this tmpdir too
+                            env_worker['TMPDIR'] = worker_tmp
+                            env_worker['TMP'] = worker_tmp
+                            env_worker['TEMP'] = worker_tmp
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 payloads.append(payload)
                 envs.append(env_worker)
 
@@ -2991,11 +3483,46 @@ def _run_simulation_core(args):
                     except Exception as e:
                         out_txt, err_txt, rc = '', f'# ERROR: msprime worker failed in process: {e}\n', 1
                     results_loc.append((int(payloads[idx].get('rep_count',1)), out_txt, err_txt, (1 if rc else None), idx))
+                    # Update progress
                     if bar_loc is not None:
                         bar_loc.update(payloads[idx].get('rep_count', 1))
                     elif args.progress and show_progress:
                         progress_done_loc += payloads[idx].get('rep_count', 1)
                         sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
+
+                    # Attempt immediate cleanup of per-worker tmpdir created for this worker
+                    try:
+                        envw_local = envs[idx] if idx < len(envs) else None
+                        wk = None
+                        if envw_local:
+                            wk = envw_local.get('SIMULATOR_WORKER_TMP') or envw_local.get('TMPDIR') or None
+                        # Determine preservation: payload-level or env-level or global preserve
+                        preserve = False
+                        try:
+                            if payloads[idx].get('preserve_worker_tmp', False):
+                                preserve = True
+                        except Exception:
+                            pass
+                        try:
+                            if envw_local and envw_local.get('SIMULATOR_PRESERVE_WORKER_TMP'):
+                                preserve = True
+                        except Exception:
+                            pass
+                        if os.environ.get('SIMULATOR_PRESERVE_TMP'):
+                            preserve = True
+                        if wk and os.path.isdir(wk) and not preserve:
+                            try:
+                                shutil.rmtree(wk, ignore_errors=True)
+                                if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                                    try:
+                                        sys.stderr.write(f"DEBUG: removed worker tmpdir after worker completion: {wk}\n")
+                                        sys.stderr.flush()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             results_loc.sort(key=lambda x: x[4])
         else:
             if per_rep_mode_loc:
@@ -3008,6 +3535,36 @@ def _run_simulation_core(args):
                     for fut in concurrent.futures.as_completed(futs):
                         rc, out, err, code, rep_idx = fut.result()
                         results_loc.append((rc, out, err, code, rep_idx))
+                        # Attempt immediate cleanup of per-chunk tmpdir if set in env during the chunk
+                        try:
+                            # run_chunk_loc sets SIMULATOR_WORKER_TMP in its local env var if used for subprocesses
+                            # try to get from current process env as a best-effort (may not be accurate)
+                            wk = None
+                            try:
+                                wk = os.environ.get('SIMULATOR_WORKER_TMP')
+                            except Exception:
+                                wk = None
+                            # If the run_chunk returned a rep_idx, payloads may contain preserve flags
+                            preserve = False
+                            try:
+                                # if results list contains env info embed later, skip; use global preserve if set
+                                if os.environ.get('SIMULATOR_PRESERVE_TMP'):
+                                    preserve = True
+                            except Exception:
+                                pass
+                            if wk and os.path.isdir(wk) and not preserve:
+                                try:
+                                    shutil.rmtree(wk, ignore_errors=True)
+                                    if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                                        try:
+                                            sys.stderr.write(f"DEBUG: removed chunk tmpdir after completion: {wk}\n")
+                                            sys.stderr.flush()
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                         if bar_loc is not None:
                             bar_loc.update(1)
                         elif args.progress and show_progress:
@@ -3038,6 +3595,33 @@ def _run_simulation_core(args):
                                 sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
         if bar_loc is not None:
             bar_loc.close()
+        def _expand_marker_text(s):
+            try:
+                if not s:
+                    return ''
+                # marker form: FILE:/abs/path
+                if isinstance(s, str) and s.startswith('FILE:'):
+                    p = s[5:]
+                    try:
+                        if os.path.isfile(p):
+                            with open(p, 'r', errors='replace') as fh:
+                                return fh.read()
+                    except Exception:
+                        return s
+                # If it's a path to a file, read it
+                if isinstance(s, str) and os.path.isfile(s):
+                    try:
+                        with open(s, 'r', errors='replace') as fh:
+                            return fh.read()
+                    except Exception:
+                        return s
+                return str(s)
+            except Exception:
+                try:
+                    return str(s)
+                except Exception:
+                    return ''
+
         for tpl in results_loc:
             if len(tpl) == 5:
                 rc, out, err, code, _r = tpl
@@ -3046,12 +3630,150 @@ def _run_simulation_core(args):
             if code is not None:
                 sys.stderr.write(f'# ERROR: {engine} exited with code {code}.\n')
                 if out:
-                    sys.stderr.write(out)
+                    sys.stderr.write(_expand_marker_text(out))
                 if err:
-                    sys.stderr.write(err)
+                    sys.stderr.write(_expand_marker_text(err))
                 sys.exit(code)
-        concatenated_stdout_loc = ''.join(t[1] for t in results_loc)
-        concatenated_stderr_loc = ''.join(t[2] for t in results_loc)
+        # If the caller only requested SFS (no primary output) and this
+        # is not the msprime in-process branch, avoid concatenating the
+        # potentially large stdout blobs into memory. Instead stream them
+        # to a temp file and compute the mean SFS into a compact textual
+        # representation that we return in place of the full ms/vcf text.
+        try:
+            want_only_sfs = bool(getattr(args, 'sfs', False) and not getattr(args, '_user_out_provided', False))
+        except Exception:
+            want_only_sfs = False
+
+        # Helper: read stdout content from a results_loc entry which may be
+        # either a string or a filepath produced by workers.
+        def _read_stdout_entry(e):
+            try:
+                stdout_val = e[1] if len(e) > 1 else None
+                # If worker returned a list of file paths, read each file and
+                # concatenate. If it's a single filepath string, read it.
+                if isinstance(stdout_val, (list, tuple)):
+                    parts = []
+                    for item in stdout_val:
+                        try:
+                            if isinstance(item, str) and os.path.isfile(item):
+                                with open(item, 'r') as rfh:
+                                    parts.append(rfh.read())
+                            else:
+                                parts.append(str(item))
+                        except Exception:
+                            # ignore individual read errors
+                            pass
+                    return ''.join(parts)
+                if isinstance(stdout_val, str) and os.path.isfile(stdout_val):
+                    try:
+                        with open(stdout_val, 'r') as rfh:
+                            return rfh.read()
+                    except Exception:
+                        return ''
+                return stdout_val or ''
+            except Exception:
+                return ''
+
+        # SFS-only fast path for non-msprime engines: stream worker outputs
+        # (including file-backed outputs) into a single temporary file and
+        # compute the mean SFS from that file.
+        concatenated_stdout_loc = ''
+        concatenated_stderr_loc = ''
+        if want_only_sfs and engine != 'msprime':
+            import tempfile as _tempfile, os as _os
+            tmp_path = None
+            try:
+                tmpdir = _ensure_local_tmpdir()
+                with _tempfile.NamedTemporaryFile('w', delete=False, dir=tmpdir) as tf:
+                    for t in results_loc:
+                        try:
+                            # stream file-backed outputs or in-memory strings
+                            stdout_chunk = _read_stdout_entry(t)
+                            if stdout_chunk:
+                                tf.write(stdout_chunk)
+                        except Exception:
+                            pass
+                    tmp_path = tf.name
+                # Compute SFS from the streamed file and return a compact SFS text
+                try:
+                    header_sfs, lines_sfs = _stream_sfs_mean_from_file(tmp_path, n_hap_expected=None, normalized=getattr(args, 'sfs_normalized', False))
+                    concatenated_stdout_loc = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
+                except Exception:
+                    concatenated_stdout_loc = ''
+                def _expand_err_entry(e):
+                    try:
+                        v = e[2] if len(e) > 2 else None
+                        if not v:
+                            return ''
+                        if isinstance(v, str) and v.startswith('FILE:'):
+                            p = v[5:]
+                            try:
+                                if os.path.isfile(p):
+                                    with open(p, 'r', errors='replace') as fh:
+                                        return fh.read()
+                            except Exception:
+                                return v
+                        if isinstance(v, str) and os.path.isfile(v):
+                            try:
+                                with open(v, 'r', errors='replace') as fh:
+                                    return fh.read()
+                            except Exception:
+                                return v
+                        return str(v)
+                    except Exception:
+                        return ''
+
+                concatenated_stderr_loc = ''.join((_expand_err_entry(t) for t in results_loc))
+            finally:
+                try:
+                    if tmp_path and _os.path.exists(tmp_path):
+                        _os.unlink(tmp_path)
+                except Exception:
+                    pass
+        else:
+            # Default concatenation path: read each stdout entry (file or str)
+            parts_out = []
+            for t in results_loc:
+                parts_out.append(_read_stdout_entry(t))
+            concatenated_stdout_loc = ''.join(parts_out)
+            def _expand_err_entry(e):
+                try:
+                    v = e[2] if len(e) > 2 else None
+                    if not v:
+                        return ''
+                    if isinstance(v, str) and v.startswith('FILE:'):
+                        p = v[5:]
+                        try:
+                            if os.path.isfile(p):
+                                with open(p, 'r', errors='replace') as fh:
+                                    return fh.read()
+                        except Exception:
+                            return v
+                    if isinstance(v, str) and os.path.isfile(v):
+                        try:
+                            with open(v, 'r', errors='replace') as fh:
+                                return fh.read()
+                        except Exception:
+                            return v
+                    return str(v)
+                except Exception:
+                    return ''
+
+            concatenated_stderr_loc = ''.join((_expand_err_entry(t) for t in results_loc))
+            # Cleanup per-worker output files now that we've read them
+            try:
+                for t in results_loc:
+                    try:
+                        stdout_val = t[1] if len(t) > 1 else None
+                        if isinstance(stdout_val, str) and os.path.isfile(stdout_val):
+                            try:
+                                os.unlink(stdout_val)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         # If msprime workers wrote VCF directly (start with VCF header), mark produced_format
         try:
             if engine == 'msprime' and isinstance(meta_loc, dict):
@@ -3754,7 +4476,6 @@ def _run_simulation_core(args):
                 sys.stdout.flush()
             except Exception:
                 pass
-            sys.exit(0)
     # Decide if we should suppress primary output (SFS-only scenario)
     # If user did not supply --output but requested --sfs, treat as SFS-only and do not create primary ms/vcf file.
     write_primary_output = True
@@ -4611,7 +5332,7 @@ def _run_simulation_core(args):
                     else:
                         cpu_list_n = list(range(start_cpu_n, end_cpu_n)) if end_cpu_n > start_cpu_n else [start_cpu_n % total_cpus_n]
                     pre_n = _make_affinity_preexec(cpu_list_n)
-                    rloc = subprocess.run(toks_loc, capture_output=True, text=True, check=True, env=env_n, preexec_fn=pre_n)
+                    rloc = _run_and_register(toks_loc, capture_output=True, text=True, check=True, env=env_n, preexec_fn=pre_n)
                     return (rc, rloc.stdout, rloc.stderr, None, rep_index)
                 except subprocess.CalledProcessError as e_c:
                     return (rc, e_c.stdout, e_c.stderr, e_c.returncode, rep_index)
