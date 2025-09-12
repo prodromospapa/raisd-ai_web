@@ -10,3 +10,11 @@
 !3.sfs.py
 !run.sh
 !.gitignore
+!/.github/
+!/.github/workflows/
+!tests/
+!run_tests.py
+# ignore compiled python files and cache dirs
+__pycache__/
+*.py[cod]
+*$py.class
