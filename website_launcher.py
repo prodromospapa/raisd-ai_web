@@ -1594,6 +1594,103 @@ def runs_rescan(run_id):
                     mf.write(json.dumps(cur))
             except Exception:
                 pass
+            # Try to compute and persist the projected expected SFS for this (dm,pop)
+            # so clients can render the picked-model trace without a separate fetch.
+            try:
+                # Determine target sample size
+                targ = None
+                try:
+                    if isinstance(cur.get('match'), dict):
+                        tval = cur['match'].get('target')
+                        if isinstance(tval, int) and tval > 0:
+                            targ = int(tval)
+                except Exception:
+                    targ = None
+                if not targ:
+                    # fallback to analysis_input in meta
+                    ai = cur.get('analysis_input') or cur.get('uploaded_name')
+                    if ai:
+                        vcf_candidate = os.path.join(run_dir, ai)
+                        if os.path.exists(vcf_candidate):
+                            try:
+                                targ, _, _, _ = infer_samples_and_ploidy(vcf_candidate)
+                            except Exception:
+                                targ = None
+                if targ and cur.get('species'):
+                    species_name = str(cur.get('species'))
+                    sfs_table = os.path.join(DATA_DIR, species_name, 'sfs.csv')
+                    if os.path.exists(sfs_table):
+                        try:
+                            df = load_sfs_matrix(sfs_table)
+                            try:
+                                dfn = normalize_sfs_df(df)
+                            except Exception:
+                                dfn = df
+                            proj = project_expected_df(dfn, int(targ))
+                            key = f"{dm}={pop}"
+                            if key not in proj.index:
+                                # forgiving match
+                                def _normk(s):
+                                    return re.sub(r'[^A-Za-z0-9]+', '', (s or '').lower())
+                                wanted = _normk(key)
+                                found = None
+                                for idx in proj.index:
+                                    if _normk(idx) == wanted:
+                                        found = idx
+                                        break
+                                if found is not None:
+                                    key = found
+                            if key in proj.index:
+                                arr = proj.loc[key].values.tolist()
+                                # update match_details.json if present
+                                try:
+                                    md_path = os.path.join(run_dir, 'match_details.json')
+                                    if os.path.exists(md_path):
+                                        with open(md_path, 'r', encoding='utf-8') as mdf:
+                                            md = json.load(mdf)
+                                    else:
+                                        md = {}
+                                    # update top_matches and all_jsd entries
+                                    for list_key in ('top_matches', 'all_jsd'):
+                                        if isinstance(md.get(list_key), list):
+                                            for ent in md[list_key]:
+                                                try:
+                                                    if (str(ent.get('demographic_model') or '')).strip().lower() == (str(dm) or '').strip().lower() and (str(ent.get('population') or '')).strip().lower() == (str(pop) or '').strip().lower():
+                                                        ent['expected_sfs'] = arr
+                                                except Exception:
+                                                    continue
+                                    # persist updated match_details.json
+                                    try:
+                                        with open(md_path, 'w', encoding='utf-8') as mdf:
+                                            mdf.write(json.dumps(md))
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                                # Also update result_meta.json's match.all_jsd if present
+                                try:
+                                    if isinstance(cur.get('match'), dict) and isinstance(cur['match'].get('all_jsd'), list):
+                                        updated = False
+                                        for ent in cur['match']['all_jsd']:
+                                            try:
+                                                if (str(ent.get('demographic_model') or '')).strip().lower() == (str(dm) or '').strip().lower() and (str(ent.get('population') or '')).strip().lower() == (str(pop) or '').strip().lower():
+                                                    ent['expected_sfs'] = arr
+                                                    updated = True
+                                            except Exception:
+                                                continue
+                                        if updated:
+                                            try:
+                                                with open(meta_path, 'w', encoding='utf-8') as mf:
+                                                    mf.write(json.dumps(cur))
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+            except Exception:
+                # non-fatal: best-effort persistence only
+                pass
             append_log(run_dir, f"Rescan complete: {dm}/{pop} (job {job_id})")
             # Final status with report filename for client
             try:

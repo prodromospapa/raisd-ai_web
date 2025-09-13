@@ -18,9 +18,9 @@ samples = 10_000
 # CLI: allow optional max RAM percent enforcement
 parser = argparse.ArgumentParser()
 parser.add_argument("--max-ram-percent", type=float,default=0.5,
-                    help="If set, stop a simulator run when it exceeds this percent of total RAM, decrement --max-parallel and retry until 1.")
+                    help="If set, stop a simulator run when it exceeds this percent of total RAM; the run will be skipped (no lower-parallel retry).")
 parser.add_argument("--max-parallel", type=int, default=1,
-                    help="Maximum --parallel value to start with; will be decremented on RAM exceed and retried until 1.")
+                    help="Maximum --parallel value to start with.")
 cli_args, _ = parser.parse_known_args()
 MAX_RAM_PERCENT = cli_args.max_ram_percent
 MAX_PARALLEL = cli_args.max_parallel
@@ -216,16 +216,10 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                             pass
                     # after monitoring loop, decide what happened
                     if exceeded:
-                        # reduce parallel and retry unless already at 1
-                        if current_parallel > 1:
-                            append_log(f"Exceeded RAM {MAX_RAM_PERCENT}% for {model_id} {population} at parallel={current_parallel}; retrying with {current_parallel-1}")
-                            current_parallel -= 1
-                            continue
-                        else:
-                            # failed even at parallel==1; skip this model/population
-                            append_log(f"Skipped {model_id} {population}: exceeded RAM {MAX_RAM_PERCENT}% even at parallel=1.")
-                            skipped = True
-                            break
+                        # Do not retry with a lower parallel: skip this model/population
+                        append_log(f"Skipped {model_id} {population}: exceeded RAM {MAX_RAM_PERCENT}% at parallel={current_parallel}; not retrying with lower parallel.")
+                        skipped = True
+                        break
                     else:
                         # process finished normally; check return code
                         if proc.returncode == 0:
