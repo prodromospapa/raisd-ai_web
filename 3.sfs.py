@@ -113,6 +113,7 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 "--chromosome", "21",#str(biggest_chromosome),
                 "--replicates", "5",
                 "--parallel",
+                "--sfs", "sfs.sfs",
                 "--sfs-normalized"
             ]
             # whether to include --sfs sfs.sfs in simulator args for this model/pop
