@@ -260,8 +260,18 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 append_log(f"Giving up after {attempts} attempts for {model_id} {population}; marking skipped")
                 skipped = True
             if skipped:
-                # mark skipped row with NaNs to preserve index and continue
-                sfs.loc[f"{model_id}={population}"] = np.nan
+                # Do NOT add skipped demographics to the SFS CSV.
+                # Instead, record them in a dedicated skipped log file so they can be reviewed later.
+                skipped_log = f"data/{species_folder_name}/skipped_sfs.log"
+                msg = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Skipped {model_id} {population}: unable to produce SFS\n"
+                try:
+                    with open(skipped_log, "a") as wf:
+                        wf.write(msg)
+                except Exception:
+                    # fallback to append_log if we can't write the species-level skipped log
+                    append_log(f"Failed to write skipped log for {model_id} {population}; original message: {msg.strip()}")
+                # also append to the standard logs
+                append_log(f"Skipped {model_id} {population}: unable to produce SFS; recorded in {skipped_log}")
             else:
                 # only read sfs.sfs if it exists; otherwise do not pass it in future runs
                 if os.path.exists("sfs.sfs"):
