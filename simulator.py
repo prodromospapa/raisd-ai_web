@@ -2534,6 +2534,7 @@ def parse_args():
     g.add_argument('--progress', action='store_true', help="Show progress bar (requires tqdm).")
     g.add_argument('--sfs', nargs='?', const=True, default=False,
                    help="Compute unfolded SFS. Optional value sets output basename; default name modelid_pop0[_chrom][_sweeppop].sfs.")
+    # per-chunk output deletion is enabled by default when --sfs is requested
     g.add_argument('--sfs-normalized', action='store_true', help='Normalize SFS counts to frequencies.')
     # Deprecated flags --force-resim / --no-force-resim removed: worker AF markers are authoritative.
     g.add_argument('--sfs-mode', choices=['mean','per-rep'], default='mean', help="SFS aggregation mode.")
@@ -3152,13 +3153,6 @@ def _run_simulation_core(args):
         # run replicate chunks. Use the CLI --parallel as-is for all engines.
         threads_loc = max(1, min(int(getattr(args, 'parallel', 1)), total_reps_loc))
         per_rep_mode_loc = bool(args.progress and show_progress and total_reps_loc > 1)
-        # For msprime, decouple performance from UI: always use per-replicate
-        # chunking when there are multiple replicates, regardless of --progress.
-        # This keeps the fast scheduling path without requiring the flag.
-        if engine == 'msprime':
-            per_rep_mode_loc = bool(total_reps_loc > 1)
-        else:
-            per_rep_mode_loc = bool(args.progress and show_progress and total_reps_loc > 1)
 
         # Compute the default chunking that the existing code would produce so we
         # can derive a sensible default/cap for --sims-per-work. We keep this
@@ -3182,13 +3176,16 @@ def _run_simulation_core(args):
             max_allowed_sims_per_work = max(1, total_reps_loc)
 
         # If user didn't provide --sims-per-work, default to the computed max
-        # which preserves previous behaviour.
+        # which preserves previous behaviour. Inform the user when we set this.
         try:
             if getattr(args, 'sims_per_work', None) is None:
                 args.sims_per_work = int(max_allowed_sims_per_work)
+                try:
+                    sys.stderr.write(f"# INFO: --sims-per-work not provided; defaulting to computed maximum {args.sims_per_work} (derived from --reps/--parallel).\n")
+                except Exception:
+                    pass
         except Exception:
             args.sims_per_work = int(max_allowed_sims_per_work)
-
         # Validate user-provided value: minimum 1, cap to max_allowed_sims_per_work.
         try:
             user_spw = int(args.sims_per_work)
@@ -3757,7 +3754,10 @@ def _run_simulation_core(args):
                 # Abort early if RAM monitor signalled an exceedance
                 if getattr(args, '_ram_exceeded', False):
                     _abort_due_to_ram()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=threads_loc) as ex:
+                # Limit concurrent chunk runners to threads_loc (honours --parallel).
+                # Submit all chunk tasks but allow executor to queue excess tasks so
+                # only up to `threads_loc` run at once and remaining chunks wait.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(chunks_loc), threads_loc))) as ex:
                     futs = []
                     rep_counter = 0
                     for idx, c in enumerate(chunks_loc):
@@ -3817,7 +3817,10 @@ def _run_simulation_core(args):
                     # Abort early if RAM monitor signalled an exceedance
                     if getattr(args, '_ram_exceeded', False):
                         _abort_due_to_ram()
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks_loc)) as ex:
+                    # When chunking into multiple chunks we still want to cap
+                    # concurrent runners to `threads_loc` (derived from --parallel)
+                    # so remaining chunks are queued and executed as workers free up.
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(chunks_loc), threads_loc))) as ex:
                         futs = [ex.submit(run_chunk_loc, c, i, i) for i, c in enumerate(chunks_loc)]
                         for fut in concurrent.futures.as_completed(futs):
                             if getattr(args, '_ram_exceeded', False):
@@ -3883,6 +3886,20 @@ def _run_simulation_core(args):
         except Exception:
             want_only_sfs = False
 
+        # Whether user requested deletion of per-chunk primary outputs after
+        # extracting SFS. This lets users keep disk/RAM low by removing heavy
+        # ms/vcf files as soon as their SFS contribution is captured.
+        try:
+            # Discard per-chunk primary outputs by default when --sfs is requested
+            discard_requested = bool(getattr(args, 'sfs', False))
+        except Exception:
+            discard_requested = False
+        if discard_requested:
+                try:
+                    sys.stderr.write('# INFO: per-chunk primary outputs will be removed after SFS extraction (SFS-only mode default). Use --output to keep primary outputs.\n')
+                except Exception:
+                    pass
+
         # Helper: read stdout content from a results_loc entry which may be
         # either a string or a filepath produced by workers.
         def _read_stdout_entry(e):
@@ -3913,6 +3930,70 @@ def _run_simulation_core(args):
             except Exception:
                 return ''
 
+        def _expand_err_entry(e):
+            try:
+                v = e[2] if len(e) > 2 else None
+                if not v:
+                    return ''
+                if isinstance(v, str) and v.startswith('FILE:'):
+                    p = v[5:]
+                    try:
+                        if os.path.isfile(p):
+                            with open(p, 'r', errors='replace') as fh:
+                                return fh.read()
+                    except Exception:
+                        return v
+                if isinstance(v, str) and os.path.isfile(v):
+                    try:
+                        with open(v, 'r', errors='replace') as fh:
+                            return fh.read()
+                    except Exception:
+                        return v
+                return str(v)
+            except Exception:
+                return ''
+
+        def _read_stdout_and_maybe_delete(e):
+            # Similar to _read_stdout_entry but removes file-backed outputs
+            # when the user requested discard behavior.
+            try:
+                stdout_val = e[1] if len(e) > 1 else None
+                if isinstance(stdout_val, (list, tuple)):
+                    parts = []
+                    for item in stdout_val:
+                        try:
+                            if isinstance(item, str) and os.path.isfile(item):
+                                try:
+                                    with open(item, 'r') as rfh:
+                                        parts.append(rfh.read())
+                                except Exception:
+                                    pass
+                                if discard_requested:
+                                    try:
+                                        os.unlink(item)
+                                    except Exception:
+                                        pass
+                            else:
+                                parts.append(str(item))
+                        except Exception:
+                            pass
+                    return ''.join(parts)
+                if isinstance(stdout_val, str) and os.path.isfile(stdout_val):
+                    try:
+                        with open(stdout_val, 'r') as rfh:
+                            data = rfh.read()
+                    except Exception:
+                        data = ''
+                    if discard_requested:
+                        try:
+                            os.unlink(stdout_val)
+                        except Exception:
+                            pass
+                    return data
+                return stdout_val or ''
+            except Exception:
+                return ''
+
         # SFS-only fast path for non-msprime engines: stream worker outputs
         # (including file-backed outputs) into a single temporary file and
         # compute the mean SFS from that file.
@@ -3923,13 +4004,49 @@ def _run_simulation_core(args):
             tmp_path = None
             try:
                 tmpdir = _ensure_local_tmpdir()
+                discard_files = bool(discard_requested or want_only_sfs)
                 with _tempfile.NamedTemporaryFile('w', delete=False, dir=tmpdir) as tf:
                     for t in results_loc:
                         try:
                             # stream file-backed outputs or in-memory strings
-                            stdout_chunk = _read_stdout_entry(t)
-                            if stdout_chunk:
-                                tf.write(stdout_chunk)
+                            stdout_val = t[1] if len(t) > 1 else None
+                            if isinstance(stdout_val, (list, tuple)):
+                                for item in stdout_val:
+                                    try:
+                                        if isinstance(item, str) and os.path.isfile(item):
+                                            with open(item, 'r') as rfh:
+                                                chunk = rfh.read()
+                                            if chunk:
+                                                tf.write(chunk)
+                                            if discard_files:
+                                                try:
+                                                    os.unlink(item)
+                                                except Exception:
+                                                    pass
+                                        else:
+                                            s = str(item)
+                                            if s:
+                                                tf.write(s)
+                                    except Exception:
+                                        # ignore individual read/remove errors
+                                        pass
+                            elif isinstance(stdout_val, str) and os.path.isfile(stdout_val):
+                                try:
+                                    with open(stdout_val, 'r') as rfh:
+                                        chunk = rfh.read()
+                                    if chunk:
+                                        tf.write(chunk)
+                                    if discard_files:
+                                        try:
+                                            os.unlink(stdout_val)
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                            else:
+                                stdout_chunk = _read_stdout_entry(t)
+                                if stdout_chunk:
+                                    tf.write(stdout_chunk)
                         except Exception:
                             pass
                     tmp_path = tf.name
@@ -3970,11 +4087,79 @@ def _run_simulation_core(args):
                 except Exception:
                     pass
         else:
-            # Default concatenation path: read each stdout entry (file or str)
-            parts_out = []
-            for t in results_loc:
-                parts_out.append(_read_stdout_entry(t))
-            concatenated_stdout_loc = ''.join(parts_out)
+            # Default concatenation path: either stream-and-delete to save RAM
+            # (when discard_requested and we don't need the full ms output for
+            # target-snps enforcement), or concatenate into memory as before.
+            if discard_requested and getattr(args, 'min_snps', None) is None:
+                # Stream worker outputs to a temporary file, compute SFS from it,
+                # and avoid retaining full ms/vcf text in memory.
+                import tempfile as _tempfile, os as _os
+                tmp_path = None
+                try:
+                    tmpdir = _ensure_local_tmpdir()
+                    with _tempfile.NamedTemporaryFile('w', delete=False, dir=tmpdir) as tf:
+                        for t in results_loc:
+                            try:
+                                stdout_val = t[1] if len(t) > 1 else None
+                                if isinstance(stdout_val, (list, tuple)):
+                                    for item in stdout_val:
+                                        try:
+                                            if isinstance(item, str) and os.path.isfile(item):
+                                                with open(item, 'r') as rfh:
+                                                    chunk = rfh.read()
+                                                if chunk:
+                                                    tf.write(chunk)
+                                                try:
+                                                    os.unlink(item)
+                                                except Exception:
+                                                    pass
+                                            else:
+                                                s = str(item)
+                                                if s:
+                                                    tf.write(s)
+                                        except Exception:
+                                            pass
+                                elif isinstance(stdout_val, str) and os.path.isfile(stdout_val):
+                                    try:
+                                        with open(stdout_val, 'r') as rfh:
+                                            chunk = rfh.read()
+                                        if chunk:
+                                            tf.write(chunk)
+                                        try:
+                                            os.unlink(stdout_val)
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                else:
+                                    stdout_chunk = _read_stdout_entry(t)
+                                    if stdout_chunk:
+                                        tf.write(stdout_chunk)
+                            except Exception:
+                                pass
+                        tmp_path = tf.name
+                    # Compute SFS from the streamed file and return compact SFS text
+                    try:
+                        header_sfs, lines_sfs = _stream_sfs_mean_from_file(tmp_path, n_hap_expected=None, normalized=getattr(args, 'sfs_normalized', False))
+                        concatenated_stdout_loc = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
+                    except Exception:
+                        concatenated_stdout_loc = ''
+                    concatenated_stderr_loc = ''.join((_expand_err_entry(t) for t in results_loc))
+                finally:
+                    try:
+                        if tmp_path and _os.path.exists(tmp_path):
+                            _os.unlink(tmp_path)
+                    except Exception:
+                        pass
+            else:
+                # Default behavior: concatenate into memory
+                parts_out = []
+                for t in results_loc:
+                    if discard_requested:
+                        parts_out.append(_read_stdout_and_maybe_delete(t))
+                    else:
+                        parts_out.append(_read_stdout_entry(t))
+                concatenated_stdout_loc = ''.join(parts_out)
             def _expand_err_entry(e):
                 try:
                     v = e[2] if len(e) > 2 else None
