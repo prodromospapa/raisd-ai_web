@@ -7,8 +7,6 @@ import shutil
 species = "Homo sapiens"
 train_sample_individuals = 100
 train_replicates = 1_000
-sfs_sample_individuals = 10_000
-sfs_replicates = 1_000
 sel_s = 0.1
 
 window = 500
@@ -36,14 +34,14 @@ def run_subprocess(args, cwd, desc):
             text=True,
         )
     except subprocess.CalledProcessError as e:
-        # print(
-        #     f"\n===== SUBPROCESS ERROR: {desc} =====\n"
-        #     f"Command: {' '.join(args)}\n"
-        #     f"Return code: {e.returncode}\n"
-        #     f"STDOUT:\n{e.stdout or '(empty)'}\n"
-        #     f"STDERR:\n{e.stderr or '(empty)'}\n"
-        #     f"===================================\n"
-        # )
+        print(
+            f"\n===== SUBPROCESS ERROR: {desc} =====\n"
+            f"Command: {' '.join(args)}\n"
+            f"Return code: {e.returncode}\n"
+            f"STDOUT:\n{e.stdout or '(empty)'}\n"
+            f"STDERR:\n{e.stderr or '(empty)'}\n"
+            f"===================================\n"
+        )
         raise SystemExit(1)
 
 
@@ -260,6 +258,3 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                     # Only advance when task just completed (not pre-counted)
                     total_bar.update(1)
                     total_bar.refresh()
-
-# RAiSD-AI -n test -mdl data/Homo_sapiens/OutOfAfricaExtendedNeandertalAdmixturePulse_3I21/YRI/1/RAiSD_Model.model -op SWP-SCN -I test.ms -L 10000000 -frm -G 300 -pci 1 1 -R
-# RAiSD-AI -n ms -f -op RSD-DEF -I test.ms -frm -G 300 -R -L 1000000
