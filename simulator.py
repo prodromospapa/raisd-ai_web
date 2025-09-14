@@ -1862,7 +1862,8 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
         rho   = 2.0 * ploidy * N0 * rrate * length
 
     sel_args = []
-    # discoal -ws t x a : t interpreted here as ORIGIN time (when allele became beneficial) per user spec.
+    # discoal -ws t x a : discoal expects t in coalescent units (4N generations).
+    # The user now provides --sweep-time in generations ago; convert to t_4N = gen / (4*N0).
     # If user supplied per-generation s, compute 2Ns using N0
     if s is not None:
         try:
@@ -1871,10 +1872,23 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
             raise SystemExit('ERROR: Failed to convert --sel-s to 2Ns using N0.')
     else:
         a = None
-    if (a is not None) and (sweep_time is not None):
+
+    # Convert sweep_time from generations to discoal units (4N gens)
+    sweep_time_gen = sweep_time  # may be None
+    sweep_time_4N = None
+    if sweep_time_gen is not None:
+        try:
+            # Ensure N0 is positive
+            if not (N0 and float(N0) > 0):
+                raise Exception('Invalid N0 for conversion')
+            sweep_time_4N = float(sweep_time_gen) / (4.0 * float(N0))
+        except Exception:
+            raise SystemExit('ERROR: Failed to convert --sweep-time (generations) to discoal 4N units using N0.')
+
+    if (a is not None) and (sweep_time_4N is not None):
         if x is None:
             x = 0.5
-        sel_args = ['-ws', str(sweep_time), '-x', str(x), '-a', str(a)]
+        sel_args = ['-ws', str(sweep_time_4N), '-x', str(x), '-a', str(a)]
 
     npop_disc = len(desired_disc_order)
     total_hap_disc = sum(counts_disc)
@@ -1889,9 +1903,11 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
         'demog': demog_0b, 'pop_order': desired_disc_order, 'pop0': discoal_pop0,
         'ploidy': ploidy, 'sel_args': sel_args, 'length': length,
         'chromosome': chr_name if chr_name else None, 'species_id': species,
-        'sweep_pos': x if sel_args else None,
-        'sel_2Ns': a if sel_args else None,
-        'sweep_time': sweep_time if sel_args else None,
+    'sweep_pos': x if sel_args else None,
+    'sel_2Ns': a if sel_args else None,
+    # Store both the user-provided generations and the converted discoal 4N units
+    'sweep_time_gen': sweep_time_gen if sel_args else None,
+    'sweep_time_4N': sweep_time_4N if sel_args else None,
         'fixation_time': None,
         'growth_discretization': {
             'requested_disable': bool(disable_en_ladder),
@@ -2515,7 +2531,7 @@ def parse_args():
     sg.add_argument('--sweep-pop', dest='discoal_pop0', help='Sweep population (discoal/msms). Ignored for ms.')
     sg.add_argument('--sweep-pos', dest='x', type=float, help='Selected site position in (0,1) (required for discoal/msms). Ignored for ms.')
     sg.add_argument('--sel-s', dest='s', type=float, help='Selection coefficient s per generation (required for discoal/msms). Converted to 2Ns using present-size N for the sweep population. Ignored for ms.')
-    sg.add_argument('--sweep-time', dest='sweep_time', type=float, help='Origin time (4N gens) allele becomes beneficial (discoal only).')
+    sg.add_argument('--sweep-time', dest='sweep_time', type=float, help='Origin time in generations ago when allele became beneficial (discoal only).')
     sg.add_argument('--fixation-time', dest='fix_time', type=float, default=0.0, help='Fixation time back in 4N units (msms only; default 0=present).')
 
     args = ap.parse_args()
@@ -2769,9 +2785,9 @@ def _run_simulation_core(args):
         user_attempted_selection = any(getattr(args, n) is not None for n in ('sweep_time','s','x'))
         if user_attempted_selection:
             if args.sweep_time is None or getattr(args, 's', None) is None or args.x is None:
-                sys.exit('ERROR: discoal sweep requires --sweep-time, --sel-s, and --sweep-pos.')
+                sys.exit('ERROR: discoal sweep requires --sweep-time (in generations), --sel-s, and --sweep-pos.')
             if args.sweep_time < 0:
-                sys.exit('ERROR: --sweep-time must be >= 0.')
+                sys.exit('ERROR: --sweep-time must be >= 0 (generations ago).')
         else:
             sys.stderr.write('# INFO: No sweep parameters supplied; running neutral discoal simulation.\n')
     elif engine == 'msms':
