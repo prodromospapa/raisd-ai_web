@@ -52,8 +52,8 @@ if cli_args.max_parallel is None:
 else:
     MAX_PARALLEL = cli_args.max_parallel
 
-# basic logger
-logger = logging.getLogger("check_sfs_models")
+# basic logger (not used for file logging here; we use append_log instead)
+logger = logging.getLogger("raisd")
 logger.setLevel(logging.INFO)
 
 def biggest_chrom(species_std):
@@ -90,8 +90,8 @@ ploidy = species_std.ploidy
 
 os.system(f'mkdir -p "data/{species_folder_name}"')
 
-# shared skipped demographics file
-skipped_file = f"data/{species_folder_name}/skipped_demographics.jsonl"
+# shared record of failed parts (JSON-lines)
+skipped_file = f"data/{species_folder_name}/failed_parts.jsonl"
 
 import json
 
@@ -130,10 +130,9 @@ def append_skipped(key, reason='skipped', source='3.sfs'):
             with open(fallback, 'a') as lf:
                 lf.write(key + "\n")
         except Exception:
+            # Give up on writing fallback; report to stdout instead
             try:
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                with open(os.path.join(os.getcwd(), "check_sfs_models.log"), 'a') as lf:
-                    lf.write(f"[{ts}] Failed to write to skipped demographics file: {skipped_file}\n")
+                print(f"Failed to write failed parts to {skipped_file}", flush=True)
             except Exception:
                 pass
 
@@ -141,20 +140,17 @@ existing_skipped = load_skipped()
 
 # helper to append logs both to species folder and current working dir
 def append_log(msg: str):
+    # Do not write any log files. Print to stdout and also log via the logger.
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}\n"
-    species_log = f"data/{species_folder_name}/check_sfs_models.log"
-    local_log = os.path.join(os.getcwd(), "check_sfs_models.log")
+    line = f"[{ts}] {msg}"
     try:
-        with open(species_log, "a") as wf:
-            wf.write(line)
+        print(line, flush=True)
     except Exception:
-        pass
-    try:
-        with open(local_log, "a") as wf:
-            wf.write(line)
-    except Exception:
-        pass
+        # As a last resort, fall back to logger which may be configured by caller
+        try:
+            logger.info(msg)
+        except Exception:
+            pass
 
 if os.path.exists(f"data/{species_folder_name}/sfs.csv"):
     sfs = pd.read_csv(f"data/{species_folder_name}/sfs.csv",index_col=0)
@@ -163,7 +159,7 @@ if os.path.exists(f"data/{species_folder_name}/sfs.csv"):
 else:
     sfs = pd.DataFrame(columns= range(1,ploidy*(samples)))
 
-#os.remove(f"data/{species_folder_name}/warning.log") if os.path.exists(f"data/{species_folder_name}/warning.log") else None
+# previously removed warning log; no longer used
 first = True
 total = sum(len(pops) for pops in demographic_models.values())
 with tqdm(total=total, desc="Simulations", unit="run") as pbar:
@@ -174,7 +170,7 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 pbar.update(1)
                 pbar.refresh()
                 first = False
-                append_log(f"Skipping {key} because it is listed in skipped_demographics.txt")
+                append_log(f"Skipping {key} because it is listed in skipped_demographics.jsonl")
                 continue
 
             if key in sfs.index:
@@ -183,25 +179,8 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 first = False
                 continue
             if first:
-                os.remove(f"data/{species_folder_name}/check_sfs_models.log") if os.path.exists(f"data/{species_folder_name}/check_sfs_models.log") else None
+                pass
             first = False
-
-            # helper to append logs both to species folder and current working dir
-            def append_log(msg: str):
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                line = f"[{ts}] {msg}\n"
-                species_log = f"data/{species_folder_name}/check_sfs_models.log"
-                local_log = os.path.join(os.getcwd(), "check_sfs_models.log")
-                try:
-                    with open(species_log, "a") as wf:
-                        wf.write(line)
-                except Exception:
-                    pass
-                try:
-                    with open(local_log, "a") as wf:
-                        wf.write(line)
-                except Exception:
-                    pass
 
             # prepare base args; we'll modify --parallel dynamically on retries
             base_args = [

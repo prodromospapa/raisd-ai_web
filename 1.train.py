@@ -119,18 +119,8 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
 
         #print(f"Engine '{engine}' failed for {model_id}/{population}/{chromosome}; retrying once with 'discoal' and --sweep-time 0.01")
         run_subprocess(alt_args, out_dir, f"simulation {model_id}/{population}/{chromosome} (discoal retry)")
-        msg = f"Model '{model_id}' population '{population}'\n"
-        species_dir = os.path.join(os.getcwd(), "data", species_folder_name)
-        os.makedirs(species_dir, exist_ok=True)
-        log_path = os.path.join(species_dir, "check_train_model.log")
-        if os.path.exists(log_path):
-            with open(log_path, "r", encoding="utf-8") as log_f:
-                if msg not in log_f.read():
-                    with open(log_path, "a", encoding="utf-8") as log_f:
-                        log_f.write(msg)
-        else:
-            with open(log_path, "w", encoding="utf-8") as log_f:
-                log_f.write(msg)
+        # Report retry success via stdout. Do not write log files.
+        print(f"Engine '{engine}' failed for {model_id}/{population}/{chromosome}; retry succeeded with 'discoal' and --sweep-time.")
 
 def get_info(model_id,population,chromosome):
     out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(population), str(chromosome))
@@ -200,8 +190,8 @@ else:
 species_folder_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in str(species_full_name)).strip().replace(" ", "_")
 os.makedirs(os.path.join("data", species_folder_name), exist_ok=True)
 
-# shared skipped demographics file (JSON-lines, used by 3.sfs.py)
-skipped_file = os.path.join("data", species_folder_name, "skipped_demographics.jsonl")
+# shared failed parts file (JSON-lines, used by 3.sfs.py)
+skipped_file = os.path.join("data", species_folder_name, "failed_parts.jsonl")
 
 def load_skipped():
     skipped = set()
@@ -237,7 +227,10 @@ def append_skipped(key, reason='skipped', source='1.train'):
             with open(fallback, 'a') as lf:
                 lf.write(key + "\n")
         except Exception:
-            pass
+            try:
+                print(f"Failed to write failed parts to {skipped_file}", flush=True)
+            except Exception:
+                pass
 
 existing_skipped = load_skipped()
 
@@ -301,7 +294,7 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                     continue
                 try: 
                     if first:
-                        os.remove(f"data/{species_folder_name}/check_train_model.log") if os.path.exists(f"data/{species_folder_name}/check_train_model.log") else None
+                        pass
                     first = False
                     sweep_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep.ms"
                     neutral_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/neutral.ms"

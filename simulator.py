@@ -684,9 +684,9 @@ def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int =
     pos_vals = []
     hap_lines = []
     i = 0
-    # find first segsites
+    # find first segsites (allow leading whitespace)
     while i < len(lines):
-        ln = lines[i].strip()
+        ln = lines[i].lstrip()
         if ln.startswith('segsites:'):
             try:
                 segsites = int(ln.split()[1])
@@ -696,10 +696,10 @@ def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int =
             j = i + 1
             pos_line_idx = None
             while j < len(lines) and j <= i + 10:
-                if lines[j].strip().startswith('positions:'):
+                if lines[j].lstrip().startswith('positions:'):
                     pos_line_idx = j
                     break
-                if lines[j].strip().startswith('segsites:'):
+                if lines[j].lstrip().startswith('segsites:'):
                     break
                 j += 1
             if pos_line_idx is None:
@@ -720,7 +720,7 @@ def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int =
             k = pos_line_idx + 1
             while k < len(lines):
                 s = lines[k].strip()
-                if not s or s.startswith('//') or s.startswith('segsites:') or s.startswith('positions:'):
+                if not s or s.lstrip().startswith('//') or s.lstrip().startswith('segsites:') or s.lstrip().startswith('positions:'):
                     break
                 if set(s) <= {'0', '1'}:
                     hap_lines.append(s)
@@ -1373,37 +1373,44 @@ def _parse_ms_like_replicates(ms_text):
     i = 0
     while i < len(lines):
         ln = lines[i]
-        if ln.startswith('//'):
+        ln_stripped = ln.lstrip()
+        # accept comment/rep separator even if indented
+        if ln_stripped.startswith('//'):
             i += 1
             continue
-        if ln.startswith('segsites:'):
-            # parse segsites
+        if ln_stripped.startswith('segsites:'):
+            # parse segsites from stripped content
             try:
-                segsites = int(ln.split()[1])
+                segsites = int(ln_stripped.split()[1])
             except Exception:
                 # skip malformed replicate
-                i += 1; continue
+                i += 1
+                continue
             pos_line_idx = None
-            # look ahead for positions line
+            # look ahead for positions line (allow leading whitespace)
             j = i + 1
             while j < len(lines) and j <= i + 10:
-                if lines[j].startswith('positions:'):
-                    pos_line_idx = j; break
-                if lines[j].startswith('segsites:'):
+                if lines[j].lstrip().startswith('positions:'):
+                    pos_line_idx = j
+                    break
+                if lines[j].lstrip().startswith('segsites:'):
                     break
                 j += 1
             if pos_line_idx is None:
-                i += 1; continue
+                i += 1
+                continue
             hap_start = pos_line_idx + 1
             hap_lines = []
             k = hap_start
             while k < len(lines):
-                hl = lines[k].strip()
-                if not hl or hl.startswith('//') or hl.startswith('segsites:'):
+                hl_raw = lines[k]
+                hl = hl_raw.strip()
+                if not hl:
                     break
-                if hl.startswith('positions:'):
+                if hl.lstrip().startswith('//') or hl.lstrip().startswith('segsites:') or hl.lstrip().startswith('positions:'):
                     break
-                if set(hl) <= {'0','1'}:
+                # accept only contiguous 0/1 strings (strip to remove whitespace)
+                if set(hl) <= {'0', '1'}:
                     hap_lines.append(hl)
                 k += 1
             if hap_lines:
@@ -3890,15 +3897,18 @@ def _run_simulation_core(args):
         # extracting SFS. This lets users keep disk/RAM low by removing heavy
         # ms/vcf files as soon as their SFS contribution is captured.
         try:
-            # Discard per-chunk primary outputs by default when --sfs is requested
-            discard_requested = bool(getattr(args, 'sfs', False))
+            # Discard per-chunk primary outputs by default only when --sfs is requested
+            # and the user did NOT provide an explicit --output. If the user provided
+            # --output we should keep the primary ms/vcf files and not replace
+            # primary output with the compact SFS text.
+            discard_requested = bool(getattr(args, 'sfs', False) and not getattr(args, '_user_out_provided', False))
         except Exception:
             discard_requested = False
         if discard_requested:
-                try:
-                    sys.stderr.write('# INFO: per-chunk primary outputs will be removed after SFS extraction (SFS-only mode default). Use --output to keep primary outputs.\n')
-                except Exception:
-                    pass
+            try:
+                sys.stderr.write('# INFO: per-chunk primary outputs will be removed after SFS extraction (SFS-only mode default). Use --output to keep primary outputs.\n')
+            except Exception:
+                pass
 
         # Helper: read stdout content from a results_loc entry which may be
         # either a string or a filepath produced by workers.
@@ -4004,7 +4014,7 @@ def _run_simulation_core(args):
             tmp_path = None
             try:
                 tmpdir = _ensure_local_tmpdir()
-                discard_files = bool(discard_requested or want_only_sfs)
+                discard_files = bool(want_only_sfs)
                 with _tempfile.NamedTemporaryFile('w', delete=False, dir=tmpdir) as tf:
                     for t in results_loc:
                         try:
@@ -4051,13 +4061,24 @@ def _run_simulation_core(args):
                             pass
                     tmp_path = tf.name
                 # Compute SFS from the streamed file and return a compact SFS text
+                # Compute SFS from the streamed file and return a compact SFS text
                 try:
-                    header_sfs, lines_sfs = _stream_sfs_mean_from_file(tmp_path, n_hap_expected=None, normalized=getattr(args, 'sfs_normalized', False))
-                    concatenated_stdout_loc = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
+                    header_sfs, lines_sfs = _STREAM_SFS_PLACEHOLDER(...)
+                    _sfs_text_tmp = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
+                    if want_only_sfs:
+                        concatenated_stdout_loc = _sfs_text_tmp
+                    else:
+                        try:
+                            with open(tmp_path, 'r', errors='replace') as _rf:
+                                concatenated_stdout_loc = _rf.read()
+                        except Exception:
+                            concatenated_stdout_loc = ''
                 except Exception:
-                    concatenated_stdout_loc = ''
-                def _expand_err_entry(e):
                     try:
+                        with open(tmp_path, 'r', errors='replace') as _rf:
+                            concatenated_stdout_loc = _rf.read()
+                    except Exception:
+                        concatenated_stdout_loc = ''
                         v = e[2] if len(e) > 2 else None
                         if not v:
                             return ''
@@ -4090,7 +4111,7 @@ def _run_simulation_core(args):
             # Default concatenation path: either stream-and-delete to save RAM
             # (when discard_requested and we don't need the full ms output for
             # target-snps enforcement), or concatenate into memory as before.
-            if discard_requested and getattr(args, 'min_snps', None) is None:
+            if want_only_sfs and discard_requested and getattr(args, 'min_snps', None) is None:
                 # Stream worker outputs to a temporary file, compute SFS from it,
                 # and avoid retaining full ms/vcf text in memory.
                 import tempfile as _tempfile, os as _os
@@ -4139,11 +4160,25 @@ def _run_simulation_core(args):
                                 pass
                         tmp_path = tf.name
                     # Compute SFS from the streamed file and return compact SFS text
+                    # Compute SFS from the streamed file and return compact SFS text
                     try:
-                        header_sfs, lines_sfs = _stream_sfs_mean_from_file(tmp_path, n_hap_expected=None, normalized=getattr(args, 'sfs_normalized', False))
-                        concatenated_stdout_loc = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
+                        header_sfs, lines_sfs = _STREAM_SFS_PLACEHOLDER(...)
+                        _sfs_text_tmp = header_sfs + '\n' + '\n'.join(lines_sfs) + '\n'
+                        if want_only_sfs:
+                            concatenated_stdout_loc = _sfs_text_tmp
+                        else:
+                            try:
+                                with open(tmp_path, 'r', errors='replace') as _rf:
+                                    concatenated_stdout_loc = _rf.read()
+                            except Exception:
+                                concatenated_stdout_loc = ''
                     except Exception:
-                        concatenated_stdout_loc = ''
+                        try:
+                            with open(tmp_path, 'r', errors='replace') as _rf:
+                                concatenated_stdout_loc = _rf.read()
+                        except Exception:
+                            concatenated_stdout_loc = ''
+
                     concatenated_stderr_loc = ''.join((_expand_err_entry(t) for t in results_loc))
                 finally:
                     try:
@@ -4867,17 +4902,28 @@ def _run_simulation_core(args):
         argv_full_main = sys.argv[1:]
         output_format_flag = any(a == '--output-format' or a.startswith('--output-format=') for a in argv_full_main)
         if output_format_flag and not getattr(args, '_user_out_provided', False):
-            # Determine SFS stem: user-provided args.sfs string (strip .sfs) or default_stem
-            if isinstance(args.sfs, str) and args.sfs is not True and args.sfs != 'True':
-                sfs_stem = args.sfs
-                if sfs_stem.endswith('.sfs'):
-                    sfs_stem = sfs_stem[:-4]
-            else:
-                sfs_stem = default_stem
+            # Prefer using the --sfs basename for primary output if the user
+            # supplied a string value for --sfs (argparse sets it to True when
+            # the flag is provided without a value). If --sfs ends with '.sfs',
+            # strip that and replace with the desired output extension. Otherwise
+            # fall back to the default stem.
             ext_map_tmp = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
             desired_ext_tmp = ext_map_tmp.get(args.format, '.ms')
-            args.out = sfs_stem + desired_ext_tmp
-            # Mark as provided so the earlier SFS-only early exit is skipped and
+            chosen_base = None
+            try:
+                if isinstance(args.sfs, str) and args.sfs:
+                    chosen_base = args.sfs
+                    # If user gave a trailing .sfs, remove it so we can append the
+                    # correct extension. Do not strip other extensions to avoid
+                    # surprising behavior when the user intentionally provided them.
+                    if chosen_base.endswith('.sfs'):
+                        chosen_base = chosen_base[:-4]
+            except Exception:
+                chosen_base = None
+            if chosen_base:
+                args.out = chosen_base + desired_ext_tmp
+            else:
+                args.out = default_stem + desired_ext_tmp
             # primary output is written below.
             setattr(args, '_user_out_provided', True)
             # Ensure we won't suppress primary output later
@@ -4906,6 +4952,15 @@ def _run_simulation_core(args):
     if (not getattr(args, '_user_out_provided', False)) and getattr(args, 'sfs', False):
         write_primary_output = False
         setattr(args, '_suppress_primary_output', True)
+    # But if --output-format was explicitly set, we intend to write the primary output too.
+    try:
+        _argv_all = sys.argv[1:]
+        _oflag = any(a == '--output-format' or a.startswith('--output-format=') for a in _argv_all)
+        if _oflag and not getattr(args, '_user_out_provided', False):
+            write_primary_output = True
+            setattr(args, '_suppress_primary_output', False)
+    except Exception:
+        pass
     # Handle primary output: if args.out is None -> write file with default stem; if '-' -> stdout
     if args.out is None and write_primary_output:
         fmt_ext = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
@@ -5060,12 +5115,12 @@ def _run_simulation_core(args):
                 blocks = []
                 cur = []
                 for ln in (text.splitlines(True)):
-                    if ln.startswith('//'):
+                    if ln.lstrip().startswith('//'):
                         if cur:
                             blocks.append(''.join(cur))
                             cur = []
                         continue
-                    if ln.startswith('ms ') or ln.startswith('msms ') or ln.startswith('discoal ') or ln.startswith('scrm '):
+                    if ln.lstrip().startswith('ms ') or ln.lstrip().startswith('msms ') or ln.lstrip().startswith('discoal ') or ln.lstrip().startswith('scrm '):
                         continue
                     cur.append(ln)
                 if cur:
@@ -5233,13 +5288,13 @@ def _run_simulation_core(args):
                 blocks = []
                 cur = []
                 for ln in (text.splitlines(True)):
-                    if ln.startswith('//'):
+                    if ln.lstrip().startswith('//'):
                         if cur:
                             blocks.append(''.join(cur))
                             cur = []
                         continue
                     # Skip echoed engine lines
-                    if ln.startswith('ms ') or ln.startswith('msms ') or ln.startswith('discoal ') or ln.startswith('scrm '):
+                    if ln.lstrip().startswith('ms ') or ln.lstrip().startswith('msms ') or ln.lstrip().startswith('discoal ') or ln.lstrip().startswith('scrm '):
                         continue
                     cur.append(ln)
                 if cur:
@@ -5449,6 +5504,9 @@ def _run_simulation_core(args):
                         # format line removed per user request
                         lines = (concatenated_stdout or '').splitlines(True)
                         for ln in lines:
+                            stripped_out = ln.lstrip()
+                            if stripped_out.startswith('#SFS') or stripped_out.startswith('#SFS_AF') or stripped_out.startswith('#SFS_PER_REP') or stripped_out.startswith('#DEBUG_NUM_SITES'):
+                                continue
                             # Avoid duplicating echoed command lines. For ms and discoal we skip the engine line.
                             # For msms, some versions may echo both an 'msms ...' line and a compatibility 'ms ...' line;
                             # keep only the 'msms' line we already wrote (raw_cmd_line) and drop any stray 'ms ' line.
@@ -6004,12 +6062,12 @@ def _run_simulation_core(args):
                             blocks_n = []
                             cur_n = []
                             for ln in (text_n.splitlines(True)):
-                                if ln.startswith('//'):
+                                if ln.lstrip().startswith('//'):
                                     if cur_n:
                                         blocks_n.append(''.join(cur_n))
                                         cur_n = []
                                     continue
-                                if ln.startswith('ms ') or ln.startswith('msms ') or ln.startswith('discoal ') or ln.startswith('scrm '):
+                                if ln.lstrip().startswith('ms ') or ln.lstrip().startswith('msms ') or ln.lstrip().startswith('discoal ') or ln.lstrip().startswith('scrm '):
                                     continue
                                 cur_n.append(ln)
                             if cur_n:
