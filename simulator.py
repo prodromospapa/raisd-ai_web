@@ -2509,11 +2509,17 @@ def parse_args():
     g.add_argument('--temp', dest='temp_loc', choices=['local','system'], default='local',
                    help=("Where to place intermediate temporary files: 'local' (repo-local hidden folder)"
                          " or 'system' (use Python's tempfile.gettempdir()). Default: local."))
-    # Note: --debug-temp and --preserve-tmp removed; temporary files are not preserved.
     g.add_argument('--output-format', dest='format', default='ms', choices=['ms','ms.gz','vcf','vcf.gz','bcf'],
                    help="Output format. 'ms'/'ms.gz' write raw ms-like (optionally gzipped); 'vcf'/'vcf.gz' convert single replicate to VCF.")
     g.add_argument('--parallel', dest='parallel', type=int, default=1,
                    help="Parallel workers for replicate chunks.")
+    g.add_argument('--sims-per-work', dest='sims_per_work', type=int, default=None,
+                   help=("Number of simulation replicates assigned to each parallel worker (per core/thread). "
+                         "Default is computed from --parallel splitting (uses the maximum chunk size from the automatic split). "
+                         "Minimum 1; values above the computed maximum will be capped and a message printed."))
+    g.add_argument('--max-ram-percent', dest='max_ram_percent', type=float, default=80.0,
+                   help=("Abort the run if total system RAM usage exceeds this percentage out of 100 (float). "
+                         "Default 80.0."))
     # Show-only command flag
     g.add_argument('--show-command', action='store_true', help="Print the external simulator command that would run and exit (no execution).")
     g.add_argument('--progress', action='store_true', help="Show progress bar (requires tqdm).")
@@ -2549,6 +2555,70 @@ def parse_args():
     args = ap.parse_args()
     # No legacy debug flag; use --show-command for previews.
     engine = args.engine
+
+    # Start optional RAM monitor thread if requested (default 80%). It checks
+    # total system RAM usage (percent) and sets args._ram_exceeded when the
+    # threshold is crossed so the runner can abort safely. Uses psutil when
+    # available; otherwise monitoring is disabled with an informational note.
+    try:
+        max_ram_pct = float(getattr(args, 'max_ram_percent', 80.0)) if getattr(args, 'max_ram_percent', None) is not None else None
+    except Exception:
+        max_ram_pct = 80.0
+
+    def _ram_monitor_loop(stop_event, threshold_pct, args_obj):
+        try:
+            import psutil
+        except Exception:
+            # psutil not available; do not monitor
+            try:
+                sys.stderr.write('# INFO: psutil not available; --max-ram-percent monitoring disabled.\n')
+            except Exception:
+                pass
+            return
+        try:
+            pfunc = psutil.virtual_memory
+        except Exception:
+            try:
+                sys.stderr.write('# INFO: psutil.virtual_memory not available; RAM monitoring disabled.\n')
+            except Exception:
+                pass
+            return
+        # Poll every 0.5s (tunable); when threshold exceeded, set flag on args and exit
+        while not stop_event.is_set():
+            try:
+                vm = pfunc()
+                used = float(getattr(vm, 'percent', 0.0))
+                if threshold_pct is not None and used > float(threshold_pct):
+                    # mark on args so the rest of the runner can react
+                    try:
+                        setattr(args_obj, '_ram_exceeded', True)
+                        sys.stderr.write(f"# ERROR: total system RAM usage {used:.1f}% exceeded threshold {threshold_pct}%. Aborting run.\n")
+                        sys.stderr.write('# SUGGESTION: reduce --sims-per-work, sample size, --length, or --replicates.\n')
+                    except Exception:
+                        pass
+                    # stop monitoring and exit
+                    break
+            except Exception:
+                pass
+            stop_event.wait(0.5)
+
+    # Launch monitor if a numeric threshold is present
+    try:
+        if max_ram_pct is not None:
+            ram_ev = threading.Event()
+            ram_th = threading.Thread(target=_ram_monitor_loop, args=(ram_ev, max_ram_pct, args), daemon=True)
+            try:
+                setattr(args, '_ram_monitor_event', ram_ev)
+                setattr(args, '_ram_monitor_thread', ram_th)
+                setattr(args, '_ram_exceeded', False)
+                ram_th.start()
+            except Exception:
+                try:
+                    sys.stderr.write('# INFO: Failed to start RAM monitor thread; continuing without enforcement.\n')
+                except Exception:
+                    pass
+    except Exception:
+        pass
     argv_full = sys.argv[1:]
     # Misuse checks
     if engine == 'msms' and any(a.startswith('--sweep-time') for a in argv_full):
@@ -2668,6 +2738,22 @@ def _post_run_teardown(args, result):
     """Post-run hook: perform cleanup of local temporary directory."""
     try:
         _cleanup_local_tmpdir()
+    except Exception:
+        pass
+    # Stop any background RAM monitor thread started in _run_simulation_core
+    try:
+        ev = getattr(args, '_ram_monitor_event', None)
+        th = getattr(args, '_ram_monitor_thread', None)
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+        if th is not None and isinstance(th, threading.Thread):
+            try:
+                th.join(timeout=1.0)
+            except Exception:
+                pass
     except Exception:
         pass
     return result
@@ -3054,15 +3140,65 @@ def _run_simulation_core(args):
             per_rep_mode_loc = bool(total_reps_loc > 1)
         else:
             per_rep_mode_loc = bool(args.progress and show_progress and total_reps_loc > 1)
+
+        # Compute the default chunking that the existing code would produce so we
+        # can derive a sensible default/cap for --sims-per-work. We keep this
+        # initial calculation separate then optionally override with the
+        # user-specified sims_per_work.
         if per_rep_mode_loc:
-            chunks_loc = [1] * total_reps_loc
+            default_chunks = [1] * total_reps_loc
         else:
             if threads_loc == 1 or total_reps_loc == 1:
-                chunks_loc = [total_reps_loc]
+                default_chunks = [total_reps_loc]
             else:
                 base = total_reps_loc // threads_loc
                 rem = total_reps_loc % threads_loc
-                chunks_loc = [base + (1 if i < rem else 0) for i in range(threads_loc) if base + (1 if i < rem else 0) > 0]
+                default_chunks = [base + (1 if i < rem else 0) for i in range(threads_loc) if base + (1 if i < rem else 0) > 0]
+
+        # Compute maximum allowed sims-per-work from the default splitting
+        # behaviour (largest chunk size). Minimum allowed is 1.
+        try:
+            max_allowed_sims_per_work = max(1, max(default_chunks))
+        except Exception:
+            max_allowed_sims_per_work = max(1, total_reps_loc)
+
+        # If user didn't provide --sims-per-work, default to the computed max
+        # which preserves previous behaviour.
+        try:
+            if getattr(args, 'sims_per_work', None) is None:
+                args.sims_per_work = int(max_allowed_sims_per_work)
+        except Exception:
+            args.sims_per_work = int(max_allowed_sims_per_work)
+
+        # Validate user-provided value: minimum 1, cap to max_allowed_sims_per_work.
+        try:
+            user_spw = int(args.sims_per_work)
+            if user_spw < 1:
+                sys.stderr.write(f"# INFO: --sims-per-work {user_spw} < 1; using 1 instead.\n")
+                user_spw = 1
+            if user_spw > max_allowed_sims_per_work:
+                sys.stderr.write(f"# INFO: --sims-per-work {user_spw} exceeds computed maximum {max_allowed_sims_per_work}; capping to {max_allowed_sims_per_work}.\n")
+                user_spw = int(max_allowed_sims_per_work)
+            args.sims_per_work = int(user_spw)
+        except Exception:
+            args.sims_per_work = int(max_allowed_sims_per_work)
+
+        # Now produce the final chunks list. If per-rep mode, keep per-replicate
+        # chunks. Otherwise split total_reps_loc into pieces of size
+        # args.sims_per_work (last chunk may be smaller). This allows more
+        # chunks than --parallel; the executor will limit concurrency.
+        if per_rep_mode_loc:
+            chunks_loc = [1] * total_reps_loc
+        else:
+            spw = max(1, int(getattr(args, 'sims_per_work', 1)))
+            if spw >= total_reps_loc:
+                chunks_loc = [total_reps_loc]
+            else:
+                full = total_reps_loc // spw
+                rem = total_reps_loc % spw
+                chunks_loc = [spw] * full
+                if rem:
+                    chunks_loc.append(rem)
         # Prepare unique seeds per chunk for engines supporting explicit seeding
         chunk_process_count = None
         # Engines that support per-replicate seeding/mode. Include msprime so it can run multiple
@@ -3502,11 +3638,15 @@ def _run_simulation_core(args):
             # of physical CPU cores to avoid oversubscription.
             max_proc = min(len(payloads), req_workers, phys_total)
 
+            if getattr(args, '_ram_exceeded', False):
+                raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_proc) as pex:
                 for i, (pld, envw) in enumerate(zip(payloads, envs)):
                     futs.append((i, pex.submit(_msprime_worker_run, pld, envw)))
                 for idx, fut in futs:
                     try:
+                        if getattr(args, '_ram_exceeded', False):
+                            raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
                         out_txt, err_txt, rc = fut.result()
                     except Exception as e:
                         out_txt, err_txt, rc = '', f'# ERROR: msprime worker failed in process: {e}\n', 1
@@ -3554,6 +3694,9 @@ def _run_simulation_core(args):
             results_loc.sort(key=lambda x: x[4])
         else:
             if per_rep_mode_loc:
+                # Abort early if RAM monitor signalled an exceedance
+                if getattr(args, '_ram_exceeded', False):
+                    raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
                 with concurrent.futures.ThreadPoolExecutor(max_workers=threads_loc) as ex:
                     futs = []
                     rep_counter = 0
@@ -3561,6 +3704,9 @@ def _run_simulation_core(args):
                         futs.append(ex.submit(run_chunk_loc, c, rep_counter, idx))
                         rep_counter += 1
                     for fut in concurrent.futures.as_completed(futs):
+                        if getattr(args, '_ram_exceeded', False):
+                            # stop waiting for remaining futures and abort
+                            raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
                         rc, out, err, code, rep_idx = fut.result()
                         results_loc.append((rc, out, err, code, rep_idx))
                         # Attempt immediate cleanup of per-chunk tmpdir if set in env during the chunk
@@ -3608,9 +3754,14 @@ def _run_simulation_core(args):
                     elif args.progress and show_progress and total_reps_loc == 1:
                         sys.stderr.write('# progress: 1/1\n')
                 else:
+                    # Abort early if RAM monitor signalled an exceedance
+                    if getattr(args, '_ram_exceeded', False):
+                        raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
                     with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks_loc)) as ex:
                         futs = [ex.submit(run_chunk_loc, c, i, i) for i, c in enumerate(chunks_loc)]
                         for fut in concurrent.futures.as_completed(futs):
+                            if getattr(args, '_ram_exceeded', False):
+                                raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
                             rc, out, err, code, rep_idx = fut.result()
                             results_loc.append((rc, out, err, code, rep_idx))
                             if bar_loc is not None:
