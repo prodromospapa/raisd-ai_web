@@ -22,6 +22,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 import matplotlib.pyplot as plt
 import pysam
+import signal
 
 from collections import Counter
 from math import lgamma
@@ -1402,6 +1403,78 @@ def runs_tail(run_id):
         rs_err = '(failed to read RAiSD stderr)'
 
     return json.dumps({'lines': lines, 'raisd_stdout': rs_out, 'raisd_stderr': rs_err, 'done': bool(done)}), 200, {'Content-Type': 'application/json'}
+
+
+@app.route('/runs/<run_id>/cancel', methods=['POST'])
+def runs_cancel(run_id):
+    """Best-effort cancellation: try to cancel the submitted future, and kill any
+    processes whose current working directory is the run directory. Returns JSON
+    describing what was attempted."""
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    if not os.path.isdir(run_dir):
+        return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
+
+    # Try to cancel the future if present
+    fut = None
+    with _futures_lock:
+        fut = _run_futures.get(run_id)
+    cancelled = False
+    try:
+        if fut:
+            cancelled = fut.cancel()
+    except Exception:
+        cancelled = False
+
+    # Best-effort: kill processes whose cwd is inside the run dir
+    killed = []
+    try:
+        for pid_str in os.listdir('/proc'):
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            try:
+                # readlink may raise if process exits
+                proc_cwd = os.readlink(f'/proc/{pid}/cwd')
+                # match exact run_dir or a subpath
+                try:
+                    # normalization
+                    if os.path.commonpath([proc_cwd, run_dir]) == run_dir:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            killed.append(pid)
+                        except Exception:
+                            pass
+                except Exception:
+                    # fallback to simple prefix check
+                    if proc_cwd.startswith(run_dir):
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            killed.append(pid)
+                        except Exception:
+                            pass
+            except Exception:
+                continue
+        # give processes a moment, then force kill remaining
+        time.sleep(0.5)
+        for pid in list(killed):
+            try:
+                os.kill(pid, 0)
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+            except Exception:
+                # process already gone
+                try:
+                    killed.remove(pid)
+                except Exception:
+                    pass
+    except Exception:
+        # ignore errors in best-effort cleanup
+        pass
+
+    append_log(run_dir, f"Cancellation requested: fut_cancelled={cancelled}, pids_killed={killed}")
+    return json.dumps({'cancelled': cancelled, 'pids_killed': killed}), 200, {'Content-Type': 'application/json'}
 
 @app.route('/runs/<run_id>/rescan', methods=['POST'])
 def runs_rescan(run_id):
