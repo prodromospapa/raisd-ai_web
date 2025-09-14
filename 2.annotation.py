@@ -77,9 +77,10 @@ def fetch(species, chrom):
 if __name__=="__main__":
     species_std = stdpopsim.get_species(species)
     species_name = species_std.name
-    annot_dir = f"data_/{species_name.replace(' ', '_')}/annotation"
-    with open(f"data_/{species_name.replace(' ', '_')}/chromosomes.txt", 'r') as f:
-            chromosomes = [line.strip() for line in f]
+    # Write annotation files into the main `data/` tree so the website finds them.
+    annot_dir = f"data/{species_name.replace(' ', '_')}/annotation"
+    with open(f"data/{species_name.replace(' ', '_')}/chromosomes.txt", 'r') as f:
+        chromosomes = [line.strip() for line in f]
     # ensure annotation directory exists
     Path(annot_dir).mkdir(parents=True, exist_ok=True)
 

@@ -12,18 +12,19 @@ import logging
 import signal
 import psutil
 
-species = "Homo sapiens"
-
-samples = 10_000
-
-# CLI: allow optional max RAM percent enforcement
+# CLI: species (stdpopsim id or full name) plus optional resource flags
 parser = argparse.ArgumentParser()
+parser.add_argument("--species", type=str, default="Homo sapiens",
+                    help="Species id (stdpopsim short id) or full name, e.g. 'HomSap' or 'Homo sapiens'.")
 parser.add_argument("--max-ram-percent", type=float, default=None,
                     help="If set, stop a simulator run when it exceeds this percent of total RAM; the run will be skipped (no lower-parallel retry). If omitted, wrapper-level monitoring is disabled (the simulator may still enforce its own threshold).")
 parser.add_argument("--max-parallel", type=int, default=None,
                     help="Maximum --parallel value to start with. If omitted, defaults to min(half of CPU threads, replicates).")
 cli_args, _ = parser.parse_known_args()
+species = cli_args.species
 MAX_RAM_PERCENT = cli_args.max_ram_percent
+# default sample count (per-population copies to simulate when building SFS)
+samples = 10_000
 # We'll compute a sensible default for MAX_PARALLEL: at most half the available CPUs, but no more than replicates.
 REPLICATES = 5
 cpu_count = mp.cpu_count() or 1
@@ -112,8 +113,7 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
 
             # prepare base args; we'll modify --parallel dynamically on retries
             base_args = [
-                "python3",
-                "simulator.py",
+                 "simulator.py",
                 "--engine", "scrm",
                 "--species-id", str(species),
                 "--model-id", str(model_id),

@@ -3,8 +3,14 @@ import stdpopsim as sps
 import subprocess
 from tqdm import tqdm
 import shutil
+import argparse
 
-species = "Homo sapiens"
+# CLI: accept species as stdpopsim id or full name (e.g. 'HomSap' or 'Homo sapiens')
+parser = argparse.ArgumentParser(description="Train RAiSD-AI models for a species")
+parser.add_argument("--species", type=str, default="Homo sapiens",
+                    help="Species id (stdpopsim short id) or full name, e.g. 'HomSap' or 'Homo sapiens'.")
+args = parser.parse_args()
+species = args.species
 train_sample_individuals = 100
 train_replicates = 1_000
 sel_s = 0.1
