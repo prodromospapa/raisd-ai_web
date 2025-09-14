@@ -3434,7 +3434,16 @@ def _run_simulation_core(args):
                                 err_name = f"worker_err_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}.err"
                                 err_path = os.path.join(worker_tmp, err_name)
                                 with open(out_path, 'wb') as ofh, open(err_path, 'wb') as efh:
-                                    proc = subprocess.Popen(toks, stdout=ofh, stderr=efh, env=env, preexec_fn=pre)
+                                    # Ensure child process runs in the per-worker tmp directory so
+                                    # any auxiliary files created by external engines (e.g. Hudson
+                                    # 'seedms' from ms) are placed inside worker_tmp and removed
+                                    # during cleanup. This avoids leaving seed files in the repo
+                                    # when engine == 'ms'.
+                                    try:
+                                        proc = subprocess.Popen(toks, stdout=ofh, stderr=efh, env=env, preexec_fn=pre, cwd=worker_tmp)
+                                    except Exception:
+                                        # Fallback: if worker_tmp is invalid for cwd, run without cwd
+                                        proc = subprocess.Popen(toks, stdout=ofh, stderr=efh, env=env, preexec_fn=pre)
                                     _register_child_pid(proc.pid)
                                     # Optional external-worker peak sampler: monitor child pid RSS
                                     ext_peak_thread = None
