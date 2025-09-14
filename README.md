@@ -7,7 +7,7 @@ Overview
 This repository contains two related but distinct parts:
 
 - Training & simulation (data preparation)
-   - scripts that run population-genetic simulations, compute expected site-frequency spectra (SFS) for many stdpopsim demographic models, fetch gene annotations, and train RAiSD-AI models from simulated sweep/neutral examples.
+   - scripts that run population-genetic simulations, compute expected site-frequency spectra (SFS) for many demographic models, fetch gene annotations, and train RAiSD-AI models from simulated sweep/neutral examples.
 
 - Website & scanning (user-facing analysis)
    - a Flask-based web application that accepts user VCF/BCF uploads, matches the uploaded data to the best precomputed demographic model using projected SFS and JSD, runs RAiSD scans with the selected model, and presents interactive plots and metadata.
@@ -37,7 +37,7 @@ Requirements
 The repository's scripts call a mix of Python libraries and external executables. Based on imports and subprocess calls in the repository, you will likely need:
 
 - Python 3.9+ (recommended)
-- Python packages (examples): pandas, numpy, matplotlib, flask, werkzeug, pysam, stdpopsim, msprime, demes, tqdm, psutil, biomart
+-- Python packages (examples): pandas, numpy, matplotlib, flask, werkzeug, pysam, msprime, demes, tqdm, psutil, biomart
 - External executables:
    - `bcftools` (indexing, conversion, SFS extraction)
    - `RAiSD-AI` or `RAiSD-AI-ZLIB` / `RAiSD` (used for RAiSD scans and RAiSD-AI training)
@@ -54,7 +54,7 @@ RAiSD-AI Web Toolkit — Quick Start
 What this is
 ------------
 A compact toolkit to:
-- generate expected site-frequency spectra (SFS) for stdpopsim demographic models,
+- generate expected site-frequency spectra (SFS) for demographic models,
 - prepare training data and train RAiSD-AI models,
 - run a Flask web UI to analyze user VCF/BCF files with precomputed models.
 
