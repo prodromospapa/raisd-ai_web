@@ -7,6 +7,7 @@ from tqdm.auto import tqdm
 import stdpopsim
 import subprocess
 import time
+import sys
 import logging
 import signal
 import psutil
@@ -104,6 +105,7 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
 
             # prepare base args; we'll modify --parallel dynamically on retries
             base_args = [
+                "python3",
                 "simulator.py",
                 "--engine", "scrm",
                 "--species-id", str(species),
@@ -114,15 +116,24 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 "--replicates", "5",
                 "--parallel",
                 "--sfs", "sfs.sfs",
-                "--sfs-normalized"
+                "--sfs-normalized",
+                "--sims-per-work", "1",
+            
             ]
             # whether to include --sfs sfs.sfs in simulator args for this model/pop
             include_sfs = True
             current_parallel = MAX_PARALLEL
+            # default to single-replicate work per worker to minimize RAM
+            current_sims_per_work = 1
             skipped = False
+            attempts = 0
+            max_attempts = 6
+
             # We'll attempt runs, lowering parallel if RAM threshold is exceeded
-            while True:
+            while attempts < max_attempts:
+                attempts += 1
                 args = list(base_args)
+
                 # insert parallel value in the args list after the --parallel flag
                 try:
                     pi = args.index("--parallel")
@@ -130,119 +141,124 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 except ValueError:
                     args += ["--parallel", str(current_parallel)]
 
-                # start the subprocess
-                # build args list; include --sfs only if requested
-                if include_sfs:
-                    # insert sfs args right after the --parallel value later
-                    pass
-
-                if MAX_RAM_PERCENT is None or psutil is None:
-                    # no monitoring requested or psutil not available: run normally
+                # ensure sims-per-work is set to 1 (keep simple: user requested default 1)
+                if "--sims-per-work" not in args:
                     try:
-                        # ensure args include sfs if requested
-                        if include_sfs and "--sfs" not in args:
-                            try:
-                                pi = args.index("--parallel")
-                                args.insert(pi+2, "sfs.sfs")
-                                args.insert(pi+1, "--sfs")
-                            except Exception:
-                                args += ["--sfs", "sfs.sfs"]
-                        subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        break
-                    except subprocess.CalledProcessError:
-                        # fallback behavior: swap engine to scrm and retry once
-                        i = args.index("--engine")
-                        args[i+1] = "scrm"
-                        append_log(f"Warning: msprime failed for {model_id} {population}.")
-                        subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        break
-                else:
-                    # monitored run using psutil
-                    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    try:
-                        p = psutil.Process(proc.pid)
+                        pi = args.index("--parallel")
+                        args.insert(pi + 2, str(current_sims_per_work))
+                        args.insert(pi + 1, "--sims-per-work")
                     except Exception:
-                        p = None
+                        args += ["--sims-per-work", str(current_sims_per_work)]
 
-                    exceeded = False
+                # always pass max-ram-percent flag to simulator so it enforces the same threshold
+                if MAX_RAM_PERCENT is not None and "--max-ram-percent" not in args:
+                    args += ["--max-ram-percent", str(MAX_RAM_PERCENT)]
+
+                # ensure args include sfs if requested
+                if include_sfs and "--sfs" not in args:
                     try:
-                        # monitor until process ends
-                        while proc.poll() is None:
-                            if p is not None:
-                                try:
-                                    # check memory percent of process tree
-                                    mem = p.memory_percent()
-                                    # include children
-                                    for ch in p.children(recursive=True):
-                                        try:
-                                            mem += ch.memory_percent()
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    mem = 0.0
+                        pi = args.index("--parallel")
+                        args.insert(pi+2, "sfs.sfs")
+                        args.insert(pi+1, "--sfs")
+                    except Exception:
+                        args += ["--sfs", "sfs.sfs"]
 
-                                if MAX_RAM_PERCENT is not None and mem > MAX_RAM_PERCENT:
-                                    # exceed threshold: kill process tree and retry with lower parallel
-                                    exceeded = True
-                                    # terminate children first
-                                    for ch in p.children(recursive=True):
-                                        try:
-                                            ch.terminate()
-                                        except Exception:
-                                            pass
+                exceeded = False
+                rc = 1
+                proc = None
+                try:
+                    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    # If wrapper-level monitoring requested, watch the child process's RSS
+                    if MAX_RAM_PERCENT is not None and psutil is not None:
+                        try:
+                            p = psutil.Process(proc.pid)
+                            total = psutil.virtual_memory().total
+                            while proc.poll() is None:
+                                try:
+                                    rss = p.memory_info().rss
+                                    perc = rss / total * 100.0
+                                except Exception:
+                                    # fallback to psutil's percent method
                                     try:
-                                        p.terminate()
+                                        perc = p.memory_percent()
                                     except Exception:
-                                        pass
-                                    # give them a moment, then kill if needed
-                                    time.sleep(0.5)
-                                    for ch in p.children(recursive=True):
-                                        if ch.is_running():
-                                            try:
-                                                ch.kill()
-                                            except Exception:
-                                                pass
-                                    if p.is_running():
+                                        perc = 0.0
+                                if perc > MAX_RAM_PERCENT:
+                                    append_log(f"Memory exceeded {MAX_RAM_PERCENT}% ({perc:.1f}%) for {model_id} {population} at parallel={current_parallel} (pid={proc.pid}).")
+                                    exceeded = True
+                                    # try to terminate the process tree
+                                    try:
+                                        p.kill()
+                                    except Exception:
                                         try:
-                                            p.kill()
+                                            proc.kill()
                                         except Exception:
                                             pass
                                     break
-                            time.sleep(0.2)
-                    finally:
-                        # ensure subprocess is reaped
-                        try:
-                            proc.wait(timeout=1)
-                        except Exception:
+                                time.sleep(0.5)
+                        except psutil.NoSuchProcess:
+                            # process finished quickly
                             pass
-                    # after monitoring loop, decide what happened
-                    if exceeded:
-                        # Do not retry with a lower parallel: skip this model/population
-                        append_log(f"Skipped {model_id} {population}: exceeded RAM {MAX_RAM_PERCENT}% at parallel={current_parallel}; not retrying with lower parallel.")
-                        skipped = True
-                        break
-                    else:
-                        # process finished normally; check return code
-                        if proc.returncode == 0:
-                            break
-                        else:
-                            # non-zero exit: write warning and attempt with engine scrm once
+
+                    # wait for process to exit if not already
+                    if proc is not None:
+                        try:
+                            rc = proc.wait()
+                        except Exception:
                             try:
-                                i = args.index("--engine")
-                                args[i+1] = "scrm"
+                                proc.kill()
                             except Exception:
                                 pass
-                            append_log(f"Warning: simulator failed (rc={proc.returncode}) for {model_id} {population} at parallel={current_parallel}. Trying scrm.")
-                            # ensure sfs flag only present if requested
-                            if include_sfs and "--sfs" not in args:
-                                try:
-                                    pi = args.index("--parallel")
-                                    args.insert(pi+2, "sfs.sfs")
-                                    args.insert(pi+1, "--sfs")
-                                except Exception:
-                                    args += ["--sfs", "sfs.sfs"]
-                            subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            break
+                            rc = getattr(proc, 'returncode', 1)
+
+                except Exception as e:
+                    append_log(f"Exception while running simulator for {model_id} {population}: {e}")
+                    exceeded = False
+                    rc = getattr(proc, 'returncode', 1) if proc is not None else 1
+
+                # Decide next action based on whether memory was exceeded or process exit code
+                if exceeded:
+                    # reduce parallel and retry (keep sims-per-work=1)
+                    if current_parallel > 1:
+                        current_parallel -= 1
+                        append_log(f"Retrying with lower parallel: {current_parallel} (keeping --sims-per-work=1)")
+                        continue
+                    else:
+                        append_log(f"Skipped {model_id} {population}: exceeded RAM {MAX_RAM_PERCENT}% even at parallel=1 and --sims-per-work=1.")
+                        skipped = True
+                        break
+
+                # process finished without exceeding memory
+                if rc == 0:
+                    # success
+                    break
+                else:
+                    # non-zero exit: try swapping engine to scrm once (if not already), otherwise skip
+                    try:
+                        i = args.index("--engine")
+                        if args[i+1] != "scrm":
+                            args[i+1] = "scrm"
+                            append_log(f"Warning: simulator failed (rc={rc}) for {model_id} {population} at parallel={current_parallel}. Retrying with engine=scrm.")
+                            try:
+                                subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                rc = 0
+                                break
+                            except subprocess.CalledProcessError:
+                                rc = 1
+                        else:
+                            append_log(f"Warning: simulator failed (rc={rc}) for {model_id} {population} at parallel={current_parallel}.")
+                    except Exception:
+                        append_log(f"Warning: simulator failed (rc={rc}) for {model_id} {population} at parallel={current_parallel}.")
+
+                    # if we reach here, treat as failure and skip
+                    skipped = True
+                    break
+
+            else:
+                # exceeded max attempts
+                append_log(f"Giving up after {attempts} attempts for {model_id} {population}; marking skipped")
+                skipped = True
             if skipped:
                 # mark skipped row with NaNs to preserve index and continue
                 sfs.loc[f"{model_id}={population}"] = np.nan

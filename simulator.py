@@ -17,6 +17,15 @@ import gzip
 import concurrent.futures
 import stdpopsim as sps
 
+# optional progress bar (not required)
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    try:
+        from tqdm import tqdm
+    except Exception:
+        tqdm = None
+
 # Try to import demes.ms.to_ms once at module import time for reliability
 try:
     from demes.ms import to_ms as _demes_to_ms
@@ -2591,6 +2600,16 @@ def parse_args():
                 if threshold_pct is not None and used > float(threshold_pct):
                     # mark on args so the rest of the runner can react
                     try:
+                        # Close any active progress bar to avoid tqdm re-rendering
+                        try:
+                            pb = getattr(args_obj, '_progress_bar', None)
+                            if pb is not None:
+                                try:
+                                    pb.close()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                         setattr(args_obj, '_ram_exceeded', True)
                         sys.stderr.write(f"# ERROR: total system RAM usage {used:.1f}% exceeded threshold {threshold_pct}%. Aborting run.\n")
                         sys.stderr.write('# SUGGESTION: reduce --sims-per-work, sample size, --length, or --replicates.\n')
@@ -3550,11 +3569,52 @@ def _run_simulation_core(args):
         if args.progress and show_progress:
             if tqdm is not None:
                 bar_loc = tqdm(total=total_reps_loc, desc='replicates', unit='rep')
+                try:
+                    setattr(args, '_progress_bar', bar_loc)
+                except Exception:
+                    pass
             else:
                 if total_reps_loc == 1:
                     sys.stderr.write('# progress: 0/1\n')
                 else:
                     sys.stderr.write('# WARNING: --progress requested but tqdm not installed; using textual updates.\n')
+
+        # local helper to abort cleanly on RAM exceed: close progress bar then exit
+        def _abort_due_to_ram(msg=None):
+            try:
+                if bar_loc is not None:
+                    try:
+                        bar_loc.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # If caller provided an explicit message, use it; otherwise exit silently
+            # since the RAM monitor already prints the informative message and suggestion.
+            if msg:
+                raise SystemExit(msg)
+            else:
+                raise SystemExit()
+
+        # helper to update the progress bar only when RAM hasn't been exceeded
+        def _maybe_update_bar(delta=1):
+            """Safely update the progress UI.
+
+            If a tqdm bar is active, call its update method. Otherwise, emit
+            a textual progress line to stderr. Respect a RAM-exceeded flag
+            by no-op'ing when set.
+            """
+            try:
+                if getattr(args, '_ram_exceeded', False):
+                    return
+                if bar_loc is not None:
+                    try:
+                        bar_loc.update(delta)
+                    except Exception:
+                        # Best-effort: ignore progress update failures
+                        pass
+            except Exception:
+                pass
         # Special-case msprime: run each chunk in its own process (ProcessPool)
         # so msprime uses physical cores rather than Python threads.
         if engine == 'msprime':
@@ -3639,21 +3699,21 @@ def _run_simulation_core(args):
             max_proc = min(len(payloads), req_workers, phys_total)
 
             if getattr(args, '_ram_exceeded', False):
-                raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
+                _abort_due_to_ram()
             with concurrent.futures.ProcessPoolExecutor(max_workers=max_proc) as pex:
                 for i, (pld, envw) in enumerate(zip(payloads, envs)):
                     futs.append((i, pex.submit(_msprime_worker_run, pld, envw)))
                 for idx, fut in futs:
                     try:
                         if getattr(args, '_ram_exceeded', False):
-                            raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
+                            _abort_due_to_ram()
                         out_txt, err_txt, rc = fut.result()
                     except Exception as e:
                         out_txt, err_txt, rc = '', f'# ERROR: msprime worker failed in process: {e}\n', 1
                     results_loc.append((int(payloads[idx].get('rep_count',1)), out_txt, err_txt, (1 if rc else None), idx))
                     # Update progress
                     if bar_loc is not None:
-                        bar_loc.update(payloads[idx].get('rep_count', 1))
+                        _maybe_update_bar(payloads[idx].get('rep_count', 1))
                     elif args.progress and show_progress:
                         progress_done_loc += payloads[idx].get('rep_count', 1)
                         sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
@@ -3696,7 +3756,7 @@ def _run_simulation_core(args):
             if per_rep_mode_loc:
                 # Abort early if RAM monitor signalled an exceedance
                 if getattr(args, '_ram_exceeded', False):
-                    raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
+                    _abort_due_to_ram()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=threads_loc) as ex:
                     futs = []
                     rep_counter = 0
@@ -3706,7 +3766,7 @@ def _run_simulation_core(args):
                     for fut in concurrent.futures.as_completed(futs):
                         if getattr(args, '_ram_exceeded', False):
                             # stop waiting for remaining futures and abort
-                            raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
+                            _abort_due_to_ram()
                         rc, out, err, code, rep_idx = fut.result()
                         results_loc.append((rc, out, err, code, rep_idx))
                         # Attempt immediate cleanup of per-chunk tmpdir if set in env during the chunk
@@ -3740,7 +3800,7 @@ def _run_simulation_core(args):
                         except Exception:
                             pass
                         if bar_loc is not None:
-                            bar_loc.update(1)
+                            _maybe_update_bar(1)
                         elif args.progress and show_progress:
                             progress_done_loc += 1
                             sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
@@ -3750,25 +3810,25 @@ def _run_simulation_core(args):
                     rc, out, err, code, rep_idx = run_chunk_loc(chunks_loc[0], 0, 0)
                     results_loc.append((rc, out, err, code, rep_idx))
                     if bar_loc is not None:
-                        bar_loc.update(total_reps_loc)
+                        _maybe_update_bar(total_reps_loc)
                     elif args.progress and show_progress and total_reps_loc == 1:
                         sys.stderr.write('# progress: 1/1\n')
                 else:
                     # Abort early if RAM monitor signalled an exceedance
                     if getattr(args, '_ram_exceeded', False):
-                        raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
+                        _abort_due_to_ram()
                     with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks_loc)) as ex:
                         futs = [ex.submit(run_chunk_loc, c, i, i) for i, c in enumerate(chunks_loc)]
                         for fut in concurrent.futures.as_completed(futs):
                             if getattr(args, '_ram_exceeded', False):
-                                raise SystemExit('# ERROR: Aborted due to memory threshold exceeded. Reduce --sims-per-work, sample size, --length, or --replicates.')
+                                _abort_due_to_ram()
                             rc, out, err, code, rep_idx = fut.result()
                             results_loc.append((rc, out, err, code, rep_idx))
                             if bar_loc is not None:
                                 try:
-                                    bar_loc.update(int(rc))
+                                    _maybe_update_bar(int(rc))
                                 except Exception:
-                                    bar_loc.update(1)
+                                    _maybe_update_bar(1)
                             elif args.progress and show_progress:
                                 progress_done_loc += rc
                                 sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
