@@ -4,6 +4,8 @@ import subprocess
 from tqdm import tqdm
 import shutil
 import argparse
+import time
+import json
 
 # default thread count (safe when os.cpu_count() returns None)
 _cpu = os.cpu_count() or 2
@@ -11,7 +13,7 @@ _default_parallel = max(1, _cpu // 2)
 
 # CLI: accept species as stdpopsim id or full name (e.g. 'HomSap' or 'Homo sapiens')
 parser = argparse.ArgumentParser(description="Train RAiSD-AI models for a species")
-parser.add_argument("--species", type=str, default="Homo sapiens",
+parser.add_argument("--species", type=str, required=True,
                     help="Species id (stdpopsim short id) or full name, e.g. 'HomSap' or 'Homo sapiens'.")
 parser.add_argument("--train-sample-individuals", type=int, default=100,
                     help="Individuals per simulation (default 100)")
@@ -198,6 +200,47 @@ else:
 species_folder_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in str(species_full_name)).strip().replace(" ", "_")
 os.makedirs(os.path.join("data", species_folder_name), exist_ok=True)
 
+# shared skipped demographics file (JSON-lines, used by 3.sfs.py)
+skipped_file = os.path.join("data", species_folder_name, "skipped_demographics.jsonl")
+
+def load_skipped():
+    skipped = set()
+    try:
+        if os.path.exists(skipped_file):
+            with open(skipped_file, 'r', encoding='utf-8') as rf:
+                for line in rf:
+                    try:
+                        obj = json.loads(line)
+                        key = obj.get('key')
+                        if key:
+                            skipped.add(key)
+                    except Exception:
+                        # ignore malformed lines
+                        continue
+    except Exception:
+        pass
+    return skipped
+
+def append_skipped(key, reason='skipped', source='1.train'):
+    entry = {
+        'key': key,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'reason': reason,
+        'source': source,
+    }
+    try:
+        with open(skipped_file, 'a', encoding='utf-8') as wf:
+            wf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        try:
+            fallback = skipped_file.replace('.jsonl', '.txt')
+            with open(fallback, 'a') as lf:
+                lf.write(key + "\n")
+        except Exception:
+            pass
+
+existing_skipped = load_skipped()
+
 if species in species_dict.keys():
     species_id = species_dict[species]
 elif species in species_dict.values():
@@ -243,6 +286,13 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
     for model_id, populations in demographic_models.items():
         for population in populations:
             for chromosome in chromosomes:
+                key = f"{model_id}={population}"
+                if key in existing_skipped:
+                    total_bar.update(1)
+                    total_bar.refresh()
+                    # canonical skip list contains this key; no additional skip logging required
+                    continue
+
                 if _model_done(model_id, population, chromosome):
                     total_bar.update(1)
                     total_bar.refresh()

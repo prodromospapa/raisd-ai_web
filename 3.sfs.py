@@ -14,7 +14,7 @@ import psutil
 
 # CLI: species (stdpopsim id or full name) plus optional resource flags
 parser = argparse.ArgumentParser()
-parser.add_argument("--species", type=str, default="Homo sapiens",
+parser.add_argument("--species", type=str, required=True,
                     help="Species id (stdpopsim short id) or full name, e.g. 'HomSap' or 'Homo sapiens'.")
 parser.add_argument("--max-ram-percent", type=float, default=None,
                     help="If set, stop a simulator run when it exceeds this percent of total RAM; the run will be skipped (no lower-parallel retry). If omitted, wrapper-level monitoring is disabled (the simulator may still enforce its own threshold).")
@@ -90,6 +90,72 @@ ploidy = species_std.ploidy
 
 os.system(f'mkdir -p "data/{species_folder_name}"')
 
+# shared skipped demographics file
+skipped_file = f"data/{species_folder_name}/skipped_demographics.jsonl"
+
+import json
+
+def load_skipped():
+    skipped = set()
+    try:
+        if os.path.exists(skipped_file):
+            with open(skipped_file, 'r', encoding='utf-8') as rf:
+                for line in rf:
+                    try:
+                        obj = json.loads(line)
+                        key = obj.get('key')
+                        if key:
+                            skipped.add(key)
+                    except Exception:
+                        # ignore malformed lines
+                        continue
+    except Exception:
+        pass
+    return skipped
+
+def append_skipped(key, reason='skipped', source='3.sfs'):
+    entry = {
+        'key': key,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'reason': reason,
+        'source': source,
+    }
+    try:
+        with open(skipped_file, 'a', encoding='utf-8') as wf:
+            wf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        # fallback to writing a bare line in the old file location for maximum compatibility
+        try:
+            fallback = skipped_file.replace('.jsonl', '.txt')
+            with open(fallback, 'a') as lf:
+                lf.write(key + "\n")
+        except Exception:
+            try:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                with open(os.path.join(os.getcwd(), "check_sfs_models.log"), 'a') as lf:
+                    lf.write(f"[{ts}] Failed to write to skipped demographics file: {skipped_file}\n")
+            except Exception:
+                pass
+
+existing_skipped = load_skipped()
+
+# helper to append logs both to species folder and current working dir
+def append_log(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    species_log = f"data/{species_folder_name}/check_sfs_models.log"
+    local_log = os.path.join(os.getcwd(), "check_sfs_models.log")
+    try:
+        with open(species_log, "a") as wf:
+            wf.write(line)
+    except Exception:
+        pass
+    try:
+        with open(local_log, "a") as wf:
+            wf.write(line)
+    except Exception:
+        pass
+
 if os.path.exists(f"data/{species_folder_name}/sfs.csv"):
     sfs = pd.read_csv(f"data/{species_folder_name}/sfs.csv",index_col=0)
     samples = (sfs.shape[1] // ploidy)+1
@@ -103,7 +169,15 @@ total = sum(len(pops) for pops in demographic_models.values())
 with tqdm(total=total, desc="Simulations", unit="run") as pbar:
     for model_id, populations in demographic_models.items():
         for population in populations:
-            if f"{model_id}={population}" in sfs.index:
+            key = f"{model_id}={population}"
+            if key in existing_skipped:
+                pbar.update(1)
+                pbar.refresh()
+                first = False
+                append_log(f"Skipping {key} because it is listed in skipped_demographics.txt")
+                continue
+
+            if key in sfs.index:
                 pbar.update(1)
                 pbar.refresh()
                 first = False
@@ -287,23 +361,42 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 append_log(f"Giving up after {attempts} attempts for {model_id} {population}; marking skipped")
                 skipped = True
             if skipped:
-                # Do NOT add skipped demographics to the SFS CSV.
-                # Instead, record them in a dedicated skipped log file so they can be reviewed later.
-                skipped_log = f"data/{species_folder_name}/skipped_sfs.log"
-                msg = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Skipped {model_id} {population}: unable to produce SFS\n"
+                # Record the skip in the canonical JSONL skipped file and remove any existing data
                 try:
-                    with open(skipped_log, "a") as wf:
-                        wf.write(msg)
+                    append_skipped(key, reason='failed_to_produce_sfs', source='3.sfs')
+                    existing_skipped.add(key)
+                    # remove any previously created data for this demographic/population
+                    try:
+                        import shutil
+                        target_dir = os.path.join("data", species_folder_name, str(model_id), str(population))
+                        if os.path.exists(target_dir):
+                            shutil.rmtree(target_dir)
+                    except Exception:
+                        # keep going even if removal fails
+                        pass
                 except Exception:
-                    # fallback to append_log if we can't write the species-level skipped log
-                    append_log(f"Failed to write skipped log for {model_id} {population}; original message: {msg.strip()}")
-                # also append to the standard logs
-                append_log(f"Skipped {model_id} {population}: unable to produce SFS; recorded in {skipped_log}")
+                    # if we can't write the canonical skip, log an error for troubleshooting
+                    append_log(f"Failed to append {key} to {skipped_file}")
             else:
                 # only read sfs.sfs if it exists; otherwise do not pass it in future runs
                 if os.path.exists("sfs.sfs"):
                     try:
-                        sfs.loc[f"{model_id}={population}"] = read_sfs_file("sfs.sfs")
+                        vals = read_sfs_file("sfs.sfs")
+                        # if all zeros or empty, treat as skipped and do not add to CSV
+                        if vals is None or np.allclose(vals, 0):
+                            append_skipped(key, reason='all_zero_or_empty_sfs', source='3.sfs')
+                            existing_skipped.add(key)
+                            # remove any previously created data for this demographic/population
+                            try:
+                                import shutil
+                                target_dir = os.path.join("data", species_folder_name, str(model_id), str(population))
+                                if os.path.exists(target_dir):
+                                    shutil.rmtree(target_dir)
+                            except Exception:
+                                pass
+                            sfs.loc[f"{model_id}={population}"] = np.nan
+                        else:
+                            sfs.loc[f"{model_id}={population}"] = vals
                     except Exception:
                         append_log(f"Failed to read sfs.sfs for {model_id} {population}; treating as no SFS produced.")
                         sfs.loc[f"{model_id}={population}"] = np.nan

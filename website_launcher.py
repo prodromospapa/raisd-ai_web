@@ -137,6 +137,49 @@ BCFTOOLS = shutil.which("bcftools") or "bcftools"
 RAISD_AI = shutil.which("RAiSD-AI") or os.environ.get("RAISD_AI", "RAiSD-AI")
 RAISD_AI_ZLIB = shutil.which("RAiSD-AI-ZLIB") or os.environ.get("RAISD_AI_ZLIB", "RAiSD-AI-ZLIB")
 
+# GPU handling: allow starting the web app with --gpu to request GPU-accelerated
+# RAiSD-AI scanning. We detect GPUs at startup and record whether the platform
+# appears to have one. If the user requests --gpu but no GPU is present, we
+# will inform them and not pass the -gpu argument to the RAiSD executable.
+USE_GPU_FOR_RAISD = False
+_GPU_CHECKED = False
+_GPU_AVAILABLE = False
+
+def _detect_gpu() -> bool:
+    """Return True if a GPU device appears available on this host.
+
+    Detection is conservative and uses a few heuristics: nvidia-smi presence
+    and usable, /dev/nvidia0 device, or rocm-smi for ROCm systems. This avoids
+    importing heavy GPU libs and works without additional deps.
+    """
+    try:
+        # Fast check: nvidia-smi
+        nvsmi = shutil.which('nvidia-smi')
+        if nvsmi:
+            proc = subprocess.run([nvsmi, '-L'], capture_output=True, text=True, timeout=3)
+            if proc.returncode == 0 and proc.stdout and 'GPU' in proc.stdout:
+                return True
+        # Check for device node
+        if os.path.exists('/dev/nvidia0'):
+            return True
+        # ROCm / AMD: rocm-smi may exist
+        rmsmi = shutil.which('rocm-smi')
+        if rmsmi:
+            proc = subprocess.run([rmsmi, '--showproductname'], capture_output=True, text=True, timeout=3)
+            if proc.returncode == 0 and proc.stdout and proc.stdout.strip():
+                return True
+        # As a last resort, look for obvious PCI vendor strings (best-effort, may be slow)
+        lspci = shutil.which('lspci')
+        if lspci:
+            proc = subprocess.run([lspci], capture_output=True, text=True, timeout=3)
+            if proc.returncode == 0 and proc.stdout:
+                out = proc.stdout.lower()
+                if 'nvidia' in out or 'amd' in out or 'advanced micro devices' in out:
+                    return True
+    except Exception:
+        pass
+    return False
+
 # ---------------------- bcftools plugin helper ----------------------
 def _bcftools_env():
     env = os.environ.copy()
@@ -926,7 +969,7 @@ def run_raisd(run_dir: str, model_path: str, vcf_path: str, chromosome: int, gri
         name_base = 'results'
 
     cmd = [
-    ra_bin, '-n', name_base,
+        ra_bin, '-n', name_base,
         '-mdl', model_path,
         '-f',
         '-op', 'SWP-SCN',
@@ -936,6 +979,15 @@ def run_raisd(run_dir: str, model_path: str, vcf_path: str, chromosome: int, gri
         '-pci', '1', '1',
         '-R'
     ]
+    # Append -gpu if requested and a GPU is available. The USE_GPU_FOR_RAISD
+    # global is set at process startup when the user passed --gpu and a GPU
+    # was detected. If --gpu was requested but no GPU was found, USE_GPU_FOR_RAISD
+    # will be False and we will not add the flag.
+    try:
+        if USE_GPU_FOR_RAISD:
+            cmd.append('-gpu')
+    except Exception:
+        pass
     append_log(run_dir, f"Running RAiSD: {' '.join(cmd)}")
     proc = subprocess.run(cmd, cwd=run_dir, capture_output=True, text=True)
     try:
@@ -2405,10 +2457,34 @@ def upload():
     return json.dumps(payload), 200, {'Content-Type': 'application/json'}
 
 if __name__ == '__main__':
+    import argparse
     host = os.environ.get('HOST', '0.0.0.0')
     port = int(os.environ.get('PORT', '5000'))
     debug = bool(os.environ.get('FLASK_DEBUG', '0') == '1')
     threaded = bool(os.environ.get('FLASK_THREADED', '1') == '1')
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--gpu', dest='gpu', action='store_true', help='Request GPU-accelerated RAiSD-AI scanning when available')
+    # parse known args so we don't interfere with Flask's own argv handling
+    args, _others = parser.parse_known_args()
+    # Check if user requested GPU; if so, try to detect one. If none found, warn and ignore.
+    if args.gpu:
+        try:
+            available = _detect_gpu()
+        except Exception:
+            available = False
+        if available:
+            USE_GPU_FOR_RAISD = True
+            app.logger.info('GPU requested and appears available: RAiSD-AI will be invoked with -gpu')
+        else:
+            USE_GPU_FOR_RAISD = False
+            # Inform user immediately on stderr/stdout as well as app logger
+            msg = 'No GPU detected on this host; ignoring --gpu and running RAiSD on CPU.'
+            try:
+                print(msg)
+            except Exception:
+                pass
+            app.logger.warning(msg)
     # Validate host name/service before attempting to bind. Some environments set HOST
     # to values that cannot be resolved which leads to an immediate socket error like
     # "Name or service not known" when Flask attempts to start. Try a pre-check and

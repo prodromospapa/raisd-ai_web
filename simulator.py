@@ -5653,17 +5653,13 @@ def _run_simulation_core(args):
                         if seed_val_n is not None:
                             toks_loc.extend(['-seed', str(int(seed_val_n))])
                     elif neut_engine == 'ms':
-                        # Use ms -seeds s1 s2 s3
-                        if '-seeds' in toks_loc:
-                            try:
-                                idxs = [i for i,t in enumerate(toks_loc) if t=='-seeds']
-                                for idx in reversed(idxs):
-                                    del toks_loc[idx:idx+4]
-                            except Exception:
-                                pass
-                        if seed_val_n is not None:
-                            s1 = int(seed_val_n); s2 = s1 + 1; s3 = s1 + 2
-                            toks_loc.extend(['-seeds', str(s1), str(s2), str(s3)])
+                        # Intentionally avoid using ms -seeds here to prevent the
+                        # Hudson 'seedms' external seed file from being created.
+                        # We keep seeds_for_chunks_n for bookkeeping but do not
+                        # append '-seeds' to the command line. ms will use its
+                        # default RNG behavior (or the user can supply explicit
+                        # seeding elsewhere).
+                        pass
                     elif neut_engine == 'msprime':
                         # handled below in-process; nothing to append to toks_loc
                         pass
