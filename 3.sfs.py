@@ -18,13 +18,20 @@ samples = 10_000
 
 # CLI: allow optional max RAM percent enforcement
 parser = argparse.ArgumentParser()
-parser.add_argument("--max-ram-percent", type=float,default=50,
-                    help="If set, stop a simulator run when it exceeds this percent of total RAM; the run will be skipped (no lower-parallel retry).")
-parser.add_argument("--max-parallel", type=int, default=1,
-                    help="Maximum --parallel value to start with.")
+parser.add_argument("--max-ram-percent", type=float, default=None,
+                    help="If set, stop a simulator run when it exceeds this percent of total RAM; the run will be skipped (no lower-parallel retry). If omitted, wrapper-level monitoring is disabled (the simulator may still enforce its own threshold).")
+parser.add_argument("--max-parallel", type=int, default=None,
+                    help="Maximum --parallel value to start with. If omitted, defaults to min(half of CPU threads, replicates).")
 cli_args, _ = parser.parse_known_args()
 MAX_RAM_PERCENT = cli_args.max_ram_percent
-MAX_PARALLEL = cli_args.max_parallel
+# We'll compute a sensible default for MAX_PARALLEL: at most half the available CPUs, but no more than replicates.
+REPLICATES = 5
+cpu_count = mp.cpu_count() or 1
+default_parallel = max(1, cpu_count // 2)
+if cli_args.max_parallel is None:
+    MAX_PARALLEL = min(default_parallel, REPLICATES)
+else:
+    MAX_PARALLEL = cli_args.max_parallel
 
 # basic logger
 logger = logging.getLogger("check_sfs_models")
@@ -113,7 +120,7 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 "--pop-order", str(population),
                 "--sample-individuals", str(samples),
                 "--chromosome", "21",#str(biggest_chromosome),
-                "--replicates", "5",
+                "--replicates", str(REPLICATES),
                 "--parallel",
                 "--sfs", "sfs.sfs",
                 "--sfs-normalized",
