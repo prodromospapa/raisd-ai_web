@@ -71,7 +71,7 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
     if gpu:
         args.append("--gpu")
 
-    # run inside the target directory; if it fails, retry once using discoal and add --sweep-time 0.01
+    # run inside the target directory; if it fails, retry once using discoal and add --sweep-time (in generations)
     try:
         run_subprocess(args, out_dir, f"simulation {model_id}/{population}/{chromosome}")
     except SystemExit:
@@ -85,7 +85,10 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
             alt_args.extend(["--engine", "discoal"])
 
         if "--sweep-time" not in alt_args:
-            alt_args.extend(["--sweep-time", "0.01"])
+            # Previous scripts passed 0.01 in 4N units; simulator.py now expects generations ago.
+            # Assuming a typical N0 ~ 10,000, 0.01 (4N units) ≈ 0.01 * 4 * 10000 = 400 generations.
+            # Use 400 generations as a conservative fallback for the retry.
+            alt_args.extend(["--sweep-time", "400"])
 
         #print(f"Engine '{engine}' failed for {model_id}/{population}/{chromosome}; retrying once with 'discoal' and --sweep-time 0.01")
         run_subprocess(alt_args, out_dir, f"simulation {model_id}/{population}/{chromosome} (discoal retry)")

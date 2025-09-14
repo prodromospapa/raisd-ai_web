@@ -17,7 +17,7 @@ samples = 10_000
 
 # CLI: allow optional max RAM percent enforcement
 parser = argparse.ArgumentParser()
-parser.add_argument("--max-ram-percent", type=float,default=0.5,
+parser.add_argument("--max-ram-percent", type=float,default=50,
                     help="If set, stop a simulator run when it exceeds this percent of total RAM; the run will be skipped (no lower-parallel retry).")
 parser.add_argument("--max-parallel", type=int, default=1,
                     help="Maximum --parallel value to start with.")

@@ -1739,7 +1739,7 @@ def compute_sfs_stream_mean(ms_text, n_hap_expected, normalized=False, use_temp_
 
 def build_discoal_command(*, species, model_id, user_order, individual_counts, discoal_pop0,
                           reps, length, max_fold_per_step, sweep_time, x, s=None, min_snps=None, chr_name=None,
-                          disable_en_ladder=False, seed=None):
+                          disable_en_ladder=False, seed=None, time_units='gens'):
     sp = sps.get_species(species)
     model = sp.get_demographic_model(model_id)
     # Prefer mutation rate specified on the demographic model if present
@@ -1862,8 +1862,7 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
         rho   = 2.0 * ploidy * N0 * rrate * length
 
     sel_args = []
-    # discoal -ws t x a : discoal expects t in coalescent units (4N generations).
-    # The user now provides --sweep-time in generations ago; convert to t_4N = gen / (4*N0).
+    # discoal -ws t x a : t interpreted here as ORIGIN time (when allele became beneficial) per user spec.
     # If user supplied per-generation s, compute 2Ns using N0
     if s is not None:
         try:
@@ -1872,18 +1871,17 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
             raise SystemExit('ERROR: Failed to convert --sel-s to 2Ns using N0.')
     else:
         a = None
-
-    # Convert sweep_time from generations to discoal units (4N gens)
-    sweep_time_gen = sweep_time  # may be None
+    # Interpret sweep_time according to time_units
+    sweep_time_user = sweep_time
     sweep_time_4N = None
-    if sweep_time_gen is not None:
-        try:
-            # Ensure N0 is positive
-            if not (N0 and float(N0) > 0):
-                raise Exception('Invalid N0 for conversion')
-            sweep_time_4N = float(sweep_time_gen) / (4.0 * float(N0))
-        except Exception:
-            raise SystemExit('ERROR: Failed to convert --sweep-time (generations) to discoal 4N units using N0.')
+    if sweep_time_user is not None:
+        if time_units == 'gens':
+            try:
+                sweep_time_4N = float(sweep_time_user) / (4.0 * float(N0))
+            except Exception:
+                raise SystemExit('ERROR: Failed to convert --sweep-time (generations) to discoal 4N units using N0.')
+        else:  # time_units == '4N'
+            sweep_time_4N = float(sweep_time_user)
 
     if (a is not None) and (sweep_time_4N is not None):
         if x is None:
@@ -1903,11 +1901,9 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
         'demog': demog_0b, 'pop_order': desired_disc_order, 'pop0': discoal_pop0,
         'ploidy': ploidy, 'sel_args': sel_args, 'length': length,
         'chromosome': chr_name if chr_name else None, 'species_id': species,
-    'sweep_pos': x if sel_args else None,
-    'sel_2Ns': a if sel_args else None,
-    # Store both the user-provided generations and the converted discoal 4N units
-    'sweep_time_gen': sweep_time_gen if sel_args else None,
-    'sweep_time_4N': sweep_time_4N if sel_args else None,
+        'sweep_pos': x if sel_args else None,
+        'sel_2Ns': a if sel_args else None,
+        'sweep_time': sweep_time if sel_args else None,
         'fixation_time': None,
         'growth_discretization': {
             'requested_disable': bool(disable_en_ladder),
@@ -2267,7 +2263,7 @@ def build_msprime_command(*, species, model_id, user_order, individual_counts, p
 def build_msms_command(*, species, model_id, user_order, individual_counts, pop0,
                        reps, length, max_fold_per_step, chr_name=None,
                        min_snps=None, disable_en_ladder=False, a=None, s=None, x=None,
-                       fixation_time=0.0, seed=None):
+                       fixation_time=0.0, seed=None, time_units='gens'):
     sp = sps.get_species(species)
     model = sp.get_demographic_model(model_id)
     raw_demog = model.model
@@ -2393,7 +2389,21 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
             t_duration = math.log(a) / a
         else:
             t_duration = math.log(1.0 + a) / a
-        tstart = t_duration + (fixation_time or 0.0)
+        # interpret fixation_time according to time_units
+        fixation_time_gen = None
+        fixation_time_4N = 0.0
+        if fixation_time is not None:
+            if time_units == 'gens':
+                fixation_time_gen = fixation_time
+                try:
+                    if not (N0 and float(N0) > 0):
+                        raise Exception('Invalid N0 for conversion')
+                    fixation_time_4N = float(fixation_time_gen) / (4.0 * float(N0))
+                except Exception:
+                    raise SystemExit('ERROR: Failed to convert --fixation-time (generations) to 4N units using N0.')
+            else:
+                fixation_time_4N = float(fixation_time)
+        tstart = t_duration + (fixation_time_4N or 0.0)
         f0 = max(1.0 / (2.0 * N0), 1e-6)
         init_freqs = ['0'] * npop
         sel_deme_index = desired_order.index(pop0)  # 0-based index into our order list
@@ -2531,8 +2541,10 @@ def parse_args():
     sg.add_argument('--sweep-pop', dest='discoal_pop0', help='Sweep population (discoal/msms). Ignored for ms.')
     sg.add_argument('--sweep-pos', dest='x', type=float, help='Selected site position in (0,1) (required for discoal/msms). Ignored for ms.')
     sg.add_argument('--sel-s', dest='s', type=float, help='Selection coefficient s per generation (required for discoal/msms). Converted to 2Ns using present-size N for the sweep population. Ignored for ms.')
-    sg.add_argument('--sweep-time', dest='sweep_time', type=float, help='Origin time in generations ago when allele became beneficial (discoal only).')
-    sg.add_argument('--fixation-time', dest='fix_time', type=float, default=0.0, help='Fixation time back in 4N units (msms only; default 0=present).')
+    sg.add_argument('--sweep-time', dest='sweep_time', type=float, help='Origin time for the allele (units set by --time-units; default gens).')
+    sg.add_argument('--fixation-time', dest='fix_time', type=float, default=0.0, help='Fixation time back (units set by --time-units; default gens=generations ago).')
+    sg.add_argument('--time-units', dest='time_units', choices=['gens','4N'], default='gens',
+                   help="Units for --sweep-time and --fixation-time: 'gens' = generations ago, '4N' = coalescent units (4N generations). Default: gens.")
 
     args = ap.parse_args()
     # No legacy debug flag; use --show-command for previews.
@@ -2785,9 +2797,9 @@ def _run_simulation_core(args):
         user_attempted_selection = any(getattr(args, n) is not None for n in ('sweep_time','s','x'))
         if user_attempted_selection:
             if args.sweep_time is None or getattr(args, 's', None) is None or args.x is None:
-                sys.exit('ERROR: discoal sweep requires --sweep-time (in generations), --sel-s, and --sweep-pos.')
+                sys.exit('ERROR: discoal sweep requires --sweep-time, --sel-s, and --sweep-pos.')
             if args.sweep_time < 0:
-                sys.exit('ERROR: --sweep-time must be >= 0 (generations ago).')
+                sys.exit('ERROR: --sweep-time must be >= 0.')
         else:
             sys.stderr.write('# INFO: No sweep parameters supplied; running neutral discoal simulation.\n')
     elif engine == 'msms':
@@ -2811,7 +2823,7 @@ def _run_simulation_core(args):
                 discoal_pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, sweep_time=getattr(args,'sweep_time',None),
                 x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=min_snps_forward, chr_name=args.chromosome,
-                disable_en_ladder=args.no_en_ladder, seed=None,
+                disable_en_ladder=args.no_en_ladder, seed=None, time_units=getattr(args,'time_units','gens'),
             )
         elif engine_name == 'msms':
             cmd, meta_local = build_msms_command(
@@ -2819,7 +2831,7 @@ def _run_simulation_core(args):
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
                 min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder,
-                a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), seed=None,
+                a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), seed=None, time_units=getattr(args,'time_units','gens'),
             )
         elif engine_name == 'scrm':
             cmd, meta_local = build_scrm_command(
@@ -2930,7 +2942,7 @@ def _run_simulation_core(args):
             discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, sweep_time=getattr(args,'sweep_time',None),
             x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=args.min_snps, chr_name=args.chromosome,
-            disable_en_ladder=args.no_en_ladder, seed=None,
+            disable_en_ladder=args.no_en_ladder, seed=None, time_units=getattr(args,'time_units','gens'),
         )
     elif engine == 'msms':
         sim_cmd, meta = build_msms_command(
@@ -2938,7 +2950,7 @@ def _run_simulation_core(args):
             pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
             min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder,
-            a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), seed=None,
+            a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), seed=None, time_units=getattr(args,'time_units','gens'),
         )
     else:
         # ms neutral only: selection flags were already warned & ignored in parse_args.
@@ -5161,12 +5173,12 @@ def _run_simulation_core(args):
                 neut_cmd, neut_meta = build_discoal_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
                     sweep_time=None, x=None, s=None, min_snps=None, chr_name=args.chromosome, disable_en_ladder=args.no_en_ladder,
-                    seed=neut_seed)
+                    seed=neut_seed, time_units=getattr(args,'time_units','gens'))
             elif neut_engine=='msms':
                 neut_cmd, neut_meta = build_msms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
                     chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, a=None, s=None, x=None, fixation_time=0.0,
-                    seed=neut_seed)
+                    seed=neut_seed, time_units=getattr(args,'time_units','gens'))
             elif neut_engine=='ms':
                 neut_cmd, neut_meta = build_ms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
