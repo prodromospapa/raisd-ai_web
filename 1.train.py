@@ -5,27 +5,48 @@ from tqdm import tqdm
 import shutil
 import argparse
 
+# default thread count (safe when os.cpu_count() returns None)
+_cpu = os.cpu_count() or 2
+_default_parallel = max(1, _cpu // 2)
+
 # CLI: accept species as stdpopsim id or full name (e.g. 'HomSap' or 'Homo sapiens')
 parser = argparse.ArgumentParser(description="Train RAiSD-AI models for a species")
 parser.add_argument("--species", type=str, default="Homo sapiens",
                     help="Species id (stdpopsim short id) or full name, e.g. 'HomSap' or 'Homo sapiens'.")
+parser.add_argument("--train-sample-individuals", type=int, default=100,
+                    help="Individuals per simulation (default 100)")
+parser.add_argument("--train-replicates", type=int, default=1000,
+                    help="Number of replicates per model (default 1000)")
+parser.add_argument("--sel-s", type=float, default=0.1,
+                    help="Selection coefficient used for sweep sims (default 0.1)")
+parser.add_argument("--window", type=int, default=500,
+                    help="Window size used to choose target SNPs (default 500)")
+parser.add_argument("--ips", type=int, default=11,
+                    help="ips parameter for RAiSD image generation (default 11)")
+parser.add_argument("--iws", type=int, default=10,
+                    help="iws parameter for RAiSD image generation (default 10)")
+parser.add_argument("--epochs", type=int, default=3,
+                    help="Training epochs for RAiSD-AI (default 3)")
+parser.add_argument("--gpu", action='store_true', default=False,
+                    help="Enable GPU mode for simulator/training when supported")
+parser.add_argument("--parallel", type=int, default=_default_parallel,
+                    help=f"Parallel worker count for simulator runs (default {_default_parallel})")
+parser.add_argument("--engine", type=str, default="msms",
+                    help="Simulation engine to use (default: msms)")
 args = parser.parse_args()
+
 species = args.species
-train_sample_individuals = 100
-train_replicates = 1_000
-sel_s = 0.1
+train_sample_individuals = args.train_sample_individuals
+train_replicates = args.train_replicates
+sel_s = args.sel_s
 
-window = 500
-ips = 11 # odd
-iws = 10
-epochs = 3
-gpu = False
-
-# default thread count (safe when os.cpu_count() returns None)
-_cpu = os.cpu_count() or 2
-parallel = max(1, _cpu // 2)
-
-engine = "msms"
+window = args.window
+ips = args.ips
+iws = args.iws
+epochs = args.epochs
+gpu = args.gpu
+parallel = args.parallel
+engine = args.engine
 
 
 def run_subprocess(args, cwd, desc):

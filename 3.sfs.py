@@ -20,13 +20,31 @@ parser.add_argument("--max-ram-percent", type=float, default=None,
                     help="If set, stop a simulator run when it exceeds this percent of total RAM; the run will be skipped (no lower-parallel retry). If omitted, wrapper-level monitoring is disabled (the simulator may still enforce its own threshold).")
 parser.add_argument("--max-parallel", type=int, default=None,
                     help="Maximum --parallel value to start with. If omitted, defaults to min(half of CPU threads, replicates).")
+parser.add_argument("--samples", type=int, default=10000,
+                    help="Number of haploid samples per population to request when building the SFS (default: 10000).")
+parser.add_argument("--replicates", type=int, default=5,
+                    help="Number of replicates to request from the simulator for each model/population when building SFS (default: 5).")
+parser.add_argument("--engine", type=str, default="scrm",
+                    help="Default simulator engine to request (default: scrm).")
+parser.add_argument("--chromosome", type=str, default="21",
+                    help="Chromosome id to simulate; defaults to the largest chromosome if not set (default: 21).")
+parser.add_argument("--sims-per-work", type=int, default=1,
+                    help="Number of sims per worker (default: 1).")
+# sfs filename and normalization are fixed for SFS generation (not CLI options)
 cli_args, _ = parser.parse_known_args()
 species = cli_args.species
 MAX_RAM_PERCENT = cli_args.max_ram_percent
 # default sample count (per-population copies to simulate when building SFS)
-samples = 10_000
+samples = cli_args.samples
+REPLICATES = cli_args.replicates
+engine_default = cli_args.engine
+chromosome = cli_args.chromosome
+current_sims_per_work = cli_args.sims_per_work
+# sfs filename and normalization are fixed for SFS generation
+# Request normalized SFS by default and use the standard filename.
+sfs_filename = "sfs.sfs"
+sfs_normalized_flag = True
 # We'll compute a sensible default for MAX_PARALLEL: at most half the available CPUs, but no more than replicates.
-REPLICATES = 5
 cpu_count = mp.cpu_count() or 1
 default_parallel = max(1, cpu_count // 2)
 if cli_args.max_parallel is None:
@@ -114,24 +132,26 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
             # prepare base args; we'll modify --parallel dynamically on retries
             base_args = [
                  "simulator.py",
-                "--engine", "scrm",
+                "--engine", str(engine_default),
                 "--species-id", str(species),
                 "--model-id", str(model_id),
                 "--pop-order", str(population),
                 "--sample-individuals", str(samples),
-                "--chromosome", "21",#str(biggest_chromosome),
+                "--chromosome", str(chromosome),
                 "--replicates", str(REPLICATES),
                 "--parallel",
-                "--sfs", "sfs.sfs",
-                "--sfs-normalized",
-                "--sims-per-work", "1",
-            
             ]
+            # optionally include SFS arguments
+            if sfs_filename:
+                base_args += ["--sfs", str(sfs_filename)]
+            if sfs_normalized_flag:
+                base_args += ["--sfs-normalized"]
+            # include sims-per-work
+            base_args += ["--sims-per-work", str(current_sims_per_work)]
             # whether to include --sfs sfs.sfs in simulator args for this model/pop
             include_sfs = True
             current_parallel = MAX_PARALLEL
-            # default to single-replicate work per worker to minimize RAM
-            current_sims_per_work = 1
+            # current_sims_per_work is set from CLI (default 1)
             skipped = False
             attempts = 0
             max_attempts = 6
