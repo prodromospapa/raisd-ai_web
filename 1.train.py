@@ -211,26 +211,22 @@ def load_skipped():
         pass
     return skipped
 
-def append_skipped(key, reason='skipped', source='1.train'):
-    entry = {
-        'key': key,
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'reason': reason,
-        'source': source,
-    }
+def remove_from_sfs_csv_if_present(species_folder_name, key):
+    """If data/<species>/sfs.csv exists, remove row matching `key` (index like 'model=pop')."""
     try:
-        with open(skipped_file, 'a', encoding='utf-8') as wf:
-            wf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        import pandas as _pd
     except Exception:
-        try:
-            fallback = skipped_file.replace('.jsonl', '.txt')
-            with open(fallback, 'a') as lf:
-                lf.write(key + "\n")
-        except Exception:
-            try:
-                print(f"Failed to write failed parts to {skipped_file}", flush=True)
-            except Exception:
-                pass
+        return
+    csv_path = os.path.join("data", species_folder_name, "sfs.csv")
+    try:
+        if os.path.exists(csv_path):
+            df = _pd.read_csv(csv_path, index_col=0)
+            if key in df.index:
+                df = df.drop(index=key)
+                df.to_csv(csv_path)
+    except Exception:
+        # best-effort: ignore any problems here
+        pass
 
 existing_skipped = load_skipped()
 
@@ -280,6 +276,22 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
         for population in populations:
             for chromosome in chromosomes:
                 key = f"{model_id}={population}"
+                # refresh skipped set on each iteration to catch skips written by other processes
+                try:
+                    latest_skipped = load_skipped()
+                    # any newly recorded skipped keys should be removed from sfs.csv to keep bookkeeping consistent
+                    new_skips = latest_skipped - existing_skipped
+                    for nk in new_skips:
+                        try:
+                            remove_from_sfs_csv_if_present(species_folder_name, nk)
+                        except Exception:
+                            pass
+                    # update the in-memory set
+                    existing_skipped.update(latest_skipped)
+                except Exception:
+                    # if we fail to reload skipped file, fall back to previously loaded set
+                    pass
+
                 if key in existing_skipped:
                     total_bar.update(1)
                     total_bar.refresh()
