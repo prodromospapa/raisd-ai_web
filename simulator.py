@@ -6399,7 +6399,11 @@ def _run_simulation_core(args):
                                 cur_n.append(ln)
                             if cur_n:
                                 blocks_n.append(''.join(cur_n))
+                            seg_hdr_pat_n = re.compile(r'^\s*segsites\s*:', re.IGNORECASE | re.MULTILINE)
                             for blk in blocks_n:
+                                # Skip blocks that don't contain any segsites header
+                                if not seg_hdr_pat_n.search(blk or ''):
+                                    continue
                                 vtxt = ms_like_to_vcf(blk, neut_meta['length'], chrom=neut_meta.get('chromosome') or 'chr1', ploidy=neut_meta.get('ploidy',1))
                                 vcf_lines = vtxt.splitlines()
                                 meta_lines_neut = _build_neut_vcf_meta_lines()
