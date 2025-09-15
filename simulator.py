@@ -3958,9 +3958,16 @@ def _run_simulation_core(args):
                         except Exception:
                             pass
                         if bar_loc is not None:
-                            _maybe_update_bar(1)
+                            # rc is the number of replicates executed in this chunk
+                            try:
+                                _maybe_update_bar(int(rc))
+                            except Exception:
+                                _maybe_update_bar(1)
                         elif args.progress and show_progress:
-                            progress_done_loc += 1
+                            try:
+                                progress_done_loc += int(rc)
+                            except Exception:
+                                progress_done_loc += 1
                             sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
                 results_loc.sort(key=lambda x: (x[4] if len(x) > 4 else 0))
             else:
@@ -3991,7 +3998,10 @@ def _run_simulation_core(args):
                                 except Exception:
                                     _maybe_update_bar(1)
                             elif args.progress and show_progress:
-                                progress_done_loc += rc
+                                try:
+                                    progress_done_loc += int(rc)
+                                except Exception:
+                                    progress_done_loc += 1
                                 sys.stderr.write(f'# progress: {progress_done_loc}/{total_reps_loc}\n')
         if bar_loc is not None:
             bar_loc.close()
