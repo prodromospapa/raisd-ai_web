@@ -144,7 +144,9 @@ def append_log(msg: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     try:
-        print(line, flush=True)
+        # Do not print warnings about skips to the terminal per user request.
+        # Keep a minimal info-level log via the logger only.
+        logger.info(msg)
     except Exception:
         # As a last resort, fall back to logger which may be configured by caller
         try:
@@ -344,18 +346,21 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 try:
                     append_skipped(key, reason='failed_to_produce_sfs', source='3.sfs')
                     existing_skipped.add(key)
-                    # remove any previously created data for this demographic/population
-                    try:
-                        import shutil
-                        target_dir = os.path.join("data", species_folder_name, str(model_id), str(population))
-                        if os.path.exists(target_dir):
-                            shutil.rmtree(target_dir)
-                    except Exception:
-                        # keep going even if removal fails
-                        pass
                 except Exception:
-                    # if we can't write the canonical skip, log an error for troubleshooting
-                    append_log(f"Failed to append {key} to {skipped_file}")
+                    # if we can't write the canonical skip, log an error for troubleshooting via logger
+                    logger.error(f"Failed to append {key} to {skipped_file}")
+                # remove any previously created data for this demographic/population (best-effort)
+                try:
+                    import shutil
+                    target_dir = os.path.join("data", species_folder_name, str(model_id), str(population))
+                    if os.path.exists(target_dir):
+                        shutil.rmtree(target_dir)
+                except Exception:
+                    # keep going even if removal fails
+                    try:
+                        logger.debug(f"Failed to remove target_dir {target_dir}", exc_info=True)
+                    except Exception:
+                        logger.debug("Failed to remove target_dir (target_dir undefined)", exc_info=True)
             else:
                 # only read sfs.sfs if it exists; otherwise do not pass it in future runs
                 if os.path.exists("sfs.sfs"):
@@ -363,17 +368,20 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                         vals = read_sfs_file("sfs.sfs")
                         # if all zeros or empty, treat as skipped and do not add to CSV
                         if vals is None or np.allclose(vals, 0):
-                            append_skipped(key, reason='all_zero_or_empty_sfs', source='3.sfs')
-                            existing_skipped.add(key)
-                            # remove any previously created data for this demographic/population
-                            try:
-                                import shutil
-                                target_dir = os.path.join("data", species_folder_name, str(model_id), str(population))
-                                if os.path.exists(target_dir):
-                                    shutil.rmtree(target_dir)
-                            except Exception:
-                                pass
-                            sfs.loc[f"{model_id}={population}"] = np.nan
+                                append_skipped(key, reason='all_zero_or_empty_sfs', source='3.sfs')
+                                existing_skipped.add(key)
+                                # remove any previously created data for this demographic/population
+                                try:
+                                    import shutil
+                                    target_dir = os.path.join("data", species_folder_name, str(model_id), str(population))
+                                    if os.path.exists(target_dir):
+                                        shutil.rmtree(target_dir)
+                                except Exception:
+                                    try:
+                                        logger.debug(f"Failed to remove target_dir {target_dir}", exc_info=True)
+                                    except Exception:
+                                        logger.debug("Failed to remove target_dir (target_dir undefined)", exc_info=True)
+                                sfs.loc[f"{model_id}={population}"] = np.nan
                         else:
                             sfs.loc[f"{model_id}={population}"] = vals
                     except Exception:

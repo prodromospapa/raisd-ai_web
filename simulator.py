@@ -130,6 +130,9 @@ def to_ms(graph, N0=1.0, samples=None):
     base = f"-I {npop} " + ' '.join(str(int(s)) for s in samples)
     return base
 def strip_I_block(ms_cmd):
+    base = f"-I {npop} " + ' '.join(str(int(s)) for s in samples)
+    return base
+def strip_I_block(ms_cmd):
     toks = ms_cmd.split()
     if '-I' not in toks:
         return ms_cmd
@@ -228,6 +231,15 @@ def shift_to_0_based(ms_cmd):
                 i += 5; continue
             except ValueError:
                 pass
+        # Attempt to stop any spawned watcher process (best-effort)
+        try:
+            if _TMP_WATCHER_PID:
+                try:
+                    os.kill(_TMP_WATCHER_PID, signal.SIGTERM)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         if t == '-m' and i + 3 < len(toks):
             # migration rate: -m i j rate  (convert population indices to 0-based)
             try:
@@ -477,6 +489,76 @@ def _run_and_register(*popen_args, **popen_kwargs):
 # Use a per-run temporary directory placed next to this script so callers
 # can inspect files if needed and so cleanup can remove the entire folder.
 _LOCAL_TMP_ROOT = None
+_TMP_WATCHER_PID = None
+# Lock to make local tmpdir creation thread-safe (avoid races when multiple
+# workers try to create/cleanup the same repo-local tmpdir simultaneously).
+try:
+    _LOCAL_TMP_LOCK = threading.Lock()
+except Exception:
+    _LOCAL_TMP_LOCK = None
+
+
+def _is_process_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _spawn_tmp_watcher(tmp_path, parent_pid):
+    """Spawn a detached watcher that removes tmp_path if parent_pid dies.
+
+    This forks a child process that detaches and monitors the parent.
+    It's best-effort: it will remove the directory unless
+    SIMULATOR_PRESERVE_TMP is set.
+    """
+    global _TMP_WATCHER_PID
+    if not tmp_path or not os.path.isdir(tmp_path):
+        return
+    # If a watcher is already recorded and alive, avoid spawning another one.
+    try:
+        global _TMP_WATCHER_PID
+        if _TMP_WATCHER_PID and _is_process_alive(_TMP_WATCHER_PID):
+            return
+    except Exception:
+        pass
+    try:
+        pid = os.fork()
+    except OSError:
+        return
+    if pid > 0:
+        # parent: record watcher pid
+        _TMP_WATCHER_PID = pid
+        return
+    # child: detach
+    try:
+        os.setsid()
+    except Exception:
+        pass
+    try:
+        # loop until parent disappears
+        while True:
+            if not _is_process_alive(parent_pid) or os.getppid() == 1:
+                break
+            time.sleep(0.5)
+    except Exception:
+        pass
+    # attempt removal: only remove the specific run tmp_path. Do NOT remove
+    # the shared parent '.tmp' directory — that can race with other runs and
+    # cause unrelated run folders to be deleted by older watchers.
+    try:
+        if os.path.isdir(tmp_path) and not os.environ.get('SIMULATOR_PRESERVE_TMP'):
+            try:
+                shutil.rmtree(tmp_path, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        os._exit(0)
+    except Exception:
+        os._exit(0)
 
 def _ensure_local_tmpdir():
     """Create and return a local tmp directory inside the simulator script dir.
@@ -495,8 +577,19 @@ def _ensure_local_tmpdir():
         except Exception:
             # fallback to normal behaviour
             pass
-    if _LOCAL_TMP_ROOT and os.path.isdir(_LOCAL_TMP_ROOT):
-        return _LOCAL_TMP_ROOT
+    # Fast path + guard: if already created, return it. Use a lock to avoid
+    # races between concurrent callers creating the same repo-local tmpdir.
+    try:
+        if _LOCAL_TMP_LOCK:
+            _LOCAL_TMP_LOCK.acquire()
+        if _LOCAL_TMP_ROOT and os.path.isdir(_LOCAL_TMP_ROOT):
+            return _LOCAL_TMP_ROOT
+    finally:
+        try:
+            if _LOCAL_TMP_LOCK:
+                _LOCAL_TMP_LOCK.release()
+        except Exception:
+            pass
     try:
         base = os.path.dirname(__file__) or os.getcwd()
     except Exception:
@@ -551,18 +644,36 @@ def _ensure_local_tmpdir():
                 if os.environ.get('SIMULATOR_DEBUG_TMP'):
                     sys.stderr.write(f"DEBUG: using system tmpdir: {_LOCAL_TMP_ROOT}\n")
                     sys.stderr.flush()
+                try:
+                    _spawn_tmp_watcher(_LOCAL_TMP_ROOT, os.getpid())
+                except Exception:
+                    pass
                 return _LOCAL_TMP_ROOT
             except Exception:
                 pass
 
         # fallback to repo-local hidden '.tmp' parent with per-run subfolder
         try:
-            os.makedirs(repo_parent, exist_ok=True)
-            os.makedirs(path, exist_ok=True)
-            _LOCAL_TMP_ROOT = path
+            # Use a few retries to tolerate transient filesystem races (e.g. NFS or concurrent processes)
+            created = False
+            for attempt in range(3):
+                try:
+                    os.makedirs(repo_parent, exist_ok=True)
+                    os.makedirs(path, exist_ok=True)
+                    _LOCAL_TMP_ROOT = path
+                    created = True
+                    break
+                except Exception:
+                    time.sleep(0.05 + 0.05 * attempt)
+            if not created:
+                raise
             if os.environ.get('SIMULATOR_DEBUG_TMP'):
                 sys.stderr.write(f"DEBUG: using repo-local tmpdir: {_LOCAL_TMP_ROOT}\n")
                 sys.stderr.flush()
+            try:
+                _spawn_tmp_watcher(_LOCAL_TMP_ROOT, os.getpid())
+            except Exception:
+                pass
         except Exception:
             # final fallback to system tempdir
             _LOCAL_TMP_ROOT = tempfile.gettempdir()
@@ -616,9 +727,24 @@ def _cleanup_local_tmpdir():
                     sys.stderr.flush()
                 except Exception:
                     pass
+        # Also support system tmp names created by this helper
+        elif os.path.basename(_LOCAL_TMP_ROOT).startswith('simulator_tmp_') and os.path.isdir(_LOCAL_TMP_ROOT):
+            shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
+            if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                try:
+                    sys.stderr.write(f"DEBUG: removed system tmpdir: {_LOCAL_TMP_ROOT}\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
+        # ensure watcher pid reference is cleared on cleanup
+        try:
+            global _TMP_WATCHER_PID
+            _TMP_WATCHER_PID = None
+        except Exception:
+            pass
         _LOCAL_TMP_ROOT = None
 
 
@@ -2530,9 +2656,11 @@ def parse_args():
     g.add_argument('--parallel', dest='parallel', type=int, default=1,
                    help="Parallel workers for replicate chunks.")
     g.add_argument('--sims-per-work', dest='sims_per_work', type=int, default=None,
-                   help=("Number of simulation replicates assigned to each parallel worker (per core/thread). "
-                         "Default is computed from --parallel splitting (uses the maximum chunk size from the automatic split). "
-                         "Minimum 1; values above the computed maximum will be capped and a message printed."))
+             help=("Number of simulation replicates to group per worker invocation (per core/thread) for external engines. "
+                 "If omitted the runner will split total replicates into exactly --parallel parts (parts need not be equal); "
+                 "the base size is floor(replicates/parallel) and any remainder is added to the final part. "
+                 "This flag is ignored for engine=msprime (internal in-process batching). "
+                 "Minimum 1; values greater than total replicates are capped to total replicates."))
     g.add_argument('--max-ram-percent', dest='max_ram_percent', type=float, default=80.0,
                    help=("Abort the run if total system RAM usage exceeds this percentage out of 100 (float). "
                          "Default 80.0."))
@@ -3161,67 +3289,81 @@ def _run_simulation_core(args):
         threads_loc = max(1, min(int(getattr(args, 'parallel', 1)), total_reps_loc))
         per_rep_mode_loc = bool(args.progress and show_progress and total_reps_loc > 1)
 
-        # Compute the default chunking that the existing code would produce so we
-        # can derive a sensible default/cap for --sims-per-work. We keep this
-        # initial calculation separate then optionally override with the
-        # user-specified sims_per_work.
-        if per_rep_mode_loc:
-            default_chunks = [1] * total_reps_loc
-        else:
-            if threads_loc == 1 or total_reps_loc == 1:
-                default_chunks = [total_reps_loc]
-            else:
-                base = total_reps_loc // threads_loc
-                rem = total_reps_loc % threads_loc
-                default_chunks = [base + (1 if i < rem else 0) for i in range(threads_loc) if base + (1 if i < rem else 0) > 0]
+        # Ignore --sims-per-work for msprime (internal engine handles batching itself)
+        if engine == 'msprime' and getattr(args, 'sims_per_work', None) is not None:
+            try:
+                sys.stderr.write('# INFO: --sims-per-work ignored for engine=msprime (internal batching).\n')
+            except Exception:
+                pass
+            args.sims_per_work = None
 
-        # Compute maximum allowed sims-per-work from the default splitting
-        # behaviour (largest chunk size). Minimum allowed is 1.
-        try:
-            max_allowed_sims_per_work = max(1, max(default_chunks))
-        except Exception:
-            max_allowed_sims_per_work = max(1, total_reps_loc)
-
-        # If user didn't provide --sims-per-work, default to the computed max
-        # which preserves previous behaviour. Inform the user when we set this.
-        try:
-            if getattr(args, 'sims_per_work', None) is None:
-                args.sims_per_work = int(max_allowed_sims_per_work)
-                try:
-                    sys.stderr.write(f"# INFO: --sims-per-work not provided; defaulting to computed maximum {args.sims_per_work} (derived from --reps/--parallel).\n")
-                except Exception:
-                    pass
-        except Exception:
-            args.sims_per_work = int(max_allowed_sims_per_work)
-        # Validate user-provided value: minimum 1, cap to max_allowed_sims_per_work.
-        try:
-            user_spw = int(args.sims_per_work)
-            if user_spw < 1:
-                sys.stderr.write(f"# INFO: --sims-per-work {user_spw} < 1; using 1 instead.\n")
-                user_spw = 1
-            if user_spw > max_allowed_sims_per_work:
-                sys.stderr.write(f"# INFO: --sims-per-work {user_spw} exceeds computed maximum {max_allowed_sims_per_work}; capping to {max_allowed_sims_per_work}.\n")
-                user_spw = int(max_allowed_sims_per_work)
-            args.sims_per_work = int(user_spw)
-        except Exception:
-            args.sims_per_work = int(max_allowed_sims_per_work)
+        # When --sims-per-work is not provided, we will split total replicates
+        # into exactly `threads_loc` parts (the requested parallel workers).
+        # The parts need not be equal: we use floor division and add the
+        # remainder to the last chunk. For msprime, --sims-per-work is ignored
+        # and chunks are per-replicate.
+        max_allowed_sims_per_work = total_reps_loc  # absolute upper bound
+        if engine != 'msprime' and getattr(args, 'sims_per_work', None) is None:
+            try:
+                base_spw = max(1, total_reps_loc // threads_loc)
+            except Exception:
+                base_spw = 1
+            try:
+                rem = total_reps_loc - base_spw * threads_loc
+                if rem > 0:
+                    sys.stderr.write(f"# INFO: --sims-per-work not provided; splitting {total_reps_loc} replicates into {threads_loc} parts (base {base_spw}, remainder {rem} added to last part).\n")
+                else:
+                    sys.stderr.write(f"# INFO: --sims-per-work not provided; splitting {total_reps_loc} replicates into {threads_loc} equal parts of {base_spw}.\n")
+            except Exception:
+                pass
+        # If user provided a value, validate and cap it (msprime remains None)
+        if engine != 'msprime' and getattr(args, 'sims_per_work', None) is not None:
+            try:
+                user_spw = int(args.sims_per_work)
+                if user_spw < 1:
+                    sys.stderr.write(f"# INFO: --sims-per-work {user_spw} < 1; using 1 instead.\n")
+                    user_spw = 1
+                if user_spw > max_allowed_sims_per_work:
+                    sys.stderr.write(f"# INFO: --sims-per-work {user_spw} > total replicates {max_allowed_sims_per_work}; capping to {max_allowed_sims_per_work}.\n")
+                    user_spw = max_allowed_sims_per_work
+                args.sims_per_work = user_spw
+            except Exception:
+                # If parsing/capping fails, leave as None so the default
+                # splitting behaviour (into --parallel parts) is used.
+                args.sims_per_work = None
 
         # Now produce the final chunks list. If per-rep mode, keep per-replicate
         # chunks. Otherwise split total_reps_loc into pieces of size
         # args.sims_per_work (last chunk may be smaller). This allows more
         # chunks than --parallel; the executor will limit concurrency.
-        if per_rep_mode_loc:
+        # Chunking: do not force per-replicate chunks just because progress is enabled.
+        # Engine msprime always uses per-replicate chunks because it runs in-process.
+        if engine == 'msprime':
             chunks_loc = [1] * total_reps_loc
         else:
-            spw = max(1, int(getattr(args, 'sims_per_work', 1)))
-            if spw >= total_reps_loc:
-                chunks_loc = [total_reps_loc]
-            else:
-                full = total_reps_loc // spw
-                rem = total_reps_loc % spw
-                chunks_loc = [spw] * full
-                if rem:
-                    chunks_loc.append(rem)
+                # If sims_per_work is None (user omitted), split into threads_loc parts
+                # with remainder added to the last part. Otherwise use the provided size.
+                spw_val = getattr(args, 'sims_per_work', None)
+                if spw_val is None:
+                    try:
+                        base = max(1, total_reps_loc // threads_loc)
+                    except Exception:
+                        base = 1
+                    rem = total_reps_loc - base * threads_loc
+                    chunks_loc = [base] * threads_loc
+                    if rem > 0:
+                        # Add remainder to the last chunk
+                        chunks_loc[-1] = chunks_loc[-1] + rem
+                else:
+                    spw = max(1, int(spw_val))
+                    if spw >= total_reps_loc:
+                        chunks_loc = [total_reps_loc]
+                    else:
+                        full = total_reps_loc // spw
+                        rem = total_reps_loc % spw
+                        chunks_loc = [spw] * full
+                        if rem:
+                            chunks_loc.append(rem)
         # Prepare unique seeds per chunk for engines supporting explicit seeding
         chunk_process_count = None
         # Engines that support per-replicate seeding/mode. Include msprime so it can run multiple
