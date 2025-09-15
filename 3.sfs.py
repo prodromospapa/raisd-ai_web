@@ -174,6 +174,23 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
         for population in populations:
             key = f"{model_id}={population}"
             if key in existing_skipped:
+                # If this demographic/population is in the skipped list, make sure
+                # we don't write skipped demographics to the SFS CSV.
+                # Ensure any existing row for this key is removed so skipped
+                # demographics never appear in `sfs.csv`.
+                try:
+                    sfs.drop(index=key, inplace=True, errors='ignore')
+                except Exception:
+                    # best-effort: if dropping fails, ignore and continue
+                    try:
+                        logger.debug("Failed to drop skipped key from sfs in memory", exc_info=True)
+                    except Exception:
+                        pass
+                try:
+                    sfs.to_csv(f"data/{species_folder_name}/sfs.csv")
+                except Exception:
+                    # best-effort: if writing fails, continue but keep consistency in memory
+                    logger.debug("Failed to persist sfs.csv for skipped key", exc_info=True)
                 pbar.update(1)
                 pbar.refresh()
                 first = False
@@ -366,6 +383,14 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                         logger.debug("Failed to remove target_dir", exc_info=True)
                     except Exception:
                         logger.debug("Failed to remove target_dir", exc_info=True)
+                # Ensure skipped demographics are not present in the SFS CSV in any form
+                try:
+                    sfs.drop(index=key, inplace=True, errors='ignore')
+                except Exception:
+                    try:
+                        logger.debug("Failed to drop skipped key from sfs in memory after skip", exc_info=True)
+                    except Exception:
+                        pass
             else:
                 # only read sfs.sfs if it exists; otherwise do not pass it in future runs
                 if os.path.exists("sfs.sfs"):
@@ -386,12 +411,26 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                                         logger.debug("Failed to remove target_dir", exc_info=True)
                                     except Exception:
                                         logger.debug("Failed to remove target_dir", exc_info=True)
-                                sfs.loc[f"{model_id}={population}"] = np.nan
+                                # ensure skipped demographics are not written to sfs.csv
+                                try:
+                                    sfs.drop(index=key, inplace=True, errors='ignore')
+                                except Exception:
+                                    try:
+                                        logger.debug("Failed to drop all-zero key from sfs in memory", exc_info=True)
+                                    except Exception:
+                                        pass
                         else:
                             sfs.loc[f"{model_id}={population}"] = vals
                     except Exception:
                         append_log(f"Failed to read sfs.sfs for {model_id} {population}; treating as no SFS produced.")
-                        sfs.loc[f"{model_id}={population}"] = np.nan
+                        # ensure we do not add a NaN row for failed reads
+                        try:
+                            sfs.drop(index=key, inplace=True, errors='ignore')
+                        except Exception:
+                            try:
+                                logger.debug("Failed to drop key from sfs after read failure", exc_info=True)
+                            except Exception:
+                                pass
                         include_sfs = False
                     try:
                         os.remove("sfs.sfs")
@@ -399,7 +438,14 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                         pass
                 else:
                     append_log(f"No sfs.sfs produced for {model_id} {population}; will not pass --sfs on retries.")
-                    sfs.loc[f"{model_id}={population}"] = np.nan
+                    # do not add a NaN row for demographics that produced no SFS
+                    try:
+                        sfs.drop(index=key, inplace=True, errors='ignore')
+                    except Exception:
+                        try:
+                            logger.debug("Failed to drop key from sfs when no sfs produced", exc_info=True)
+                        except Exception:
+                            pass
                     include_sfs = False
             sfs.to_csv(f"data/{species_folder_name}/sfs.csv")
             pbar.update(1)
