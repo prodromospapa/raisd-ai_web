@@ -1,341 +1,347 @@
 <div align="center">
 
-# RAiSD‑AI Web Toolkit
+# RAiSD‑AI Web Scanner (with Pre‑Trained Demographic Models)
 
-End‑to‑end workflow for demographic simulation, RAiSD‑AI model training, and an interactive web interface to scan user VCF/BCF genomes for selective sweeps.
+Primary goal: provide a ready‑to‑use web interface to scan user VCF/BCF files for selective sweeps using **pre‑trained RAiSD‑AI models** across published demographic models & populations (e.g. those under `data/Homo_sapiens/*`).
 
-**Simulate → Build SFS → Annotate Genes → Train RAiSD‑AI → Upload VCF → Automatic Model Match → RAiSD Scan → Interactive Plots & Gene Context**
+The repository also contains the internal tooling (simulator + training scripts) that produced those models. These scripts are **optional** for end users—they are only needed if you want to regenerate / extend the pretrained collection.
 
 </div>
 
 ---
 
-## 1. Highlights
+## 1. What You Get
 
-| Area | What You Get |
+| Layer | Purpose | Typical User Action |
+|-------|---------|--------------------|
+| Web app (`website_launcher.py`) | Upload VCF/BCF → auto demographic/pop match → RAiSD‑AI sweep scan → plots & gene context | ONLY part most users run |
+| Pretrained models (`data/<Species>/<Model>/<Pop>/<Chrom>/RAiSD_Model.model/`) | Ready inference weights | Consume silently |
+| Expected SFS (`data/<Species>/sfs.csv`) | Basis for model/pop matching via Jensen–Shannon distance | Already provided |
+| Gene annotations (`data/<Species>/annotation/*.tsv`) | Gene overlap queries in UI | Already provided |
+| (Optional) Training scripts (`3.sfs.py`, `2.annotation.py`, `1.train.py`) | Rebuild / extend model library | For advanced contributors |
+| (Optional) `simulator.py` | Low‑level multi‑engine demographic simulator + SFS | For method development |
+
+> If you cloned a release that already includes the populated `data/` tree, you can ignore every “Optional / Advanced” section below.
+
+---
+
+## 2. Web Scanner Feature Overview
+
+| Area | Key Features |
 |------|--------------|
-| Demographic simulation | Unified `simulator.py` wrapper over ms/msms/discoal/scrm/msprime with adaptive length, resource guards, paired neutral runs, SFS extraction |
-| Expected SFS table | Automated per model/population SFS generation (`3.sfs.py`) with skip‑tracking + resume |
-| Gene annotations | Parallel BioMart fetcher (`2.annotation.py`) writing per‑chromosome TSVs |
-| Training | Automated sweep + neutral simulation, image generation, model training (`1.train.py`) |
-| Model store layout | `data/<Species>/<ModelID>/<Population>/<Chromosome>/RAiSD_Model.model/` |
-| Web app | Flask UI: upload VCF/BCF, infer sample ploidy, project expected SFS, pick best `(model,pop)` via Jensen–Shannon distance, run RAiSD, visualize metrics, browse genes |
-| Metrics & plots | Dynamic PNG endpoint, JSON metric streaming, CSV export, RAiSD metric selection (`μ`, `sweepTR`) |
-| House‑keeping | Auto cleanup of stale runs, resumable jobs, rescan endpoint |
-| Robustness | Memory capping, adaptive parallelism, retry / fallback engines, neutral pairing, detailed logs |
+| Simulation | Multi‑engine (`msprime`, `ms`, `msms`, `discoal`, `scrm`), sweep + neutral pairing, target SNP length estimation, growth discretization, optional RAM cap, SFS export, parallel chunking |
+| SFS Builder (`3.sfs.py`) | Iterates all (model,pop), adaptive parallel reduction on OOM, skip tracking, normalized SFS matrix persisted to `sfs.csv` |
+| Annotation (`2.annotation.py`) | Multi‑host BioMart fallback, parallel per‑chromosome TSV output, minimal columns |
+| Training (`1.train.py`) | Sweep + neutral simulation, IMG generation (`RAiSD-AI -op IMG-GEN`), model training (`FASTER-NN`), transparent retry with `discoal` if primary engine fails |
+| Web UI | Drag & drop upload, staged file auto‑indexing, SFS projection & model selection (JSD), RAiSD run + live metric/plot endpoints, gene lookup API |
+| Robustness | Safe subprocess wrappers, skip registry, cleanup threads, resumable partial runs, memory throttling, automatic neutral pairing |
+| Ops | Single script install, environment reproducibility (`raisd-ai.yml`), auto stale run deletion, lightweight logging |
 
 ---
 
-## 2. Repository Overview
+## 3. Repository Layout (Perspective: End User vs. Advanced)
 
 ```
-data/                         # Generated artefacts (SFS, models, annotations)
-1.train.py                    # Train RAiSD‑AI models (simulation + image + NN training)
-2.annotation.py               # Fetch & store per-chromosome gene annotations
-3.sfs.py                      # Build expected SFS table across demographic models
-simulator.py                  # Unified demographic simulator & SFS producer
-website_launcher.py           # Flask application (upload → model match → RAiSD scan)
-static/, templates/           # Web assets & Jinja templates
-install_dependencies.sh       # Helper bootstrap script
-raisd-ai.yml                  # Conda environment definition
+data/                     # Generated artefacts (SFS table, models, annotations, per-run outputs)
+1.train.py                # RAiSD‑AI model training pipeline
+2.annotation.py           # BioMart chromosome-wise annotation fetcher
+3.sfs.py                  # Expected SFS builder across demographic models
+simulator.py              # Core multi-engine simulator + SFS & ms/vcf output
+website_launcher.py       # Flask web server (upload → model match → scan)
+static/, templates/       # Web assets
+install_dependencies.sh   # One-stop installer (creates/updates env + tools)
+raisd-ai.yml              # Conda environment specification
 ```
 
-Two major phases:
+### File Purpose Summary
+| File | Role (Primary Scope) |
+|------|----------------------|
+| `website_launcher.py` | Flask web server; loads expected SFS + pretrained models, matches demographic/population, runs RAiSD‑AI, serves plots & gene/metric endpoints. |
+| `simulator.py` | Low-level multi-engine demographic simulator (msprime/ms/msms/discoal/scrm); produces ms-like, VCF/BCF, and SFS; internal utility for training & SFS generation. |
+| `3.sfs.py` | Iterates all stdpopsim demographic models/populations; runs simulator to build normalized expected SFS matrix (`sfs.csv`). Optional for end users (already provided). |
+| `2.annotation.py` | Fetches per chromosome gene annotations via BioMart (multi-host fallback) producing TSVs for web gene overlap queries. Optional if already present. |
+| `1.train.py` | Automates sweep + neutral simulation, RAiSD image generation, and RAiSD‑AI model training (`RAiSD_Model.model/`). Optional; only for regenerating pretrained models. |
+| `install_dependencies.sh` | One-shot installer: creates/upgrades Conda env, builds RAiSD‑AI, msms, discoal, installs simulator wrapper. |
+| `raisd-ai.yml` | Conda environment spec (Python + genomics + ML deps). |
+| `static/`, `templates/` | Front-end JS/CSS + Jinja templates for the web UI. |
+| `data/<Species>/sfs.csv` | Expected SFS table (rows `<model>=<population>`). |
+| `data/<Species>/<Model>/<Pop>/<Chrom>/RAiSD_Model.model/` | Trained RAiSD‑AI weight directory. |
 
-1. **Training / Preparation Pipeline**: (steps 1–4 below) produce `sfs.csv`, annotation TSVs, and trained RAiSD‑AI models.
-2. **Web Scanning**: run Flask server, upload user data, automatic demographic/pop match, sweep scan + visualization.
+Two phases in practice:
+1. **Preparation / Training (offline)** – run once per species (or when hyperparameters change).
+2. **Scanning (online)** – launch the web server and analyze user data with already-trained models.
 
 ---
 
-## 3. Installation
+## 4. Installation
 
-### 3.1 Prerequisites
-
-Required:
-* Python 3.9+ (3.11+ ok) with `conda` or `mamba` recommended
-* External tools on PATH:
-  * `bcftools` (indexing & allele counts)
-  * One of `RAiSD-AI-ZLIB`, `RAiSD-AI`, or fallback `RAiSD` executables
-* Internet access (only for first-time annotation & BioMart queries)
-
-Core Python packages used (non‑exhaustive): `stdpopsim`, `msprime`, `demes`, `numpy`, `pandas`, `flask`, `pysam`, `tqdm`, `psutil`, `biomart`, `matplotlib`.
-
-### 3.2 Create environment
-
-```bash
-conda env create -f raisd-ai.yml -n raisd-ai
-conda activate raisd-ai
-```
-
-Optional helper (installs extra/binaries if scripted):
+Prerequisites: A working Conda/Mamba (Linux x86_64 tested) and internet access.
 
 ```bash
 bash install_dependencies.sh
+conda activate raisd-ai
 ```
 
-### 3.3 Verify toolchain
+What this does:
+1. Creates / updates env `raisd-ai` from `raisd-ai.yml`.
+2. Downloads & wraps `msms` (Java), builds `discoal`.
+3. Clones & compiles `RAiSD-AI` (both normal & ZLIB binaries).
+4. Installs a convenience `simulator` wrapper into the env `bin/`.
+5. (Hotfix) Applies a small `stdpopsim` patch when needed.
 
+Verification:
 ```bash
-which bcftools
-which RAiSD-AI || which RAiSD-AI-ZLIB || which RAiSD
-python -c "import stdpopsim, msprime; print('stdpopsim ok')"
+which RAiSD-AI RAiSD-AI-ZLIB simulator msms discoal
+python -c "import stdpopsim, msprime; print('stdpopsim OK')"
 ```
 
 ---
 
-## 4. Quick Start (Happy Path)
+## 5. Quick Start (Using Pre‑Trained Models)
 
 ```bash
-# 1. Build expected SFS table
-python 3.sfs.py --species "Homo sapiens"
+conda activate raisd-ai
 
-# 2. Fetch gene annotations
-python 2.annotation.py --species "Homo sapiens"
-
-# 3. Train RAiSD‑AI models (sweeps + neutral)
-python 1.train.py --species "Homo sapiens"
-
-# 4. Launch web interface
+# (Skip directly to launching if data/ is already populated)
 python website_launcher.py
-
-# Open the UI
-xdg-open http://127.0.0.1:5000/
 ```
 
-Upload a `.vcf`, `.vcf.gz`, or `.bcf` — the app auto:
-1. Infers sample count + ploidy
-2. Projects each precomputed model/pop SFS to that sample size
-3. Computes Jensen–Shannon distance; selects best `(model,pop)`
-4. Runs RAiSD with the corresponding trained model
-5. Streams metrics & plots; allows rescan / CSV / gene queries.
+Navigate to http://127.0.0.1:5000/ and upload `.vcf`, `.vcf.gz`, or `.bcf`.
+
+The app:
+1. Infers total haploid sample size & ploidy.
+2. Projects every expected SFS row to that sample size.
+3. Computes Jensen–Shannon distance; selects the closest (model,pop).
+4. Runs RAiSD‑AI with the corresponding pretrained model.
+5. Streams plots & enables gene overlap queries.
 
 ---
 
-## 5. Data & Directory Layout
+## 6. OPTIONAL: Regenerating / Extending the Model Library
+Only needed if you (a) add new species, (b) want different hyperparameters, or (c) update stdpopsim models.
 
-Generated structure (per species):
+Order:
+1. `3.sfs.py` – build/update `sfs.csv`.
+2. `2.annotation.py` – fetch per‑chromosome gene annotation TSVs.
+3. `1.train.py` – simulate sweep + neutral, generate RAiSD images, train RAiSD‑AI model weights.
+
+All steps rely on `simulator.py` internally.
+
+### 6.1 Expected SFS (`3.sfs.py`)
+...existing description...
+
+### 6.2 Annotation (`2.annotation.py`)
+...existing description...
+
+### 6.3 Training (`1.train.py`)
+...existing description...
+
+### 6.4 Unified Simulator (`simulator.py`)
+...existing description...
+
+---
+
+## 7. Web Application (`website_launcher.py`)
+python website_launcher.py
+```
+
+Open: http://127.0.0.1:5000/ and upload a `.vcf`, `.vcf.gz`, or `.bcf`.
+
+The UI will: infer ploidy → project SFS of every (model,pop) to the sample size → choose best via Jensen–Shannon distance → run RAiSD with the matched model → stream plots & gene hits.
+
+---
+
+## 6. Preparation / Training Pipeline Details
+
+### 6.1 Step 1 – Expected SFS (`3.sfs.py`)
+Generates a normalized site frequency spectrum (SFS) per (model,population). Adaptive retries lower `--parallel` if a memory threshold (`--max-ram-percent`) is exceeded. Skips are recorded in `data/<Species>/failed_parts.jsonl`.
+
+Key flags:
+* `--species <ID|Full Name>` (required)
+* `--samples <haploid>` (default 10000)
+* `--replicates <n>` (default 5)
+* `--engine <msprime|ms|...>` (default `msprime` here)
+* `--max-parallel <n>` (default: half CPU or ≤ replicates)
+* `--max-ram-percent <pct>` (optional watchdog)
+* `--chromosome <id>` (auto-chooses largest if omitted)
+
+Output: `data/<Species>/sfs.csv` (rows labelled `<model>=<population>`; columns allele count bins excluding monomorphic).
+
+### 6.2 Step 2 – Annotation (`2.annotation.py`)
+Fetches chromosome-wise gene records via BioMart multi-host strategy.
+* `--species <ID|Full Name>`
+Produces: `data/<Species>/annotation/<chrom>.tsv` with columns `gene_id, transcript_id, gene_name, chromosome, start, end, biotype`.
+
+### 6.3 Step 3 – Training (`1.train.py`)
+For each demographic model, population, and chromosome (from `chromosomes.txt`):
+1. Simulate sweep + neutral ms-like output via `simulator.py` (retry with `discoal` + `--sweep-time` if initial engine fails).
+2. Transform `.ms` files into RAiSD image binaries (`RAiSD-AI -op IMG-GEN`).
+3. Train RAiSD‑AI model (`FASTER-NN`) for configured `--epochs`.
+4. Remove temporary image binaries; keep `RAiSD_Model.model/model.pt`.
+
+Flags (excerpt):
+* `--species` (required)
+* `--train-sample-individuals` (default 100)
+* `--train-replicates` (per class; default 1000) – reduce for quick smoke tests
+* `--sel-s` selection coefficient (default 0.1)
+* `--window --ips --iws` image shaping (window size & RAiSD image parameters)
+* `--epochs` (default 3)
+* `--engine` starting simulator (default `msms`)
+* `--parallel` simulation worker processes (default half of available cores)
+* `--gpu` attempt GPU‑accelerated mode (if RAiSD‑AI binary supports it)
+
+First run prompts you to optionally remove chromosomes; it writes `data/<Species>/chromosomes.txt` for future runs.
+
+### 6.4 Unified Simulator (`simulator.py`)
+Core capabilities:
+* Engines: `msprime`, `ms`, `msms`, `discoal`, `scrm`
+* Sweep vs neutral paired runs (`--paired-neutral <neutral.ms>`)
+* Automatic length estimation from `--target-snps` (with tolerance `--target-snps-tol`)
+* SFS output (`--sfs <file>`, `--sfs-normalized`)
+* Parallel chunking: `--parallel <workers>` × `--sims-per-work <n>`
+* RAM guard: `--max-ram-percent <pct>`
+* GPU flag pass‑through (`--gpu`) where supported
+
+Representative call (like training does internally):
+```bash
+simulator.py \
+  --engine msms \
+  --species-id HomSap \
+  --model-id OutOfAfrica_3G09 \
+  --pop-order YRI \
+  --sample-individuals 100 \
+  --target-snps 800 \
+  --chromosome 21 \
+  --replicates 50 \
+  --parallel 4 \
+  --paired-neutral neutral.ms \
+  --sfs sfs.sfs --sfs-normalized
+```
+
+---
+
+## 7. Web Application (`website_launcher.py`)
+
+Launch:
+```bash
+python website_launcher.py
+```
+Navigate to http://127.0.0.1:5000/
+
+Flow:
+1. Upload & stage file (progress bar; pre-index if needed with `bcftools`).
+2. Infer sample size & ploidy (examining early GTs).
+3. Load and project expected SFS for each (model,pop) → sample size.
+4. Compute Jensen–Shannon distance; select best (and keep ranking).
+5. Run RAiSD with matching model (naming report accordingly).
+6. Stream metrics (PNG + JSON) and support later rescans.
+7. Provide gene queries via start/end coordinates.
+
+Public endpoints (selection):
+`/` (upload), `/upload`, `/analyze`, `/runs/<id>/plot`, `/runs/<id>/metric_data`, `/runs/<id>/report_csv`, `/genes`, `/chromosomes`, `/healthz`.
+
+Metrics: exposes composite `μ` and additional sweep tracking metrics (e.g. `sweepTR`).
+
+Auto‑cleanup removes inactive run directories after `RESULTS_RETENTION_SECONDS`.
+
+---
+
+## 8. Data Layout
 
 ```
 data/<Species>/
-  chromosomes.txt                   # User‑confirmed chromosome list (first run of training)
-  sfs.csv                           # Expected (normalized or raw) SFS rows: <model>=<population>
-  skipped_demographics.jsonl        # Models/pops skipped (memory / zero SFS / failure)
-  <ModelID>/<Population>/<Chromosome>/
-      sweep.ms / neutral.ms         # Raw simulations retained until conversion
-      RAiSD_Model.model/            # Trained model (contains model.pt)
+  chromosomes.txt                # Selected chromosomes (user curated first run)
+  sfs.csv                        # Expected SFS (rows: <model>=<population>)
+  failed_parts.jsonl             # Skip / failure registry (SFS + training)
+  annotation/<chrom>.tsv         # Gene annotation files
+  <Model>/<Population>/<Chrom>/
+      sweep.ms / neutral.ms      # Source simulations (deleted later if desired)
+      RAiSD_Model.model/model.pt # Trained RAiSD‑AI weights
+runs/<uuid>/                     # Per upload: VCF/BCF, RAiSD reports, logs
 ```
 
-Annotation TSVs: `data/<Species>/annotation/<chrom>.tsv`
+---
 
-Web run artefacts: `runs/<uuid>/` containing uploaded file, `RAiSD_Report.*`, logs, and final assets (auto‑cleaned).
+## 9. Model Selection (SFS‑Driven)
+Observed allele count distribution (after excluding monomorphic bins) is compared to every expected SFS (projected to the same sample size). The model/pop with minimal Jensen–Shannon distance is chosen; top alternatives are kept for transparency.
 
 ---
 
-## 6. Core Scripts & CLI Reference
+## 10. Performance & Resource Tips
 
-### 6.1 `3.sfs.py` – Build Expected SFS Table
-
-Generates mean SFS per (`demographic_model`, `population`). Adaptive retries lowering parallelism if memory is exceeded; records skipped items.
-
-Key arguments:
-* `--species <ID|Full Name>` (required)
-* `--samples <haploid-samples>` default 10000 (used to size SFS)
-* `--replicates <n>` default 5 per model/pop
-* `--engine <scrm|ms|...>` default `scrm` for SFS speed
-* `--max-ram-percent <pct>` optional watchdog
-* `--max-parallel <n>` upper bound parallel workers
-* `--chromosome <id>` choose contig (default 21 if present)
-
-Output: `data/<Species>/sfs.csv`
-
-### 6.2 `2.annotation.py` – Gene Annotation Fetch
-
-Fetches per‑chromosome records via BioMart (multi-host fallback). Writes chromosome TSVs used by the web gene window lookups.
-
-* `--species <ID|Full Name>` (required)
-
-Outputs: `data/<Species>/annotation/<chrom>.tsv`
-
-### 6.3 `1.train.py` – RAiSD‑AI Model Training
-
-Workflow per (model, population, chromosome):
-1. Simulate sweep & paired neutral (`simulator.py`); fallback engine retry (e.g., to `discoal`).
-2. Convert ms output → RAiSD image binaries (`RAiSD-AI -op IMG-GEN`).
-3. Train neural architecture (`FASTER-NN`, epochs configurable) producing `RAiSD_Model.model/model.pt`.
-4. Cleanup transient image binaries.
-
-Key arguments:
-* `--species <ID|Full Name>` required
-* `--train-sample-individuals` per simulation (default 100)
-* `--train-replicates` replicates per class (default 1000)
-* `--sel-s <s>` selection coefficient for sweep class (default 0.1)
-* `--window, --ips, --iws` RAiSD image params
-* `--epochs <n>` (default 3) – increase for quality
-* `--engine <msms|...>` default `msms`
-* `--parallel <n>` CPU workers for simulation
-* `--gpu` attempt GPU where supported
-
-### 6.4 `simulator.py` – Unified Simulation Engine
-
-Supports engines: `discoal`, `ms`, `msms`, `scrm`, `msprime` + SFS computation & VCF/ms output.
-
-Features:
-* Adaptive length estimation from `--target-snps`
-* Sweep modeling (origin / fixation) via engine‑specific flags
-* Growth discretization for exponential epochs (optional)
-* Paired neutral runs (`--paired-neutral`)
-* SFS calculation (mean or per-replicate) with normalization
-* Memory guard (`--max-ram-percent`) & per-worker thread throttling
-* Chunked parallel replication with `--parallel` & `--sims-per-work`
-
-Invoke indirectly from training / SFS scripts, or directly for custom experiments.
+| Issue | Mitigation |
+|-------|------------|
+| Slow training | Lower `--train-replicates`, `--epochs`, restrict chromosomes list |
+| High RAM in SFS | Set `--max-ram-percent` & reduce `--max-parallel` |
+| Upload sluggish | Pre‑compress & index (bgzip + bcftools index) |
+| Sparse variants | Confirm chromosome choice & simulation window size; inspect RAiSD logs |
+| Suspicious model match | Rebuild SFS with higher `--samples` or more `--replicates` |
 
 ---
 
-## 7. Web Application
+## 11. Troubleshooting
 
-Start with:
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Web error: missing SFS | `sfs.csv` absent | Run `3.sfs.py` first |
+| No genes returned | Annotation TSV missing | Run `2.annotation.py` |
+| RAiSD report missing | Binary/path/empty input | Verify RAiSD install & variant density |
+| Many skips in logs | Memory or zero SFS | Inspect `failed_parts.jsonl`; adjust flags |
+| GPU ignored | No GPU or unsupported build | Check `nvidia-smi`; rebuild RAiSD‑AI |
 
+---
+
+## 12. Extending / Roadmap Ideas
+* Add pytest smoke tests (mini chromosome, few replicates).
+* Dockerfile / container recipe.
+* REST endpoint to launch training jobs remotely.
+* Model registry export (JSON) for integration with other pipelines.
+* SFS caching keyed by (sample size, model,pop) projections.
+
+Contributions welcome – open focused PRs. (Add a LICENSE first if you plan broad distribution.)
+
+---
+
+## 13. Security & Data Handling
+* Uploaded files reside in `runs/<uuid>` and are auto‑removed after inactivity (configurable via env vars: `RESULTS_RETENTION_SECONDS`).
+* No authentication layer – deploy behind VPN / reverse proxy for multi‑user or sensitive datasets.
+* If using human data, ensure compliance with relevant privacy / consent policies; this toolkit does not anonymize content.
+
+---
+
+## 14. Limitations
+* Single-host parallelism only (no distributed queue).
+* Limited RAiSD‑AI hyperparameter surface (architecture fixed to `FASTER-NN`).
+* No incremental retraining; always simulate anew (cache your raw ms if desired).
+* Missing automated tests / CI.
+
+---
+
+## 15. License
+No license file yet – add one (MIT / BSD‑3 / Apache‑2.0) to clarify permitted use.
+
+---
+
+## 16. Attribution / Citations
+Please cite:
+* RAiSD / RAiSD‑AI original publications.
+* stdpopsim, msprime, demes for demographic simulations.
+* BioMart for gene annotation services.
+
+---
+
+## 17. Quick Cheat Sheet
 ```bash
-python website_launcher.py
-```
-
-Open: http://127.0.0.1:5000/
-
-### 7.1 Flow
-1. Upload / select staged VCF/BCF
-2. Index file (bcftools) if needed
-3. Infer ploidy + sample count
-4. Load expected SFS (`sfs.csv`) → normalize → project to sample size
-5. Compute JSD vs observed SFS; choose best match
-6. Locate trained model path; run RAiSD
-7. Serve interactive plots + gene queries
-
-### 7.2 Key Endpoints (public)
-
-| Method | Route | Purpose |
-|--------|-------|---------|
-| GET | `/` | Upload form & species selector |
-| POST | `/analyze` | Begin or resume analysis for an upload |
-| GET | `/runs/<id>/plot` | Dynamic PNG plot of a metric (query: metric, xmin, xmax) |
-| GET | `/runs/<id>/metric_data` | JSON metric series (downsampling) |
-| GET | `/runs/<id>/report_csv` | Download parsed RAiSD metrics CSV |
-| POST | `/runs/<id>/rescan` | Re-run RAiSD with different grid / filters |
-| GET | `/runs/<id>/rescan_status` | Poll rescan job state |
-| POST | `/runs/<id>/cleanup` | Schedule early deletion of run directory |
-| GET | `/runs/<id>/expected_sfs` | JSON: selected model/pop expected vs observed SFS |
-| GET | `/runs/<id>/final` | Finalization status (ready signal) |
-| POST | `/runs/<id>/heartbeat` | Keep run alive (avoid auto cleanup) |
-| GET | `/chromosomes` | List available chromosomes (species context) |
-| GET | `/genes` | Query overlapping genes (params: species, chr, start, end[, biotype]) |
-| POST | `/upload` | Low-level upload (AJAX chunked forms) |
-| GET | `/healthz` | Liveness probe |
-
-### 7.3 Gene Query Output
-
-Returns overlapping genes sorted by decreasing overlap bp with fields: `label,start,end,biotype,overlap_bp`.
-
-### 7.4 Metrics
-
-Displayed metrics derived from RAiSD report. Primary exposed: `μ` (composite) and `sweepTR` (probability/tracking metric). JSON & PNG endpoints accept sanitized metric names (underscores instead of LaTeX).
-
----
-
-## 8. Model Selection Logic
-
-For each uploaded dataset:
-1. Compute observed allele count distribution via `bcftools +fill-tags`.
-2. Normalize counts to polymorphic SFS (exclude bins 0 & n).
-3. For every row `<model>=<population>` in projected expected SFS, compute Jensen–Shannon distance.
-4. Select minimal JSD; record top matches (first 6) plus full ranking.
-
-Persisted meta allows rescans to name RAiSD reports as `RAiSD_Report.<Model>__<Population>` for clarity.
-
----
-
-## 9. Performance & Resource Tips
-
-| Scenario | Tip |
-|----------|-----|
-| Training too slow | Lower `--train-replicates`, `--epochs`; start with subset chromosomes |
-| Memory errors in SFS build | Use `--max-ram-percent` and reduce `--max-parallel` |
-| Large VCF upload stalls | Compress & index (`bgzip` + `bcftools index`) before upload |
-| Few variants in scan | Ensure chromosome choice & model length align with data; check RAiSD logs |
-| Wrong model chosen | Inspect top matches JSD values; consider regenerating SFS with larger `--samples` |
-
----
-
-## 10. Troubleshooting
-
-| Symptom | Likely Cause | Fix |
-|---------|--------------|-----|
-| `Missing SFS table` in web | Did not run `3.sfs.py` | Build SFS first |
-| Annotation lookup fails | TSVs absent or species folder mismatch | Re-run `2.annotation.py`; verify folder name matches species selector |
-| RAiSD report not produced | RAiSD binary mismatch / flags / empty region | Check `raisd_stderr.log`; ensure correct RAiSD-AI build |
-| Skipped demographics in training/SFS | Memory or zero SFS | Adjust parallelism; inspect `skipped_demographics.jsonl` |
-| Very slow msprime runs | Hyperthread over-subscription | Reduce `--parallel`; ensure BLAS thread env vars capped |
-| GPU flag ignored | No GPU detected | Confirm `nvidia-smi` output; rebuild RAiSD with GPU support |
-
----
-
-## 11. Extending & Contributing
-
-Suggestions:
-* Add CI (GitHub Actions) to build SFS & run a smoke scan.
-* Provide Dockerfile for reproducible web deployment.
-* Implement caching for SFS projection for repeated sample sizes.
-* Add REST/JSON endpoint to trigger training jobs remotely.
-
-To contribute: open PRs with focused commits; include brief usage notes. **Add a LICENSE** before external sharing.
-
----
-
-## 12. Security & Data Handling
-
-* Uploaded VCF/BCF files are stored under `runs/<uuid>/` and auto‑deleted after inactivity (`RESULTS_RETENTION_SECONDS`).
-* No authentication layer is included; deploy behind a protected network or add auth (reverse proxy / Flask login) for multi‑user environments.
-* Ensure PII stripping if using human data (the tool processes genotypes; privacy policies may apply).
-
----
-
-## 13. Limitations & Future Ideas
-
-* No built‑in distributed job queue (single host thread pool only)
-* Single species processed per run instance (multi‑species fine, but one server process)
-* Training hyperparameters minimal (epochs, architecture fixed to FASTER-NN)
-* Lack of formal tests; consider adding pytest harness (simulate tiny model / run web in test mode)
-
----
-
-## 14. License
-
-No license file currently. Add e.g. MIT, BSD‑3, or Apache‑2.0 to clarify permitted use.
-
----
-
-## 15. Attribution
-
-* RAiSD / RAiSD‑AI: upstream algorithms and binaries.
-* stdpopsim / msprime / demes: demographic simulation foundation.
-* BioMart: gene annotation service.
-
-If you publish results produced with this stack, cite the original RAiSD and stdpopsim works accordingly.
-
----
-
-## 16. Quick Reference Cheat Sheet
-
-```bash
-# SFS table (fast test run)
+# SFS (fast test)
 python 3.sfs.py --species HomSap --replicates 2 --samples 2000 --max-parallel 2
 
 # Annotation
 python 2.annotation.py --species HomSap
 
-# Training (lightweight demo)
+# Training (demo)
 python 1.train.py --species HomSap --train-replicates 50 --epochs 1 --parallel 2
 
-# Launch web
+# Web app
 python website_launcher.py
 ```
 

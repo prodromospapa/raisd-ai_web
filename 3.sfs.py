@@ -26,8 +26,8 @@ parser.add_argument("--replicates", type=int, default=5,
                     help="Number of replicates to request from the simulator for each model/population when building SFS (default: 5).")
 parser.add_argument("--engine", type=str, default="msprime",
                     help="Default simulator engine to request (default: msprime).")
-parser.add_argument("--chromosome", type=str, default="21",
-                    help="Chromosome id to simulate; defaults to the largest chromosome if not set (default: 21).")
+parser.add_argument("--chromosome", type=str, default=None,
+                    help="Chromosome id to simulate; if omitted the wrapper will pick the numerically largest chromosome for the species.")
 parser.add_argument("--sims-per-work", type=int, default=1,
                     help="Number of sims per worker (default: 1).")
 # sfs filename and normalization are fixed for SFS generation (not CLI options)
@@ -38,7 +38,9 @@ MAX_RAM_PERCENT = cli_args.max_ram_percent
 samples = cli_args.samples
 REPLICATES = cli_args.replicates
 engine_default = cli_args.engine
-chromosome = cli_args.chromosome
+# chromosome will be resolved after the species object is available; if omitted, use the numerically largest chromosome
+# (we set `chromosome` below once `species_std` is known).
+
 current_sims_per_work = cli_args.sims_per_work
 # sfs filename and normalization are fixed for SFS generation
 # Request normalized SFS by default and use the standard filename.
@@ -76,6 +78,9 @@ else:
 
 species_std = stdpopsim.get_species(species)
 biggest_chromosome = biggest_chrom(species_std)
+
+# If user did not pass --chromosome, choose the numerically largest chromosome for this species
+chromosome = cli_args.chromosome if cli_args.chromosome is not None else biggest_chromosome
 
 # Build model->pop list where sampling_time == 0
 demographic_models = {
@@ -358,9 +363,9 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                 except Exception:
                     # keep going even if removal fails
                     try:
-                        logger.debug(f"Failed to remove target_dir {target_dir}", exc_info=True)
+                        logger.debug("Failed to remove target_dir", exc_info=True)
                     except Exception:
-                        logger.debug("Failed to remove target_dir (target_dir undefined)", exc_info=True)
+                        logger.debug("Failed to remove target_dir", exc_info=True)
             else:
                 # only read sfs.sfs if it exists; otherwise do not pass it in future runs
                 if os.path.exists("sfs.sfs"):
@@ -378,9 +383,9 @@ with tqdm(total=total, desc="Simulations", unit="run") as pbar:
                                         shutil.rmtree(target_dir)
                                 except Exception:
                                     try:
-                                        logger.debug(f"Failed to remove target_dir {target_dir}", exc_info=True)
+                                        logger.debug("Failed to remove target_dir", exc_info=True)
                                     except Exception:
-                                        logger.debug("Failed to remove target_dir (target_dir undefined)", exc_info=True)
+                                        logger.debug("Failed to remove target_dir", exc_info=True)
                                 sfs.loc[f"{model_id}={population}"] = np.nan
                         else:
                             sfs.loc[f"{model_id}={population}"] = vals
