@@ -24,8 +24,8 @@ parser.add_argument("--samples", type=int, default=10000,
                     help="Number of haploid samples per population to request when building the SFS (default: 10000).")
 parser.add_argument("--replicates", type=int, default=5,
                     help="Number of replicates to request from the simulator for each model/population when building SFS (default: 5).")
-parser.add_argument("--engine", type=str, default="scrm",
-                    help="Default simulator engine to request (default: scrm).")
+parser.add_argument("--engine", type=str, default="msprime",
+                    help="Default simulator engine to request (default: msprime).")
 parser.add_argument("--chromosome", type=str, default="21",
                     help="Chromosome id to simulate; defaults to the largest chromosome if not set (default: 21).")
 parser.add_argument("--sims-per-work", type=int, default=1,
