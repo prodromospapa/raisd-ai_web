@@ -5226,6 +5226,12 @@ def _run_simulation_core(args):
         fmt_ext = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
         ext = fmt_ext.get(args.format, '.ms')
         args.out = default_stem + ext
+        try:
+            # Only inform when the user did not explicitly provide --output
+            if not getattr(args, '_user_out_provided', False) and args.out and args.out != '-':
+                sys.stderr.write(f"# INFO: no --output provided; primary sweep output will be written to {args.out}\n")
+        except Exception:
+            pass
     if args.out == '-':
         if concatenated_stdout:
             sys.stdout.write(concatenated_stdout)
@@ -6370,6 +6376,15 @@ def _run_simulation_core(args):
                             else:
                                 blocks_n = [vtxt_n]
                             for vb in blocks_n:
+                                # Skip header-only VCF blocks (no variant lines). A
+                                # header-only block will only contain lines starting
+                                # with '#'. We require at least one non-# line.
+                                try:
+                                    non_hash = any((ln.strip() and not ln.startswith('#')) for ln in vb.splitlines())
+                                except Exception:
+                                    non_hash = False
+                                if not non_hash:
+                                    continue
                                 try:
                                     vb = _adjust_vcf_contig_length(vb, neut_meta.get('chromosome'), neut_meta.get('length'))
                                 except Exception:
@@ -6614,7 +6629,7 @@ def _run_simulation_core(args):
                                     if neut_engine == 'msms' and ln2.startswith('ms '):
                                         continue
                                     f2.write(ln2)  # type: ignore[arg-type]
-                    sys.stderr.write(f"# INFO: wrote paired neutral output to {neut_out_path}\n")
+                            sys.stderr.write(f"# INFO: wrote paired neutral output to {neut_out_path}\n")
                     if getattr(args, 'sfs', False):
                         try:
                             # If msprime produced VCF, convert to ms-like per replicate before SFS
