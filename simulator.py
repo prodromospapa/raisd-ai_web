@@ -347,6 +347,26 @@ def sanitize_ms_demography(ms_demog_str):
         out.append(t); i += 1
     return ' '.join(out)
 
+
+def _primary_simulation_is_neutral(meta):
+    """Return True when the primary simulation should be considered neutral.
+
+    Rules (mirrors the inline logic used elsewhere):
+    - Engines 'ms', 'scrm', 'msprime' are considered neutral-only.
+    - For other engines, absence of selection metadata (sel_args, sweep_pos, sel_2Ns)
+      means the primary run is neutral.
+    """
+    try:
+        if not isinstance(meta, dict):
+            return False
+        eng0 = meta.get('engine')
+        if eng0 in ('ms', 'scrm', 'msprime'):
+            return True
+        sel_present = bool(meta.get('sel_args')) or bool(meta.get('sweep_pos')) or bool(meta.get('sel_2Ns'))
+        return not sel_present
+    except Exception:
+        return False
+
 def _make_affinity_preexec(cpu_list):
     """Return a preexec_fn that sets CPU affinity for the child process (best-effort)."""
     def _set_affinity():
@@ -1459,12 +1479,98 @@ def _vcf_text_to_bcf(path_vcf: str, path_bcf: str):
     """
     bcftools_exe = shutil.which('bcftools') or 'bcftools'
     # Use bcftools view -Ob -o out.bcf in a subprocess
+    # Read the input VCF and normalize the #CHROM header line to use tabs
+    # (bcftools requires tab-delimited header). If normalization is needed,
+    # write to a temporary file and call bcftools on that file.
+    tmp_vcf_to_use = path_vcf
+    tmp_created = None
     try:
-        proc = subprocess.run([bcftools_exe, 'view', '-Ob', '-o', path_bcf, path_vcf], capture_output=True)
+        try:
+            with open(path_vcf, 'r', encoding='utf-8', errors='replace') as fh:
+                lines = fh.readlines()
+        except Exception:
+            lines = None
+        if lines:
+            new_lines = []
+            header_changed = False
+            for ln in lines:
+                # Accept a CHROM header even if indented; bcftools requires the
+                # '#CHROM' header to start at column 0 with tab-separated fields.
+                if ln.lstrip().startswith('#CHROM'):
+                    parts = ln.lstrip().strip().split()
+                    if len(parts) >= 9:
+                        ln_fixed = '\t'.join(parts) + '\n'
+                        if ln_fixed != ln:
+                            header_changed = True
+                            ln = ln_fixed
+                new_lines.append(ln)
+            if header_changed:
+                tmpdir = _ensure_local_tmpdir()
+                fd, tmp_created = tempfile.mkstemp(suffix='.vcf', dir=tmpdir)
+                os.close(fd)
+                with open(tmp_created, 'w', encoding='utf-8') as ofh:
+                    ofh.writelines(new_lines)
+                tmp_vcf_to_use = tmp_created
+        proc = subprocess.run([bcftools_exe, 'view', '-Ob', '-o', path_bcf, tmp_vcf_to_use], capture_output=True)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode().strip())
     except Exception as e:
         raise SystemExit(f'# ERROR: failed to convert VCF to BCF via bcftools: {e}')
+    finally:
+        try:
+            if tmp_created and os.path.exists(tmp_created):
+                os.unlink(tmp_created)
+        except Exception:
+            pass
+
+def _ensure_vcf_has_samples(vcf_text: str, meta: dict) -> str:
+    """Ensure VCF header '#CHROM' line contains sample columns.
+
+    If header lacks sample columns (only 9 fields), derive sample count from
+    metadata (hap_counts or counts_disc and ploidy) and append sample names
+    Ind1..IndN to the header line.
+    """
+    if not vcf_text:
+        return vcf_text
+    lines = vcf_text.splitlines()
+    # find header index
+    hidx = None
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith('#CHROM'):
+            hidx = i
+            break
+    if hidx is None:
+        return vcf_text
+    header_line = lines[hidx].rstrip('\n')
+    parts = re.split(r'\t|\s+', header_line.strip())
+    if len(parts) >= 10:
+        return vcf_text
+    # try to derive sample count from metadata
+    total_hap = None
+    try:
+        if meta and isinstance(meta, dict):
+            hap_counts = meta.get('hap_counts') or meta.get('counts_disc') or []
+            if hap_counts:
+                # hap_counts might be list of ints per pop
+                total_hap = sum(int(x) for x in hap_counts)
+    except Exception:
+        total_hap = None
+    try:
+        ploidy = int(meta.get('ploidy', 1)) if meta and isinstance(meta, dict) else 1
+    except Exception:
+        ploidy = 1
+    n_ind = None
+    if total_hap and ploidy and total_hap >= ploidy:
+        try:
+            n_ind = int(total_hap // ploidy)
+        except Exception:
+            n_ind = None
+    if not n_ind or n_ind <= 0:
+        return vcf_text
+    sample_names = [f'Ind{i+1}' for i in range(n_ind)]
+    new_header = header_line.strip() + '\t' + '\t'.join(sample_names)
+    lines[hidx] = new_header
+    return '\n'.join(lines) + '\n'
 
 def _adjust_vcf_contig_length(vcf_text: str, chrom_id=None, new_length=None) -> str:
     """Replace contig length for contig with ID==chrom_id in a VCF text block.
@@ -4578,15 +4684,8 @@ def _run_simulation_core(args):
     # If paired-neutral was requested but the primary run is neutral, ignore as redundant.
     try:
         if getattr(args, 'paired_neutral', False):
-            eng0 = meta.get('engine')
-            # Neutral if engine is neutral-only or selection args absent
-            primary_neutral = False
-            if eng0 in ('ms', 'scrm', 'msprime'):
-                primary_neutral = True
-            else:
-                sel_present = bool(meta.get('sel_args')) or bool(meta.get('sweep_pos')) or bool(meta.get('sel_2Ns'))
-                primary_neutral = not sel_present
-            if primary_neutral:
+            if _primary_simulation_is_neutral(meta):
+                eng0 = meta.get('engine')
                 reason = 'engine is neutral-only' if eng0 in ('ms','scrm','msprime') else 'no sweep parameters provided'
                 try:
                     sys.stderr.write(f"# INFO: primary simulation is neutral ({reason}); ignoring --paired-neutral.\n")
@@ -5831,20 +5930,56 @@ def _run_simulation_core(args):
                 # Fallback: treat as single run
                 total_reps_neut = 1
             neut_threads = max(1, min(int(getattr(args, 'parallel', 1)), total_reps_neut))
-            # Always force per-replicate execution to guarantee a distinct seed per simulation (requested behavior)
-            per_rep_mode_neut = True
-            neut_chunks = [1] * total_reps_neut
-            # Unique seeds per replicate (each chunk is size 1) for discoal/msms/ms/msprime
+            # Mirror primary run chunking: respect --parallel and --sims-per-work
+            try:
+                neut_threads = max(1, min(int(getattr(args, 'parallel', 1)), total_reps_neut))
+            except Exception:
+                neut_threads = max(1, int(getattr(args, 'parallel', 1) or 1))
+            # Per-rep progress mode similar to primary: show progress when requested and multiple reps
+            per_rep_mode_neut = bool(getattr(args, 'progress', False) and total_reps_neut > 1)
+
+            if neut_engine == 'msprime':
+                # msprime runs in-process per-replicate
+                neut_chunks = [1] * total_reps_neut
+            else:
+                # If user provided --sims-per-work, use it (cap to total_reps_neut). Otherwise split into neut_threads parts
+                spw_val = getattr(args, 'sims_per_work', None)
+                if spw_val is None:
+                    try:
+                        base = max(1, total_reps_neut // neut_threads)
+                    except Exception:
+                        base = 1
+                    rem = total_reps_neut - base * neut_threads
+                    neut_chunks = [base] * neut_threads
+                    if rem > 0:
+                        neut_chunks[-1] = neut_chunks[-1] + rem
+                else:
+                    try:
+                        spw = max(1, int(spw_val))
+                    except Exception:
+                        spw = 1
+                    if spw >= total_reps_neut:
+                        neut_chunks = [total_reps_neut]
+                    else:
+                        full = total_reps_neut // spw
+                        rem = total_reps_neut % spw
+                        neut_chunks = [spw] * full
+                        if rem:
+                            neut_chunks.append(rem)
+
+            # Unique seeds per chunk for engines that support explicit seeding
             if neut_engine in ('discoal','msms','ms','msprime'):
                 try:
                     import random as _rndN
-                    unique_seeds_n=set(); seeds_for_chunks_n=[]
+                    unique_seeds_n = set(); seeds_for_chunks_n = []
                     while len(seeds_for_chunks_n) < len(neut_chunks):
-                        sN=_rndN.randint(1,2**31-1)
-                        if sN in unique_seeds_n: continue
-                        unique_seeds_n.add(sN); seeds_for_chunks_n.append(sN)
+                        sN = _rndN.randint(1, 2**31 - 1)
+                        if sN in unique_seeds_n:
+                            continue
+                        unique_seeds_n.add(sN)
+                        seeds_for_chunks_n.append(sN)
                 except Exception:
-                    seeds_for_chunks_n=[None]*len(neut_chunks)
+                    seeds_for_chunks_n = [None] * len(neut_chunks)
             else:
                 seeds_for_chunks_n = [None] * len(neut_chunks)
             # Prepare progress bar
@@ -6016,6 +6151,24 @@ def _run_simulation_core(args):
             # Aggregate stdout / stderr
             neut_out_txt = ''.join([r[1] for r in neut_results])
             neut_err_txt = ''.join([r[2] for r in neut_results if r[2]])
+            # Optional debug dump: write a short summary of neut_results and
+            # the aggregated stdout to a debug file when RAISD_DEBUG_NEUT is set.
+            try:
+                if os.getenv('RAISD_DEBUG_NEUT'):
+                    dbg_path = os.path.join(os.getcwd(), 'neutral_debug.log')
+                    with open(dbg_path, 'w') as dbgf:
+                        dbgf.write(f"# neutral_results entries: {len(neut_results)}\n")
+                        for idx, r in enumerate(neut_results):
+                            rc_val, out_val, err_val, code_val, rep_idx_val = r
+                            dbgf.write(f"-- entry {idx}: rc={rc_val} code={code_val} rep_idx={rep_idx_val} out_len={len(out_val)} err_len={len(err_val)}\n")
+                            # write first 1000 chars of stdout for inspection
+                            excerpt = out_val[:1000].replace('\r', '')
+                            dbgf.write(excerpt + ("\n...[truncated]\n" if len(out_val) > 1000 else "\n"))
+                        dbgf.write('\n# aggregated neut_out_txt first lines:\n')
+                        for ln in neut_out_txt.splitlines()[:200]:
+                            dbgf.write(ln + '\n')
+            except Exception:
+                pass
             # Report any non-zero return codes
             for r in neut_results:
                 if r[3]:
@@ -6025,15 +6178,28 @@ def _run_simulation_core(args):
             neut_out_path = None
             user_specified_neut = False
             if isinstance(paired_val, str) and paired_val.strip():
+                # If the user explicitly provided a --paired-neutral name, use it
+                # exactly as given (do not auto-append '_neutral'). This preserves
+                # user intent for custom naming.
                 neut_out_path = paired_val.strip()
                 user_specified_neut = True
-            if neut_out_path is None and getattr(args, '_user_out_provided', False) and args.out and args.out != '-':
-                main_out = args.out
-                if main_out.endswith('.vcf.gz'):
-                    root = main_out[:-7]; ext = '.vcf.gz'
+            # If no paired-neutral name was provided, derive one from the primary
+            # output if the primary output will be written; otherwise, if the
+            # primary output is auto-named (default_stem), derive from that.
+            if neut_out_path is None and not getattr(args, '_suppress_primary_output', False):
+                if getattr(args, 'out', None) and args.out != '-':
+                    main_out = args.out
+                    if main_out.endswith('.vcf.gz'):
+                        root = main_out[:-7]; ext = '.vcf.gz'
+                    else:
+                        root, ext = os.path.splitext(main_out)
+                    neut_out_path = root + '_neutral' + ext
                 else:
-                    root, ext = os.path.splitext(main_out)
-                neut_out_path = root + '_neutral' + ext
+                    # No explicit primary output; use default_stem and desired ext
+                    ext_map_full = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
+                    desired_ext = ext_map_full.get(fmt, '')
+                    if desired_ext:
+                        neut_out_path = default_stem + '_neutral' + desired_ext
             # Force neutral output format to mirror primary format even if user supplied a mismatched extension
             if neut_out_path and neut_out_path != '-':
                 ext_map_full = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
@@ -6246,6 +6412,17 @@ def _run_simulation_core(args):
                                 per_rep_vcfs_neut.append('\n'.join(vcf_lines_final) + ('\n' if vcf_lines_final and not vcf_lines_final[-1].endswith('\n') else ''))
 
                         # Write outputs: per-replicate into a folder when reps > 1, else single file
+                        # Optional debug: dump per-rep vcf summaries
+                        try:
+                            if os.getenv('RAISD_DEBUG_NEUT'):
+                                dbg_vpath = os.path.join(os.getcwd(), 'neutral_vcf_blocks.log')
+                                with open(dbg_vpath, 'w') as dv:
+                                    dv.write(f"per_rep_vcfs_neut count: {len(per_rep_vcfs_neut)}\n")
+                                    for ii, vv in enumerate(per_rep_vcfs_neut):
+                                        dv.write(f"-- block {ii} len={len(vv)}\n")
+                                        dv.write((vv[:500].replace('\r','') + ('\n...[truncated]\n' if len(vv) > 500 else '\n')))
+                        except Exception:
+                            pass
                         if args.reps and args.reps > 1:
                             parent_n = os.path.dirname(neut_out_path)
                             base_n = os.path.basename(neut_out_path)
@@ -6257,6 +6434,11 @@ def _run_simulation_core(args):
                                 folder_base_n = base_n[:-4]
                             elif fmt == 'bcf' and base_n.endswith('.bcf'):
                                 folder_base_n = base_n[:-4]
+                            # ensure folder base includes _neutral suffix only when
+                            # the neutral name was auto-derived (not user-specified).
+                            if not user_specified_neut:
+                                if not folder_base_n.endswith('_neutral'):
+                                    folder_base_n = folder_base_n + '_neutral'
                             out_dir_n = os.path.join(parent_n, folder_base_n) if parent_n else folder_base_n
                             try:
                                 os.makedirs(out_dir_n, exist_ok=True)
@@ -6266,14 +6448,17 @@ def _run_simulation_core(args):
                             for i, vtxt in enumerate(per_rep_vcfs_neut, start=1):
                                 if fmt == 'vcf.gz':
                                     path_out = os.path.join(out_dir_n, f"{root_n}_{i}.vcf.gz")
-                                    _write_bgzip_text(path_out, vtxt)
+                                    vtxt_adj = _ensure_vcf_has_samples(vtxt, neut_meta)
+                                    _write_bgzip_text(path_out, vtxt_adj)
                                 elif fmt == 'bcf':
                                     path_out = os.path.join(out_dir_n, f"{root_n}_{i}.bcf")
                                     tmp_vcf = None
                                     try:
                                         tmpdir = _ensure_local_tmpdir()
+                                        # Ensure header includes sample columns before conversion
+                                        vtxt_adj = _ensure_vcf_has_samples(vtxt, neut_meta)
                                         with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf', dir=tmpdir) as tf:
-                                            tf.write(vtxt)
+                                            tf.write(vtxt_adj)
                                             tmp_vcf = tf.name
                                         _vcf_text_to_bcf(tmp_vcf, path_out)
                                     finally:
@@ -6284,19 +6469,33 @@ def _run_simulation_core(args):
                                             pass
                                 else:
                                     path_out = os.path.join(out_dir_n, f"{root_n}_{i}.vcf")
+                                    vtxt_adj = _ensure_vcf_has_samples(vtxt, neut_meta)
                                     with open(path_out, 'w') as f2:
-                                        f2.write(vtxt)
+                                        f2.write(vtxt_adj)
                         else:
                             # Single file
-                            single_vtxt = per_rep_vcfs_neut[0] if per_rep_vcfs_neut else ''
+                            # If multiple per-rep VCF blocks were produced, prefer
+                            # the one that contains variants (heuristic: the
+                            # longest block). This prevents writing a header-only
+                            # VCF when another block holds the variant lines.
+                            if per_rep_vcfs_neut:
+                                try:
+                                    single_vtxt = max(per_rep_vcfs_neut, key=len)
+                                except Exception:
+                                    single_vtxt = per_rep_vcfs_neut[0]
+                            else:
+                                single_vtxt = ''
                             if fmt == 'vcf.gz':
-                                _write_bgzip_text(neut_out_path, single_vtxt)  # type: ignore[arg-type]
+                                single_vtxt_adj = _ensure_vcf_has_samples(single_vtxt, neut_meta)
+                                _write_bgzip_text(neut_out_path, single_vtxt_adj)  # type: ignore[arg-type]
                             elif fmt == 'bcf':
                                 tmp_vcf = None
                                 try:
                                     tmpdir = _ensure_local_tmpdir()
+                                    # Ensure header includes sample columns before conversion
+                                    single_vtxt_adj = _ensure_vcf_has_samples(single_vtxt, neut_meta)
                                     with tempfile.NamedTemporaryFile('w', delete=False, suffix='.vcf', dir=tmpdir) as tf:
-                                        tf.write(single_vtxt)
+                                        tf.write(single_vtxt_adj)
                                         tmp_vcf = tf.name
                                     _vcf_text_to_bcf(tmp_vcf, neut_out_path)
                                 finally:
@@ -6306,8 +6505,9 @@ def _run_simulation_core(args):
                                     except Exception:
                                         pass
                             else:
+                                single_vtxt_adj = _ensure_vcf_has_samples(single_vtxt, neut_meta)
                                 with open(neut_out_path, 'w') as f2:
-                                    f2.write(single_vtxt)
+                                    f2.write(single_vtxt_adj)
                     else:
                         # Raw neutral ms-like output (optionally gzipped)
                         f_open_neut = gzip.open if fmt == 'ms.gz' else open
