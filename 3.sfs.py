@@ -7,12 +7,12 @@ from datetime import datetime
 from tqdm import tqdm
 
 species = "Homo sapiens"
-engine ="scrm"
-chromosome = "21"
+engine ="msprime"
+chromosome = "1"
 samples = 10_000
 replicates = 5
 main_parallel = 5
-max_ram_percent = 85
+max_ram_percent = 80
 max_sims_per_work = 1 # can be None
 
 
@@ -172,10 +172,10 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
                     sfs_csv.loc[f"{model_id}={population}"] = values
                     sfs_csv.to_csv(f"data/{species_folder_name}/sfs.csv")
                     done = True
+                    break
 
                 except KeyboardInterrupt:
                     # If the user cancels, ensure we kill the child process group
-                    reason = "cancelled_by_user"
                     if proc is not None:
                         try:
                             # Kill the whole process group started by Popen (negative pid)

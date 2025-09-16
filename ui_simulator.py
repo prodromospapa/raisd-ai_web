@@ -1156,12 +1156,12 @@ with st.container():
             disabled=not ordered_ready or not sfs_on,
             help="When enabled the simulator will produce only the SFS artifact (no primary ms/vcf output). Requires Compute SFS to be checked."
         )
-    # Button area for preparing or executing the engine command. Disabled for
-    # msprime or when required UI steps aren't complete.
-    is_msprime = (engine == "msprime") if 'engine' in locals() else False
-    btn_disabled = not ordered_ready or is_msprime
-    if is_msprime:
-        st.caption("Execution is disabled for msprime in this UI.")
+    # Button area for preparing or executing the engine command. Disabled
+    # when required UI steps aren't complete. msprime is supported by the
+    # simulator backend (it runs in-process), so do not disable Execute
+    # when msprime is selected. The UI still hides Simulation-per-Work
+    # controls for msprime above (they're not applicable).
+    btn_disabled = not ordered_ready
     def build_cmd():
         if not ordered_ready:
             return None
