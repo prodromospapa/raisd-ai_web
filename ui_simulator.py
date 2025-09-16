@@ -33,8 +33,10 @@ st.markdown(
     .stTitle {font-weight: 800;}
     .card {
         padding: 1rem 1.25rem;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-        background: white;
+        /* make card background transparent and remove any border/shadow so it doesn't render as a thin line */
+        box-shadow: none !important;
+        border: none !important;
+        background: transparent !important;
     }
     .muted {color: #6b7280;}
     .pill {display:inline-block;padding:2px 8px;border-radius:999px;background:#f3f4f6;font-size:12px;margin-left:6px;}
@@ -239,35 +241,117 @@ for sp in sps.all_species():
         species_items.append((" ".join(label_parts), sp.id))
 species_items.sort(key=lambda x: x[0].lower())
 labels = [lbl for (lbl, sid) in species_items]
-if not labels:
+# Insert a placeholder so no species is selected by default
+placeholder_species = "-- select species --"
+display_species = [placeholder_species] + labels
+if len(labels) == 0:
     st.error("No species with demographic models found in stdpopsim. Install or update stdpopsim data.")
     st.stop()
 
-selected_label = st.selectbox("Species (hidden label)", labels, label_visibility='hidden')
-species_id = dict(species_items)[selected_label]
-
-try:
-    sp_obj = sps.get_species(species_id)
-except Exception as e:
-    st.error(f"Could not load species {species_id}: {e}")
-    st.stop()
+selected_label = st.selectbox("Species (hidden label)", display_species, label_visibility='hidden')
+if selected_label == placeholder_species:
+    species_id = None
+    sp_obj = None
+    species_selected = False
+else:
+    species_id = dict(species_items)[selected_label]
+    species_selected = True
+    try:
+        sp_obj = sps.get_species(species_id)
+    except Exception as e:
+        st.error(f"Could not load species {species_id}: {e}")
+        st.stop()
 
 # model
 st.subheader("2) Demographic Model")
-model_options = list_models(sp_obj)
-if not model_options:
+# Only list models when a species has been chosen
+model_options = list_models(sp_obj) if sp_obj is not None else []
+if species_selected and not model_options:
     st.error("No models available for the selected species.")
     st.stop()
-model_id = st.selectbox("Demographic model (hidden label)", model_options, label_visibility='hidden')
+
+# Add placeholder so no model is selected by default and disable until species chosen
+placeholder_model = "-- select model --"
+display_models = [placeholder_model] + model_options
+model_select_disabled = not species_selected
+
+
+# Render the model selectbox and an "Info" link side-by-side. The Info link
+# is a best-effort URL into the stdpopsim catalog that opens in a new tab.
+def _make_stdpop_url(species_id: str, model_id: str) -> str:
+    """Construct a best-effort stdpopsim catalog URL for a given species/model.
+
+    The docs use anchors like:
+      #sec_catalog_<something>_models_<modelname>
+    We cannot perfectly reconstruct the <something> for every species, so
+    build a reasonable anchor using the species_id and model_id lowercased
+    and with unsafe chars removed. If that fails, fall back to the catalog
+    root page.
+    """
+    base = "https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html"
+    try:
+        s = (species_id or "").lower().replace("/", "_").replace(" ", "")
+        # model anchor: keep alphanum and underscores
+        import re
+
+        m = (model_id or "").lower()
+        m = re.sub(r"[^a-z0-9_]+", "", m)
+        if s and m:
+            return f"{base}#sec_catalog_{s}_models_{m}"
+    except Exception:
+        pass
+    return base
+
+col_m, col_info = st.columns([7, 2])
+with col_m:
+    selected_model_label = st.selectbox("Demographic model (hidden label)", display_models, label_visibility='hidden', disabled=model_select_disabled)
+    if selected_model_label == placeholder_model:
+        model_id = None
+        model_selected = False
+    else:
+        model_id = selected_model_label
+        model_selected = True
+with col_info:
+    # show a more prominent "Demographic Model Info" button when a model is selected
+    try:
+        if model_id:
+            # species_id may be None if placeholder was selected; guard for safety
+            url = _make_stdpop_url(species_id or "", model_id)
+            # Render a nicer button using HTML/CSS. Keep it accessible and open in new tab.
+            btn_html = f"""
+            <a href="{url}" target="_blank" rel="noopener noreferrer"
+               style="display:inline-block;text-decoration:none;padding:8px 10px;border-radius:8px;
+                      background:linear-gradient(180deg,#2563eb,#1e40af);color:#fff;font-weight:600;
+                      font-size:13px;border:1px solid rgba(255,255,255,0.12);box-shadow:0 2px 6px rgba(16,24,40,0.12);"
+               title="Open stdpopsim docs for {model_id}">Demographic Model Info</a>
+            """
+            st.markdown(btn_html, unsafe_allow_html=True)
+        else:
+            # keep vertical alignment tidy when nothing selected
+            st.markdown('<div style="height:34px"></div>', unsafe_allow_html=True)
+    except Exception:
+        # best-effort UI enhancement; silently ignore on failure
+        pass
 
 # chromosome – always from available contigs (normalized, no 'chr')
 st.subheader("3) Chromosome")
-raw_contigs = list_contigs(sp_obj)
-if raw_contigs:
-    contigs = normalize_contig_names(raw_contigs)
-    chromosome = st.selectbox("Chromosome (hidden label)", contigs, label_visibility='hidden')
-else:
+# Compute contigs only if we have a species object; however the chromosome
+# picker should remain disabled until a model is selected (sequential flow).
+raw_contigs = list_contigs(sp_obj) if sp_obj is not None else []
+contigs = normalize_contig_names(raw_contigs) if raw_contigs else []
+placeholder_chrom = "-- select chromosome --"
+# Always show the placeholder in the selectbox so the UI doesn't look empty.
+display_contigs = [placeholder_chrom] + contigs
+# Disabled when the model hasn't been selected; also disable when there are no real contigs
+chrom_disabled = (not model_selected) or (len(contigs) == 0)
+selected_chrom = st.selectbox("Chromosome (hidden label)", display_contigs, label_visibility='hidden', disabled=chrom_disabled)
+if selected_chrom == placeholder_chrom:
     chromosome = None
+    chromosome_selected = False
+else:
+    chromosome = selected_chrom
+    chromosome_selected = True
+if len(contigs) == 0 and species_selected:
     st.info("No chromosomes/contigs available for this species in stdpopsim. The `--chromosome` argument will be omitted.")
 
 # Populations & Sample Sizes
@@ -279,13 +363,19 @@ else:
 # `pop_n_{model_key}_{index}` (integer). We preserve these keys for
 # backward compatibility with the previous checkbox-based UI.
 st.subheader("4) Populations & Sample Sizes")
-pop_names = list_pop_names(sp_obj, model_id)
-if not pop_names:
-    st.warning("Could not detect populations from the selected model. You can type them manually below.")
-    manual_pops = st.text_input("Manual population list (comma-separated)", value="")
-    names = [p.strip() for p in manual_pops.split(",") if p.strip()] if manual_pops.strip() else []
+# Enforce sequential step enabling: populations are only editable once
+# Species -> Model -> Chromosome have been selected.
+if not (species_selected and model_selected and chromosome_selected):
+    st.info("Select previous steps to configure populations.")
+    names = []
 else:
-    names = pop_names
+    pop_names = list_pop_names(sp_obj, model_id)
+    if not pop_names:
+        st.warning("Could not detect populations from the selected model. You can type them manually below.")
+        manual_pops = st.text_input("Manual population list (comma-separated)", value="")
+        names = [p.strip() for p in manual_pops.split(",") if p.strip()] if manual_pops.strip() else []
+    else:
+        names = pop_names
 
 # Wrap populations in a styled card for a cleaner visual and add a short hint
 st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -458,7 +548,8 @@ if selected:
         # Warning suppressed by user request: do not show the 'Set populations in order...' message
         pass
 
-st.markdown('</div>', unsafe_allow_html=True)
+# Core & Engine (render above tabs so we can conditionally include Paired neutral tab)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # Core & Engine (render above tabs so we can conditionally include Paired neutral tab)
 st.markdown("### Core & Engine")
@@ -528,7 +619,8 @@ with st.container():
             else:
                 chrom_label = f"Chromosome {chromosome} Length"
         else:
-            chrom_label = "Chromosome Length (use contig's native length; don't pass --length or --target-snps)"
+            # When no chromosome is selected keep the label short and clean
+            chrom_label = "Chromosome Length"
 
         chrom_length_mode = st.checkbox(
             chrom_label,
@@ -677,7 +769,7 @@ with st.container():
             temp_loc = st.selectbox("Temp location", ["local","system"], disabled=not ordered_ready)
         else:
             temp_loc = 'local'
-    st.markdown("</div>", unsafe_allow_html=True)
+    
 
     st.markdown('<div class="card" style="margin-top:0.75rem;">', unsafe_allow_html=True)
     d1, d2, d3, d4 = st.columns(4)
@@ -861,7 +953,7 @@ with st.container():
     with d4:
         # Progress flag moved to Build & Run tab per UX change; placeholder here to preserve layout
         st.write(" ")
-    st.markdown("</div>", unsafe_allow_html=True)
+    
 
     # Build dynamic tabs list: include Paired neutral only when sweep params enabled and engine supports selection engines
     sweep_key = f"sweep_enable_{model_key}"
@@ -894,7 +986,7 @@ with st.container():
         st.markdown("### Site Frequency Spectrum (SFS)")
         st.markdown('<div class="card">', unsafe_allow_html=True)
         sfs_key = f"sfs_enable_{model_key}"
-        if sfs_key not in st.session_state:
+        if sfs_key not in st.session_state: 
             st.session_state[sfs_key] = False
         sfs_on = st.checkbox("Compute SFS", value=st.session_state.get(sfs_key, False), disabled=not ordered_ready, key=sfs_key)
         # session-backed SFS output so we can auto-fill it from the Output path
@@ -905,7 +997,7 @@ with st.container():
         # If sfs is empty but output path exists, derive a sensible default
         try:
             out_path_key = f"output_path_{model_key}"
-            cur_sfs = st.session_state.get(sfs_output_key, "")
+            cur_sfs = st.session_state.get(sfs_output_key, "") 
             cur_out = st.session_state.get(out_path_key, "")
             if (not cur_sfs or not cur_sfs.strip()) and cur_out and cur_out.strip():
                 base = cur_out
@@ -922,7 +1014,7 @@ with st.container():
         # Ensure SFS output ends with .sfs when the user types a name without extension.
         def _ensure_sfs_ext():
             cur = st.session_state.get(sfs_output_key, "") or ""
-            if cur and not cur.lower().endswith('.sfs'):
+            if cur and not cur.lower().endswith('.sfs'): 
                 st.session_state[sfs_output_key] = cur + '.sfs'
 
         # Avoid passing `value=` when the session key already exists (prevents Streamlit warning)
@@ -930,7 +1022,7 @@ with st.container():
             sfs_output = st.text_input(
                 "SFS output",
                 disabled=not ordered_ready,
-                key=sfs_output_key,
+                key=sfs_output_key, 
                 on_change=_ensure_sfs_ext,
                 help="SFS output path. If left empty the UI derives a filename from the Output path (replaces extension with .sfs)."
             )
@@ -945,7 +1037,7 @@ with st.container():
             )
         sfs_normalized = st.checkbox("Normalize SFS", value=False, disabled=not ordered_ready)
         sfs_mode = st.selectbox("SFS mode", ["mean","per-rep"], disabled=not ordered_ready)
-        st.markdown("</div>", unsafe_allow_html=True)
+        
 
     # Paired neutral tab (conditionally present in tab_map)
     if "Paired neutral" in tab_map:
@@ -953,7 +1045,7 @@ with st.container():
             st.markdown("### Paired Neutral output")
             st.markdown('<div class="card">', unsafe_allow_html=True)
             paired_key = f"paired_neutral_{model_key}"
-            paired_neutral = st.checkbox(
+            paired_neutral = st.checkbox( 
                 "Run paired neutral",
                 value=False,
                 disabled=not ordered_ready,
@@ -965,7 +1057,7 @@ with st.container():
             # If primary output exists, insert _neutral before its extension. If SFS-only,
             # suggest the sfs base with _neutral and do not append an extension (per request).
             paired_name_key = f"paired_neutral_name_{model_key}"
-            default_neutral_name = ""
+            default_neutral_name = "" 
             try:
                 out_path_key = f"output_path_{model_key}"
                 out_val = st.session_state.get(out_path_key, "") or ""
@@ -977,7 +1069,7 @@ with st.container():
                 if out_val.strip():
                     base = out_val
                     # detect double extensions first
-                    ext = ""
+                    ext = "" 
                     for e in [".ms.gz", ".vcf.gz"]:
                         if base.endswith(e):
                             base_noext = base[:-len(e)]
@@ -1001,7 +1093,7 @@ with st.container():
             if user_set_key not in st.session_state:
                 st.session_state[user_set_key] = False
 
-            def _mark_pn_user_set():
+            def _mark_pn_user_set(): 
                 # When the user edits the text input, mark the name as user-set so
                 # automatic updates no longer overwrite it.
                 try:
@@ -1057,7 +1149,7 @@ with st.container():
                     st.caption("Enable sweep parameters to choose a neutral engine (defaults to sweep engine).")
                 elif engine not in {"msms", "discoal"}:
                     st.caption("Paired neutral engine selection is meaningful mainly for msms or discoal engines.")
-            st.markdown("</div>", unsafe_allow_html=True)
+            
 
     with tab_map["Demography & Selection"]:
         st.markdown("### Demography & Selection")
@@ -1166,7 +1258,7 @@ with st.container():
                 sweep_pos_pct = 50.0
                 sel_s = 0.0
                 time_units = "gens"
-        st.markdown("</div>", unsafe_allow_html=True)
+        
 
 
     with tab_map["Build & Run"]:
@@ -1253,10 +1345,13 @@ with st.container():
         fixation_time = _ss_glob_read(f"fixation_time_{model_key}", 'fixation_time', float, 0.0)
         cmd = [sys.executable, SIM_SCRIPT,
                "--engine", engine,
-               "--species-id", species_id,
-               "--model-id", model_id,
                "--pop-order", ",".join(pop_order),
                "--sample-individuals", ",".join(str(n) for n in counts)]
+        # Only include species/model arguments when the user explicitly selected them
+        if species_selected and species_id:
+            cmd += ["--species-id", species_id]
+        if model_selected and model_id:
+            cmd += ["--model-id", model_id]
         if chromosome:
             cmd += ["--chromosome", str(chromosome)]
         # If chromosome/native length mode is enabled, ignore explicit length/target-snps
@@ -2711,6 +2806,6 @@ with st.container():
 
                 # Manual delete control removed per user request.
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        
 
 # (Removed tip about progress bar per user request)
