@@ -95,32 +95,34 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
                 "--sfs-normalized",
                 "--max-ram-percent", str(max_ram_percent),
             ]
-
             if max_sims_per_work is not None:
                 base_args += ["--sims-per-work", str(max_sims_per_work)]
             first = True
             done = False
             parallel = main_parallel
             while parallel != 0:
+                proc = None
+                stderr = ""
                 try:
-                    # Run the simulator in a separate session so child-driven
-                    # process-group kills don't affect this parent process.
-                    completed = subprocess.run(
+                    # Start the simulator in a new session so it has its own process group.
+                    # Use Popen so we can terminate the entire group if the user cancels.
+                    proc = subprocess.Popen(
                         base_args,
-                        check=False,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE,
                         start_new_session=True,
                         text=True
                     )
 
+                    # Wait for completion and capture stderr
+                    _, stderr = proc.communicate()
+                    rc = proc.returncode
+
                     # If child exit code indicates it was killed by a signal,
                     # treat it as an out-of-memory / termination and retry with
                     # reduced resources (matching previous behavior).
-                    rc = completed.returncode
                     if rc != 0:
-                        # Popen/ subprocess returns negative codes for signals on some platforms
-                        # and shells use 128+SIGNAL. Normalize to signal number when possible.
+                        # Normalize to signal number when possible.
                         sig = None
                         try:
                             if rc < 0:
@@ -132,29 +134,25 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
 
                         # If terminated by SIGKILL or SIGTERM, treat as RAM problem
                         if sig in (9, 15):
-                            # emulate earlier handling: lower parallel / sims-per-work
                             if first:
-                                base_args += ["--sims-per-work","1"]
+                                base_args += ["--sims-per-work", "1"]
                                 first = False
                                 continue
                             else:
                                 parallel -= 1
-                                base_args[base_args.index("--parallel")+1] = str(parallel)
+                                base_args[base_args.index("--parallel") + 1] = str(parallel)
                                 continue
-                        # Otherwise, if the simulator returned code 2, handle as before
                         if rc == 2:
                             if first:
-                                base_args += ["--sims-per-work","1"]
+                                base_args += ["--sims-per-work", "1"]
                                 first = False
                                 continue
                             else:
                                 parallel -= 1
-                                base_args[base_args.index("--parallel")+1] = str(parallel)
+                                base_args[base_args.index("--parallel") + 1] = str(parallel)
                                 continue
-                        # Non-recoverable non-zero exit: raise to the outer except
-                        if rc != 0:
-                            # attach stderr text to the exception-like handling below
-                            raise subprocess.CalledProcessError(rc, base_args, output=completed.stdout, stderr=completed.stderr)
+                        # Non-recoverable non-zero exit: raise to be handled below
+                        raise subprocess.CalledProcessError(rc, base_args, stderr=stderr)
 
                     sfs_part = pd.read_csv(
                         "part.sfs",
@@ -164,34 +162,74 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
                         header=0
                     )
                     os.remove("part.sfs")
-                    sfs_csv.loc[f"{model_id}={population}"] = sfs_part.loc["mean"].values
+                    values = sfs_part.loc["mean"].values
+                    if sum(values) == 0:
+                        reason = "all_zero_sfs"
+                        break
+                    sfs_csv.loc[f"{model_id}={population}"] = values
                     sfs_csv.to_csv(f"data/{species_folder_name}/sfs.csv")
                     done = True
 
+                except KeyboardInterrupt:
+                    # If the user cancels, ensure we kill the child process group
+                    reason = "cancelled_by_user"
+                    if proc is not None:
+                        try:
+                            # Kill the whole process group started by Popen (negative pid)
+                            os.killpg(proc.pid, 9)
+                        except Exception:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                    # Re-raise to allow higher-level handlers (if any) or to stop execution
+                    raise
+
                 except subprocess.CalledProcessError as e:
                     rc = getattr(e, 'returncode', None)
+                    # In our raise above we didn't include returncode, so infer from proc if possible
+                    if rc is None and proc is not None:
+                        rc = proc.returncode
+
                     if rc == 2:
                         if first:
-                            base_args += ["--sims-per-work","1"]
+                            base_args += ["--sims-per-work", "1"]
                             first = False
                         else:
                             parallel -= 1
-                            base_args[base_args.index("--parallel")+1] = str(parallel)
+                            base_args[base_args.index("--parallel") + 1] = str(parallel)
                         continue
                     # For other return codes, record and break
                     reason = f'subprocess_error "{rc}"'
-                    # optionally capture stderr for diagnostics
                     try:
                         if e.stderr:
                             reason += f': {e.stderr.strip()[:200]}'
                     except Exception:
-                        pass
+                        # fallback to stderr captured from proc.communicate
+                        try:
+                            if proc is not None and proc.stderr is not None:
+                                # proc.stderr may be a pipe; we captured it above
+                                if stderr:
+                                    reason += f': {stderr.strip()[:200]}'
+                        except Exception:
+                            pass
                     break
 
                 except ValueError as e:
                     if "non-sampling population" in str(e):
                         reason = "non_sampling_population"
                         break
+
+                finally:
+                    # Ensure no orphaned child process remains if we decided to stop
+                    if proc is not None and proc.poll() is None and (not done):
+                        try:
+                            os.killpg(proc.pid, 9)
+                        except Exception:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
             if parallel == 0:
                 reason = "run_out_of_ram"
 

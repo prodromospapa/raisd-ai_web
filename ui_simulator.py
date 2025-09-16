@@ -1,3 +1,4 @@
+# streamlit run ui_simulator.py 
 import sys
 import subprocess
 import shlex
@@ -762,53 +763,61 @@ with st.container():
         # Simulation per Work: prettier Auto vs Custom radio and renamed label
         sims_auto_key = f"sims_per_work_auto_{model_key}"
         sims_auto_default = st.session_state.get(sims_auto_key, True)
-        col_sims_a, col_sims_b = st.columns([1, 3])
-        with col_sims_a:
-            sims_choice = st.radio(
-                "Simulation per Work",
-                options=["Auto", "Custom"],
-                index=0 if sims_auto_default else 1,
-                key=f"sims_per_work_choice_{model_key}",
-                horizontal=True,
-                disabled=not ordered_ready,
-            )
-            sims_per_work_auto = (sims_choice == "Auto")
-            st.session_state[sims_auto_key] = sims_per_work_auto
-            # If engine is msprime, sims-per-work is not applicable; force Auto and disable Custom
-            if engine == "msprime":
-                sims_per_work_auto = True
-                st.session_state[sims_auto_key] = True
-        with col_sims_b:
-            # If Auto is selected we do not set the argument; if Custom is
-            # selected, show a slider whose max is ceil(replicates / parallel)
-            if sims_per_work_auto:
-                sims_per_work = 0
-            else:
-                try:
-                    par = int(parallel) if parallel else 1
-                except Exception:
-                    par = 1
-                try:
-                    reps = int(replicates) if replicates else 1
-                except Exception:
-                    reps = 1
-                import math
-                max_val = max(1, math.ceil(reps / max(1, par)))
-                if max_val <= 1:
-                    # Slider requires min < max; when only 1 is possible show a caption/read-only value
-                    st.caption("Simulation per Work: 1 (computed)")
-                    sims_per_work = 1
+
+        # Hide the Simulation-per-Work controls for msprime (not applicable).
+        # Ensure session state and local variables are set so later code can
+        # safely reference `sims_per_work` and the session key.
+        if engine == "msprime":
+            # Force Auto mode and define sims_per_work as 0 (meaning Auto)
+            st.session_state[sims_auto_key] = True
+            sims_per_work_auto = True
+            sims_per_work = 0
+            # Inform the user briefly
+            st.caption("Simulation per Work: not applicable for msprime; using automatic scheduling.")
+        else:
+            col_sims_a, col_sims_b = st.columns([1, 3])
+            with col_sims_a:
+                sims_choice = st.radio(
+                    "Simulation per Work",
+                    options=["Auto", "Custom"],
+                    index=0 if sims_auto_default else 1,
+                    key=f"sims_per_work_choice_{model_key}",
+                    horizontal=True,
+                    disabled=not ordered_ready,
+                )
+                sims_per_work_auto = (sims_choice == "Auto")
+                st.session_state[sims_auto_key] = sims_per_work_auto
+            with col_sims_b:
+                # If Auto is selected we do not set the argument; if Custom is
+                # selected, show a slider whose max is ceil(replicates / parallel)
+                if sims_per_work_auto:
+                    sims_per_work = 0
                 else:
-                    sims_per_work = st.slider(
-                        "Simulation per Work",
-                        min_value=1,
-                        max_value=max_val,
-                        value=1,
-                        step=1,
-                        disabled=not ordered_ready,
-                        help=f"Workers will process this many simulations per work (1..{max_val}).",
-                        key=f"sims_per_work_slider_{model_key}",
-                    )
+                    try:
+                        par = int(parallel) if parallel else 1
+                    except Exception:
+                        par = 1
+                    try:
+                        reps = int(replicates) if replicates else 1
+                    except Exception:
+                        reps = 1
+                    import math
+                    max_val = max(1, math.ceil(reps / max(1, par)))
+                    if max_val <= 1:
+                        # Slider requires min < max; when only 1 is possible show a caption/read-only value
+                        st.caption("Simulation per Work: 1 (computed)")
+                        sims_per_work = 1
+                    else:
+                        sims_per_work = st.slider(
+                            "Simulation per Work",
+                            min_value=1,
+                            max_value=max_val,
+                            value=1,
+                            step=1,
+                            disabled=not ordered_ready,
+                            help=f"Workers will process this many simulations per work (1..{max_val}).",
+                            key=f"sims_per_work_slider_{model_key}",
+                        )
     with d3:
         max_ram_percent = st.slider(
             "Max RAM %",
