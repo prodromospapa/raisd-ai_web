@@ -2813,8 +2813,12 @@ def parse_args():
                  "This flag is ignored for engine=msprime (internal in-process batching). "
                  "Minimum 1; values greater than total replicates are capped to total replicates."))
     g.add_argument('--max-ram-percent', dest='max_ram_percent', type=float, default=80.0,
-                   help=("Abort the run if total system RAM usage exceeds this percentage out of 100 (float). "
-                         "Default 80.0."))
+             help=("Numeric threshold (percent 0..100) used by the RAM watchdog. Interpretation depends on"
+                 " --max-ram-cap (system|run). Default 80.0."))
+    g.add_argument('--max-ram-cap', dest='max_ram_cap', choices=['system', 'run'], default='system',
+             help=("How to interpret --max-ram-percent: 'system' (default) compares to total system RAM usage percent;"
+                 " 'run' compares the current process RSS as a percentage of total system RAM (i.e. the run's share)."
+                 " Note: if system RAM usage reaches 99%% the run will be terminated regardless of this setting."))
     # Show-only command flag
     g.add_argument('--show-command', action='store_true', help="Print the external simulator command that would run and exit (no execution).")
     g.add_argument('--progress', action='store_true', help="Show progress bar (requires tqdm).")
@@ -2869,6 +2873,14 @@ def parse_args():
         # If validation fails, stop early with a clear message
         sys.exit(f"ERROR: invalid --max-ram-percent: {e}")
 
+    # cap mode: 'system' (compare vm.percent) or 'run' (compare process RSS/total RAM)
+    try:
+        max_ram_cap = getattr(args, 'max_ram_cap', 'system')
+        if max_ram_cap not in (None, 'system', 'run'):
+            raise ValueError('--max-ram-cap must be "system" or "run"')
+    except Exception as e:
+        sys.exit(f"ERROR: invalid --max-ram-cap: {e}")
+
     # Normalize target-snps tolerance: require percent (0..100) only; convert to internal fraction
     try:
         raw_tol = getattr(args, 'min_snps_tol', 0.0)
@@ -2905,7 +2917,7 @@ def parse_args():
         except Exception:
             # psutil not available; do not monitor
             try:
-                sys.stderr.write('# INFO: psutil not available; --max-ram-percent monitoring disabled.\n')
+                sys.stderr.write('# INFO: psutil not available; --max-ram-percent/--max-ram-cap monitoring disabled.\n')
             except Exception:
                 pass
             return
@@ -2921,8 +2933,42 @@ def parse_args():
         while not stop_event.is_set():
             try:
                 vm = pfunc()
-                used = float(getattr(vm, 'percent', 0.0))
-                if threshold_pct is not None and used > float(threshold_pct):
+                system_used = float(getattr(vm, 'percent', 0.0))
+
+                # Safety cutoff: if system usage reaches or exceeds 99% always trigger
+                if system_used >= 99.0:
+                    trigger_reason = 'system_critical'
+                    trigger_value = system_used
+                else:
+                    trigger_reason = None
+                    trigger_value = None
+
+                # Only evaluate configured threshold if provided and not already critical
+                if trigger_reason is None and threshold_pct is not None:
+                    cap_mode = getattr(args_obj, 'max_ram_cap', 'system')
+                    if cap_mode == 'system' or cap_mode is None:
+                        # compare system percent
+                        if system_used > float(threshold_pct):
+                            trigger_reason = 'system'
+                            trigger_value = system_used
+                    else:
+                        # run mode: compare our process RSS as percent of total RAM
+                        try:
+                            proc = psutil.Process(os.getpid())
+                            rss = float(proc.memory_info().rss)
+                            total = float(getattr(vm, 'total', 0) or 0)
+                            if total > 0:
+                                run_pct = rss / total * 100.0
+                                if run_pct > float(threshold_pct):
+                                    trigger_reason = 'run'
+                                    trigger_value = run_pct
+                        except Exception:
+                            # If any issue reading process mem, fall back to system check
+                            if system_used > float(threshold_pct):
+                                trigger_reason = 'system'
+                                trigger_value = system_used
+
+                if trigger_reason is not None:
                     # mark on args so the rest of the runner can react
                     try:
                         # Close any active progress bar to avoid tqdm re-rendering
@@ -2940,15 +2986,32 @@ def parse_args():
                                 'reduce the number of parallel workers with --parallel',
                                 "if not using msprime, lower --sims-per-work",
                                 'reduce --replicates or --sample-individuals',
-                                'or rerun with a larger --max-ram-percent'
+                                'or rerun with a larger --max-ram-percent / different --max-ram-cap'
                             ]
                             suggestion_text = '; '.join(suggestion_parts)
-                            friendly = (
-                                f"Memory usage {used:.1f}% exceeded the configured limit of {threshold_pct}%.\n"
-                                f"Suggested actions: {suggestion_text}.\n"
-                            )
+                            if trigger_reason == 'system' or trigger_reason == 'system_critical':
+                                friendly = (
+                                    f"System memory usage {trigger_value:.1f}% exceeded the configured system limit of {threshold_pct}% (or hit the 99% safety cutoff).\n"
+                                    f"Suggested actions: {suggestion_text}.\n"
+                                )
+                            else:
+                                # run mode
+                                try:
+                                    # convert threshold to GB for clarity
+                                    total = float(getattr(vm, 'total', 0) or 0)
+                                    limit_bytes = (float(threshold_pct) / 100.0) * total if total > 0 else None
+                                    if limit_bytes is not None:
+                                        limit_gb = limit_bytes / (1024**3)
+                                        friendly = (
+                                            f"Run memory {trigger_value:.1f}% of total RAM exceeded configured limit {threshold_pct}% (~{limit_gb:.2f} GB).\n"
+                                            f"Suggested actions: {suggestion_text}.\n"
+                                        )
+                                    else:
+                                        friendly = (f"Run memory {trigger_value:.1f}% exceeded configured limit of {threshold_pct}%.\n")
+                                except Exception:
+                                    friendly = (f"Run memory {trigger_value:.1f}% exceeded configured limit of {threshold_pct}%.\n")
                         except Exception:
-                            friendly = (f"Memory usage {used:.1f}% exceeded the configured limit of {threshold_pct}%.\n")
+                            friendly = (f"Memory threshold exceeded ({trigger_value:.1f}%).\n")
                         try:
                             setattr(args_obj, '_ram_exceeded', True)
                             setattr(args_obj, '_ram_exceeded_message', friendly)

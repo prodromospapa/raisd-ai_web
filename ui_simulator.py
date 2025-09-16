@@ -832,15 +832,32 @@ with st.container():
                             key=f"sims_per_work_slider_{model_key}",
                         )
     with d3:
-        max_ram_percent = st.slider(
-            "Max RAM %",
-            min_value=1,
-            max_value=100,
-            value=80,
-            step=1,
-            disabled=not ordered_ready,
-            help="Maximum RAM percentage allowed for workers (1-100)."
-        )
+        # Render slider and a small radio selector for cap mode (system/run) side-by-side
+        col_ram_slider, col_ram_mode = st.columns([3, 1])
+        with col_ram_slider:
+            max_ram_percent = st.slider(
+                "Max RAM %",
+                min_value=1,
+                max_value=100,
+                value=80,
+                step=1,
+                disabled=not ordered_ready,
+                help="Numeric threshold (1-100). Interpretation depends on Max RAM cap mode."
+            )
+        with col_ram_mode:
+            # session-backed key so selection persists per model
+            max_ram_cap_key = f"max_ram_cap_{model_key}"
+            if max_ram_cap_key not in st.session_state:
+                st.session_state[max_ram_cap_key] = 'system'
+            max_ram_cap = st.radio(
+                "Cap",
+                options=['system', 'run'],
+                index=0 if st.session_state.get(max_ram_cap_key, 'system') == 'system' else 1,
+                key=max_ram_cap_key,
+                horizontal=False,
+                disabled=not ordered_ready,
+                help="Interpretation: 'system' compares to total system RAM usage; 'run' compares the run's RSS as % of total RAM."
+            )
     with d4:
         # Progress flag moved to Build & Run tab per UX change; placeholder here to preserve layout
         st.write(" ")
@@ -1320,6 +1337,14 @@ with st.container():
             else:
                 mr = float(max_ram_percent)
             cmd += ["--max-ram-percent", str(mr)]
+            # also include the cap interpretation selected in the UI (system|run)
+            try:
+                max_ram_cap_val = _ss_glob_read(f"max_ram_cap_{model_key}", 'max_ram_cap', str, 'system')
+                if max_ram_cap_val:
+                    cmd += ["--max-ram-cap", str(max_ram_cap_val)]
+            except Exception:
+                # ignore failure and continue
+                pass
         except Exception:
             # best effort: don't crash the UI if conversion fails
             try:
