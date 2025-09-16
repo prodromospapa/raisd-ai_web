@@ -8,9 +8,6 @@ import time
 import json
 
 # default thread count (safe when os.cpu_count() returns None)
-_cpu = os.cpu_count() or 2
-_default_parallel = max(1, _cpu // 2)
-
 # CLI: accept species as stdpopsim id or full name (e.g. 'HomSap' or 'Homo sapiens')
 parser = argparse.ArgumentParser(description="Train RAiSD-AI models for a species")
 parser.add_argument("--species", type=str, required=True,
@@ -31,8 +28,8 @@ parser.add_argument("--epochs", type=int, default=3,
                     help="Training epochs for RAiSD-AI (default 3)")
 parser.add_argument("--gpu", action='store_true', default=False,
                     help="Enable GPU mode for simulator/training when supported")
-parser.add_argument("--parallel", type=int, default=_default_parallel,
-                    help=f"Parallel worker count for simulator runs (default {_default_parallel})")
+parser.add_argument("--parallel", type=int, default=max(1, os.cpu_count() // 2),
+                    help=f"Parallel worker count for simulator runs (default {max(1, os.cpu_count() // 2)})")
 parser.add_argument("--engine", type=str, default="msms",
                     help="Simulation engine to use (default: msms)")
 args = parser.parse_args()

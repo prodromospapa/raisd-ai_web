@@ -8,6 +8,7 @@
 !1.train.py
 !2.annotation.py
 !3.sfs.py
+!4.final_check.py
 !run.sh
 !.gitignore
 !README.md
