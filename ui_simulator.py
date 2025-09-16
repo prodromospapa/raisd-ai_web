@@ -690,15 +690,40 @@ with st.container():
             st.session_state[tol_auto_key] = target_snps_tol_auto
 
         with col_tol_b:
-            target_snps_tol = st.number_input(
-                "Target SNPs tolerance (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=0.0,
-                step=0.1,
-                disabled=tol_disabled or target_snps_tol_auto,
-                help="Tolerance for target SNPs overshoot. Enter percent (0-100). For backward compatibility the simulator also accepts fractional values <=1."
-            )
+            # Only render the Custom tolerance input when the user explicitly
+            # selected 'Custom' AND tolerance editing is enabled for this run.
+            tol_key_ss = f"target_snps_tol_{model_key}"
+            target_snps_tol = None
+            if not (tol_disabled or target_snps_tol_auto):
+                # When the user first switches to Custom, initialize a sensible
+                # default of 10% (as requested). Create the widget with an
+                # explicit default only when the session key does not exist.
+                if tol_key_ss not in st.session_state:
+                    target_snps_tol = st.number_input(
+                        "Target SNPs tolerance (%)",
+                        min_value=1e-9,
+                        max_value=100.0,
+                        value=10.0,
+                        step=0.1,
+                        key=tol_key_ss,
+                        help="Tolerance for target SNPs overshoot. Enter percent (>0-100). For backward compatibility the simulator also accepts fractional values <=1."
+                    )
+                else:
+                    # When the session key exists, do NOT pass `value=` —
+                    # Streamlit will use the session state value and avoids
+                    # emitting a warning about setting defaults via Session API.
+                    target_snps_tol = st.number_input(
+                        "Target SNPs tolerance (%)",
+                        min_value=1e-9,
+                        max_value=100.0,
+                        step=0.1,
+                        key=tol_key_ss,
+                        help="Tolerance for target SNPs overshoot. Enter percent (>0-100). For backward compatibility the simulator also accepts fractional values <=1."
+                    )
+            else:
+                # When Auto or disabled, do not show the input. Keep a local
+                # placeholder variable for downstream code that may read it.
+                target_snps_tol = float(st.session_state.get(tol_key_ss, 0.0) or 0.0)
 
         if tol_disabled:
             st.caption("Tolerance applies only when 'Target SNPs' is set to a positive value.")
@@ -1453,7 +1478,26 @@ with st.container():
                 # Only include tolerance flag when user explicitly set a custom value (Auto unchecked)
                 tol_auto_ss = bool(st.session_state.get(f"target_snps_tol_auto_{model_key}", True))
                 if not tol_auto_ss:
-                    cmd += ["--target-snps-tol", str(float(target_snps_tol))]
+                    # Read the session-backed tolerance value (percent). Accept
+                    # fractional values <=1 for backward compatibility (convert
+                    # to percent by *100). Only include flag when value > 0.
+                    try:
+                        raw_tol = float(st.session_state.get(f"target_snps_tol_{model_key}", 0.0) or 0.0)
+                    except Exception:
+                        raw_tol = float(target_snps_tol or 0.0)
+                    # Normalize fractional inputs (<=1) into percent
+                    tol_percent = raw_tol
+                    try:
+                        if 0.0 < raw_tol <= 1.0:
+                            tol_percent = raw_tol * 100.0
+                    except Exception:
+                        pass
+                    # Only include when strictly positive
+                    try:
+                        if float(tol_percent) > 0.0:
+                            cmd += ["--target-snps-tol", str(float(tol_percent))]
+                    except Exception:
+                        pass
         if replicates and replicates != 1:
             cmd += ["--replicates", str(int(replicates))]
         # Only include primary output path when not running SFS-only
@@ -2852,6 +2896,20 @@ with st.container():
         except Exception:
             pass
 
+        # If user selected a custom target-snps tolerance, require it to be > 0
+        tol_invalid_missing = False
+        try:
+            tol_auto_ss = bool(st.session_state.get(f"target_snps_tol_auto_{model_key}", True))
+            if not tol_auto_ss:
+                # read the session-backed tolerance value (percent)
+                tol_val = float(st.session_state.get(f"target_snps_tol_{model_key}", 0.0) or 0.0)
+                # disallow zero or negative values for custom tolerance
+                if tol_val <= 0.0:
+                    tol_invalid_missing = True
+                    st.error("Target SNPs tolerance must be a positive value greater than 0 when Custom is selected.")
+        except Exception:
+            tol_invalid_missing = False
+
         # Require at least one of: explicit Length >0, Target SNPs >0, or Chromosome Length mode
         try:
             chrom_mode = bool(st.session_state.get(f"chrom_length_mode_{model_key}", False))
@@ -2903,6 +2961,7 @@ with st.container():
             or sfs_missing_req
             or primary_missing_req
             or sweep_pop_required_missing
+            or tol_invalid_missing
         )
 
         # Separate flag used solely for the Show engine command button so

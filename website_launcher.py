@@ -114,9 +114,9 @@ def _cleanup_worker():
                         try:
                             shutil.rmtree(run_dir)
                             _run_last_seen.pop(name, None)
-                            app.logger.info(f"Cleaned stale run dir (report={'yes' if report_present else 'no'}): {run_dir}")
+                            app.logger.info(f"Cleaned stale run dir (report={'yes' if report_present else 'no'}): {_shorten_path(run_dir)}")
                         except Exception as e:
-                            app.logger.warning(f"Failed to remove stale run dir {run_dir}: {e}")
+                            app.logger.warning(f"Failed to remove stale run dir {_shorten_path(run_dir)}: {e}")
         except Exception as e:
             app.logger.exception(f"Run dir cleanup thread error: {e}")
         time.sleep(60)
@@ -238,10 +238,55 @@ def allowed_file(filename: str) -> bool:
 def append_log(run_dir: str, msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
+        # Sanitize any absolute filesystem paths in messages before writing logs
+        safe_msg = _sanitize_log_message(msg)
         with open(os.path.join(run_dir, "run.log"), "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
+            f.write(f"[{ts}] {safe_msg}\n")
     except Exception:
         pass
+
+
+def _shorten_path(p: str) -> str:
+    """Return a short/redacted representation of a filesystem path.
+
+    Rules:
+    - If path is empty or not an absolute path, return as-is (or basename for files).
+    - For absolute paths, return '<REDACTED>/(basename or last two components)'.
+    """
+    try:
+        if not p:
+            return p
+        # If p looks like multiple paths joined (e.g. CMD), don't attempt to split; handle single path
+        if '\n' in p or '\t' in p:
+            return p
+        if os.path.isabs(p):
+            # Keep last two path components for context where possible
+            parts = p.rstrip(os.path.sep).split(os.path.sep)
+            if len(parts) >= 3:
+                return os.path.join('<REDACTED>', parts[-2], parts[-1])
+            return os.path.join('<REDACTED>', parts[-1])
+        # Not absolute: return basename for safety
+        return os.path.basename(p) or p
+    except Exception:
+        return '<REDACTED_PATH>'
+
+
+def _sanitize_log_message(msg: str) -> str:
+    """Sanitize a free-form log message by replacing absolute paths with shortened forms.
+
+    This is a conservative sanitizer: it replaces sequences that look like absolute
+    Unix paths (starting with '/') with a shortened representation.
+    """
+    try:
+        # Replace any /... sequences with shortened version while preserving small tokens like '/dev/nvidia0'
+        def repl(match):
+            p = match.group(0)
+            return _shorten_path(p)
+
+        # A simple regex to match absolute Unix paths (space/newline/beginning-delimited)
+        return re.sub(r'(?<!\S)/[A-Za-z0-9_./\\-]+', repl, str(msg))
+    except Exception:
+        return '<REDACTED_MSG>'
 
 def _needs_index(path: str) -> Tuple[bool, Optional[str]]:
     p = path.lower()
@@ -354,13 +399,14 @@ def _load_annotation(species: str, chromosome: str) -> pd.DataFrame:
         if os.path.exists(path):
             try:
                 df = pd.read_csv(path, sep="\t", dtype={"chromosome": str})
-                app.logger.info(f"Loaded annotation file: {path}")
+                app.logger.info(f"Loaded annotation file: {_shorten_path(path)}")
             except Exception as read_e:
-                app.logger.exception(f"Failed to read annotation file {path}: {read_e}")
+                app.logger.exception(f"Failed to read annotation file {_shorten_path(path)}: {read_e}")
                 raise
             break
     else:
-        app.logger.warning(f"_load_annotation: no annotation file found for species variants {candidates!r} chromosome={chromosome}. Tried: {tried_paths}")
+        tried_short = [ _shorten_path(p) for p in tried_paths ]
+        app.logger.warning(f"_load_annotation: no annotation file found for species variants {candidates!r} chromosome={chromosome}. Tried: {tried_short}")
         raise FileNotFoundError(f"Annotation file not found. Tried: {', '.join(tried_paths)}")
 
     def _first_non_null(series):
@@ -1049,7 +1095,7 @@ def run_raisd(run_dir: str, model_path: str, vcf_path: str, chromosome: int, gri
         # Fallback to previous search-based normalization
         found = _find_and_normalize_report(run_dir, prefix="results")
         if found:
-            append_log(run_dir, f"Normalized report to: {found}")
+            append_log(run_dir, f"Normalized report to: {os.path.basename(found)}")
             report_path = found
 
     if proc.returncode != 0:
@@ -1064,7 +1110,7 @@ def run_raisd(run_dir: str, model_path: str, vcf_path: str, chromosome: int, gri
         err_tail = (proc.stderr or "").splitlines()[-30:]
         raise FileNotFoundError(
             "RAiSD finished but no report was produced.\n"
-            f"Searched under: {run_dir}\n"
+            f"Searched under: {_shorten_path(run_dir)}\n"
             f"CMD: {' '.join(cmd)}\n"
             "Possible causes: incompatible flags, empty scan region, or a build that writes elsewhere.\n"
             "stdout (tail):\n" + "\n".join(std_tail) + "\n\n"
