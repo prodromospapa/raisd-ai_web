@@ -207,24 +207,6 @@ def load_skipped():
     except Exception:
         pass
     return skipped
-
-def remove_from_sfs_csv_if_present(species_folder_name, key):
-    """If data/<species>/sfs.csv exists, remove row matching `key` (index like 'model=pop')."""
-    try:
-        import pandas as _pd
-    except Exception:
-        return
-    csv_path = os.path.join("data", species_folder_name, "sfs.csv")
-    try:
-        if os.path.exists(csv_path):
-            df = _pd.read_csv(csv_path, index_col=0)
-            if key in df.index:
-                df = df.drop(index=key)
-                df.to_csv(csv_path)
-    except Exception:
-        # best-effort: ignore any problems here
-        pass
-
 existing_skipped = load_skipped()
 
 if species in species_dict.keys():
@@ -277,13 +259,7 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                 try:
                     latest_skipped = load_skipped()
                     # any newly recorded skipped keys should be removed from sfs.csv to keep bookkeeping consistent
-                    new_skips = latest_skipped - existing_skipped
-                    for nk in new_skips:
-                        try:
-                            remove_from_sfs_csv_if_present(species_folder_name, nk)
-                        except Exception:
-                            pass
-                    # update the in-memory set
+                    # update the in-memory set (we no longer modify sfs.csv here)
                     existing_skipped.update(latest_skipped)
                 except Exception:
                     # if we fail to reload skipped file, fall back to previously loaded set
