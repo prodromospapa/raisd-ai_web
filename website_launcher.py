@@ -799,9 +799,43 @@ def compute_best_match(species: str, vcf_path: str):
         # If normalization fails, fall back to the raw df but continue
         pass
     target, ploidy, mixed, counts = infer_samples_and_ploidy(vcf_path)
-    proj = project_expected_df(df, target)
-    sfs = sfs_from_bcftools(vcf_path, target)
-    q = norm(sfs[1:])  # observed SFS (skip invariant)
+    # Attempt to project the expected SFS to the observed target. If the
+    # observed sample (target) is larger than the reference N in the
+    # persisted SFS table, instead project the observed SFS down to the
+    # reference N and compare in that reduced space. This allows users to
+    # upload larger input files without forcing `sfs.csv` to be re-generated.
+    try:
+        proj = project_expected_df(df, target)
+        sfs = sfs_from_bcftools(vcf_path, target)
+        q = norm(sfs[1:])  # observed SFS (skip invariant)
+    except ValueError as e:
+        # Detect the specific 'target > reference N' error from project_expected_df
+        msg = str(e)
+        if 'target' in msg and 'reference N' in msg:
+            # Reference N (max column) from the SFS table
+            try:
+                N_ref = max(int(c) for c in df.columns)
+            except Exception:
+                # Re-raise original if we can't determine a reference
+                raise
+            # Project expected SFS rows to the reference N so both sides use the
+            # same dimensionality for comparison.
+            proj = project_expected_df(df, int(N_ref))
+            # Read observed SFS (full length) and project it down to N_ref.
+            sfs = sfs_from_bcftools(vcf_path, target)
+            obs_full = np.asarray(sfs, float)
+            total = obs_full.sum()
+            if total > 0:
+                obs_full = obs_full / total
+            # Build a one-row DataFrame with columns '0'..'<M>' so we can reuse
+            # project_expected_df machinery to downsample the observed SFS.
+            cols = [str(i) for i in range(0, len(obs_full))]
+            obs_df = pd.DataFrame([obs_full], index=['_obs_'], columns=cols)
+            obs_proj = project_expected_df(obs_df, int(N_ref)).loc['_obs_'].values
+            q = norm(obs_proj)
+        else:
+            # Unknown ValueError - propagate
+            raise
     pop_jsd_pairs = []  # list of (full_name, jsd_val)
     for pop in proj.index:
         try:
