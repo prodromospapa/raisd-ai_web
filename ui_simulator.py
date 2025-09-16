@@ -2258,8 +2258,23 @@ with st.container():
         except Exception:
             sweep_pop_required_missing = False
 
-        btn_disabled_effective = btn_disabled or sfs_missing_req or primary_missing_req or sweep_pop_required_missing
-        if st.button("Show engine command", key=f"show_engine_cmd_btn_{model_key}", disabled=btn_disabled_effective):
+        # btn_disabled_effective collects validation failures that disable
+        # Prepare/Execute and the copyable CLI. Do NOT include engine==msprime
+        # here — msprime should only disable the *Show engine command* button
+        # because it runs in-process and doesn't emit an external engine command.
+        btn_disabled_effective = (
+            btn_disabled
+            or sfs_missing_req
+            or primary_missing_req
+            or sweep_pop_required_missing
+        )
+
+        # Separate flag used solely for the Show engine command button so
+        # we can disable that button for msprime while leaving execution and
+        # the copyable CLI available when other inputs are valid.
+        show_engine_disabled = btn_disabled_effective or (engine == "msprime")
+
+        if st.button("Show engine command", key=f"show_engine_cmd_btn_{model_key}", disabled=show_engine_disabled):
             cmd_show = build_cmd()
             if cmd_show is None:
                 st.error("Complete steps 1–4 (species, model, ordered populations with counts) before showing the engine command.")
