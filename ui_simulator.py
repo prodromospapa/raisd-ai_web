@@ -746,17 +746,32 @@ with st.container():
             if stored_par > max_workers:
                 stored_par = max_workers
             # render slider using the session-backed key so its value persists
-            parallel = st.slider(
-                "Parallel workers",
-                min_value=1,
-                max_value=max_workers,
-                value=stored_par,
-                step=1,
-                disabled=not ordered_ready,
-                key=par_key,
-                help=("Number of parallel workers. Uses physical cores for msprime, "
-                      "and logical threads for other engines. Capped at the number of replicates.")
-            )
+            # Avoid passing `value=` when the session key exists to prevent
+            # Streamlit warnings about widgets created with a default then set
+            # via session state. Use the session-backed key directly when present.
+            if par_key in st.session_state:
+                parallel = st.slider(
+                    "Parallel workers",
+                    min_value=1,
+                    max_value=max_workers,
+                    step=1,
+                    disabled=not ordered_ready,
+                    key=par_key,
+                    help=("Number of parallel workers. Uses physical cores for msprime, "
+                          "and logical threads for other engines. Capped at the number of replicates.")
+                )
+            else:
+                parallel = st.slider(
+                    "Parallel workers",
+                    min_value=1,
+                    max_value=max_workers,
+                    value=stored_par,
+                    step=1,
+                    disabled=not ordered_ready,
+                    key=par_key,
+                    help=("Number of parallel workers. Uses physical cores for msprime, "
+                          "and logical threads for other engines. Capped at the number of replicates.")
+                )
     with d2:
         # Simulation per Work: prettier Auto vs Custom radio and renamed label
         sims_auto_key = f"sims_per_work_auto_{model_key}"
@@ -1163,6 +1178,62 @@ with st.container():
     def build_cmd():
         if not ordered_ready:
             return None
+        # Prefer the session-backed parallel value (slider uses a session key)
+        # so that the built CLI always reflects the current widget state.
+        try:
+            parallel_effective = st.session_state.get(par_key, parallel)
+        except Exception:
+            parallel_effective = parallel
+        # Helper: read from session_state if present, else fallback to module globals
+        def _ss_glob_read(ss_key: str, glob_name: str, cast, default):
+            try:
+                if ss_key in st.session_state and st.session_state.get(ss_key) is not None:
+                    return cast(st.session_state.get(ss_key))
+            except Exception:
+                pass
+            try:
+                v = globals().get(glob_name, None)
+                if v is None:
+                    return default
+                return cast(v)
+            except Exception:
+                return default
+
+        seq_length = _ss_glob_read(f"seq_length_{model_key}", 'seq_length', int, 0)
+        target_snps = _ss_glob_read(f"target_snps_{model_key}", 'target_snps', int, 0)
+        target_snps_tol = _ss_glob_read(f"target_snps_tol_{model_key}", 'target_snps_tol', float, 0.0)
+        replicates = _ss_glob_read(f"replicates_{model_key}", 'replicates', int, 1)
+        out_path = _ss_glob_read(f"output_path_{model_key}", 'out_path', str, None)
+        out_format = _ss_glob_read(f"output_format_{model_key}", 'out_format', str, None)
+        temp_loc = _ss_glob_read('temp_loc', 'temp_loc', str, 'local')
+        sims_per_work = _ss_glob_read(f"sims_per_work_slider_{model_key}", 'sims_per_work', int, 0)
+        max_ram_percent = _ss_glob_read(f"max_ram_percent_{model_key}", 'max_ram_percent', int, 80)
+        sfs_output = _ss_glob_read(f"sfs_output_{model_key}", 'sfs_output', str, None)
+        sfs_normalized = _ss_glob_read(f"sfs_normalized_{model_key}", 'sfs_normalized', bool, False)
+        sfs_mode = _ss_glob_read(f"sfs_mode_{model_key}", 'sfs_mode', str, None)
+        paired_neutral_name = _ss_glob_read(f"paired_neutral_name_{model_key}", 'paired_neutral_name', str, None)
+        paired_neutral = _ss_glob_read(f"paired_neutral_{model_key}", 'paired_neutral', bool, False)
+        neutral_engine = _ss_glob_read(f"neutral_engine_{model_key}", 'neutral_engine', str, '')
+        no_en_ladder = _ss_glob_read('no_en_ladder', 'no_en_ladder', bool, False)
+        growth_max_fold = _ss_glob_read('growth_max_fold', 'growth_max_fold', float, 1.05)
+        sweep_enabled_ss_local = bool(st.session_state.get(f"sweep_enable_{model_key}", False))
+        # sweep_pop: prefer selectbox value, then manual entry, then globals fallback
+        try:
+            sel_val = st.session_state.get(f"sweep_pop_{model_key}_sel", None)
+            manual_val = st.session_state.get(f"sweep_pop_manual_{model_key}", None)
+            if sel_val and sel_val != "-- select population --":
+                sweep_pop = str(sel_val)
+            elif manual_val:
+                sweep_pop = str(manual_val)
+            else:
+                sweep_pop = globals().get('sweep_pop', '')
+        except Exception:
+            sweep_pop = globals().get('sweep_pop', '')
+        sweep_pos_pct = _ss_glob_read(f"sweep_pos_{model_key}", 'sweep_pos_pct', float, 50.0)
+        sel_s = _ss_glob_read(f"sel_s_{model_key}", 'sel_s', float, 0.0)
+        time_units = _ss_glob_read(f"time_units_{model_key}", 'time_units', str, 'gens')
+        sweep_time = _ss_glob_read(f"sweep_time_{model_key}", 'sweep_time', float, 0.0)
+        fixation_time = _ss_glob_read(f"fixation_time_{model_key}", 'fixation_time', float, 0.0)
         cmd = [sys.executable, SIM_SCRIPT,
                "--engine", engine,
                "--species-id", species_id,
@@ -1209,18 +1280,52 @@ with st.container():
         # (skip when user selected "Run SFS only").
         if out_format and not st.session_state.get(f"run_sfs_only_{model_key}", False):
             cmd += ["--output-format", out_format]
-        if temp_loc:
-            cmd += ["--temp", temp_loc]
+        # Only include --temp when the user explicitly chose a non-local temp
+        # location. The simulator's default for local temp should be used when
+        # temp_loc is 'local' or empty.
+        try:
+            if temp_loc and str(temp_loc).strip().lower() not in {"local", ""}:
+                cmd += ["--temp", str(temp_loc)]
+        except Exception:
+            pass
         if progress_flag:
             cmd += ["--progress"]  # only included if user ticked it
-        if parallel and parallel != 1:
-            cmd += ["--parallel", str(int(parallel))]
-        # Only include sims-per-work when user selected a custom value (Auto unchecked)
+        # Use the effective parallel value (session-backed when available).
+        try:
+            par_val = int(parallel_effective) if parallel_effective is not None else None
+        except Exception:
+            par_val = None
+        if par_val and par_val != 1:
+            cmd += ["--parallel", str(int(par_val))]
+        # Only include sims-per-work when user selected a custom value (Auto unchecked).
+        # Do NOT pass --sims-per-work to the simulator when engine is msprime
+        # because msprime performs its own in-process batching.
         sims_auto_ss = bool(st.session_state.get(f"sims_per_work_auto_{model_key}", True))
-        if not sims_auto_ss and sims_per_work and sims_per_work > 0:
-            cmd += ["--sims-per-work", str(int(sims_per_work))]
-        if max_ram_percent and float(max_ram_percent) != 80.0:
-            cmd += ["--max-ram-percent", str(float(max_ram_percent))]
+        try:
+            if engine == "msprime":
+                pass
+            else:
+                if not sims_auto_ss and sims_per_work and sims_per_work > 0:
+                    cmd += ["--sims-per-work", str(int(sims_per_work))]
+        except Exception:
+            # Defensive: if engine or session state access fails, fall back to previous behaviour
+            if not sims_auto_ss and sims_per_work and sims_per_work > 0:
+                cmd += ["--sims-per-work", str(int(sims_per_work))]
+        # Always pass --max-ram-percent so the simulator receives an explicit
+        # value even when the UI default (80) is selected.
+        try:
+            if max_ram_percent is None:
+                # fallback to default slider value if missing
+                mr = 80.0
+            else:
+                mr = float(max_ram_percent)
+            cmd += ["--max-ram-percent", str(mr)]
+        except Exception:
+            # best effort: don't crash the UI if conversion fails
+            try:
+                cmd += ["--max-ram-percent", "80"]
+            except Exception:
+                pass
         if sfs_on:
             # If user provided an explicit SFS output, use it; otherwise derive
             # from the output filename by replacing its extension with .sfs when possible.
