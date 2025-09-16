@@ -44,7 +44,6 @@ st.markdown(
 )
 
 st.title("🧬 Genomic Simulator")
-st.caption("Beautiful, species-aware UI for your `simulator.py` CLI.")
 
 # simulator script is assumed to be the default filename in CWD
 SIM_SCRIPT = "simulator.py"
@@ -290,7 +289,6 @@ else:
 
 # Wrap populations in a styled card for a cleaner visual and add a short hint
 st.markdown('<div class="card">', unsafe_allow_html=True)
-st.caption("Select populations in order (no gaps). Click a population button to toggle selection; use the arrows to adjust sample sizes. Later sections stay locked until the order is contiguous and counts are positive.")
 # Use sanitized model_id so keys remain stable across species/model switches
 model_key = (model_id or "").replace("/", "_")
 selected = []
