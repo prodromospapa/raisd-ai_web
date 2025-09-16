@@ -227,10 +227,10 @@ dependencies:
   - tqdm  # runtime progress bars
   - pysam # check if pip or conda
   - scrm
-  - psutil
+  - psutil # for max ram usage
+  - streamlit # for ui simulator
   - pip:
     - tensorflow==2.8
     - stdpopsim==0.3.0
-    #- pysam
     - Flask
     - biomart

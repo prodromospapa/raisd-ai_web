@@ -16,6 +16,13 @@ import shlex
 import gzip
 import concurrent.futures
 import stdpopsim as sps
+import errno
+
+
+# Structured exception raised when RAM limit enforcement aborts the run.
+class ExceedsMaxRam(Exception):
+    """Raised when total system RAM usage exceeds configured threshold."""
+    pass
 
 # optional progress bar (not required)
 try:
@@ -517,6 +524,10 @@ try:
 except Exception:
     _LOCAL_TMP_LOCK = None
 
+# Module-level friendly message populated when RAM threshold is exceeded
+# so signal handlers can access it even if running in a different frame.
+_LAST_RAM_EXCEEDED_MESSAGE = None
+
 
 def _is_process_alive(pid):
     try:
@@ -774,7 +785,27 @@ def _register_cleanup_handlers():
         atexit.register(_cleanup_local_tmpdir)
     except Exception:
         pass
+    # Module-level place to store a friendly RAM-exceeded message populated by the monitor
+    try:
+        _LAST_RAM_EXCEEDED_MESSAGE
+    except NameError:
+        _LAST_RAM_EXCEEDED_MESSAGE = None
+
     def _signal_handler(signum, frame):
+        # If the RAM monitor prepared a friendly message, print it first
+        try:
+            msg = globals().get('_LAST_RAM_EXCEEDED_MESSAGE')
+            if msg:
+                try:
+                    sys.stderr.write(str(msg).rstrip() + "\n")
+                    try:
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Cleanup local temporary directory
         try:
             _cleanup_local_tmpdir()
@@ -2242,7 +2273,10 @@ def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
 
     hap_counts_input_order = [ploidy * c for c in individual_counts]
     name_to_hap = {n: hap_counts_input_order[i] for i,n in enumerate(user_order)}
-    desired_order = user_order[:]
+    # Ensure consistency with discoal: put the sweep-capable population first
+    # so msms -I ordering and -SI initial-frequency vectors align when
+    # --sweep-pop is provided. If pop0 is None, default to the first user_order.
+    desired_order = reorder_put_first(user_order, pop0)
     counts_order = [name_to_hap[n] for n in desired_order]
     total_hap = sum(counts_order)
 
@@ -2365,7 +2399,9 @@ def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0
 
     hap_counts_input_order = [ploidy * c for c in individual_counts]
     name_to_hap = {n: hap_counts_input_order[i] for i,n in enumerate(user_order)}
-    desired_order = user_order[:]
+    # Put the sweep population (pop0) first in the sampling order to match
+    # discoal behaviour and ensure msms -SI init-frequency vectors align.
+    desired_order = reorder_put_first(user_order, pop0)
     counts_order = [name_to_hap[n] for n in desired_order]
     total_hap = sum(counts_order)
 
@@ -2471,7 +2507,8 @@ def build_msprime_command(*, species, model_id, user_order, individual_counts, p
 
     hap_counts_input_order = [ploidy * c for c in individual_counts]
     name_to_hap = {n: hap_counts_input_order[i] for i,n in enumerate(user_order)}
-    desired_order = user_order[:]
+    # Put sweep population first so msms -I/-SI vectors align with discoal.
+    desired_order = reorder_put_first(user_order, pop0)
     counts_order = [name_to_hap[n] for n in desired_order]
 
     graph_order = [d.name for d in graph.demes]
@@ -2579,7 +2616,17 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
 
     hap_counts_input_order = [ploidy * c for c in individual_counts]
     name_to_hap = {n: hap_counts_input_order[i] for i,n in enumerate(user_order)}
-    desired_order = user_order[:]
+    # Put the sweep population first in msms sampling order to align -I and -SI vectors.
+    #
+    # Rationale: msms expects positional vectors (-I counts, -SI init freqs) where
+    # each position corresponds to a population index. discoal already reorders
+    # the sample list so the sweep-capable population comes first; to keep
+    # semantics consistent across builders we do the same for msms. This ensures
+    # that specifying --sweep-pop=<name> applies selection to the named deme
+    # regardless of the order the user passed to --pop-order.
+    # Note: neutral engines (ms, scrm, msprime) ignore selection flags and do
+    # not require a sweep-pop argument.
+    desired_order = reorder_put_first(user_order, pop0)
     counts_order = [name_to_hap[n] for n in desired_order]
     total_hap = sum(counts_order)
 
@@ -2744,9 +2791,9 @@ def parse_args():
     g.add_argument('--target-snps', dest='min_snps', type=int, default=None,
                    help="Target/minimum segregating sites; derives --length when not provided.")
     g.add_argument('--target-snps-tol', dest='min_snps_tol', type=float, default=0.0,
-                   help=("Fractional overshoot tolerance for --target-snps. After all replicates reach >= target, "
-                         "if max(segsites) > target*(1+tol) the sequence length is iteratively shrunk while keeping every replicate >= target. "
-                         "Set 0 to disable shrink (default 0). Example: 0.02 allows ~2%% overshoot before shrink attempts."))
+             help=("Tolerance for --target-snps overshoot, specified as a percent in [0,100]. "
+                 "Internally the value is converted to a fractional tolerance (percent/100). Set 0 to disable shrink (default 0). "
+                 "Example: 2 means ~2% overshoot tolerated before shrink attempts."))
     g.add_argument('--chromosome', dest='chromosome', default=None,
                    help="Chromosome/contig name for mutation/recombination rates/length (optional).")
     g.add_argument('--replicates', dest='reps', type=int, default=1,
@@ -2796,8 +2843,8 @@ def parse_args():
 
     sg = ap.add_argument_group('Selection (engine-specific), required for discoal/msms')
     sg.add_argument('--sweep-pop', dest='discoal_pop0', help='Sweep population (discoal/msms). Ignored for ms.')
-    sg.add_argument('--sweep-pos', dest='x', type=float, help='Selected site position in (0,1) (required for discoal/msms). Ignored for ms.')
-    sg.add_argument('--sel-s', dest='s', type=float, help='Selection coefficient s per generation (required for discoal/msms). Converted to 2Ns using present-size N for the sweep population. Ignored for ms.')
+    sg.add_argument('--sweep-pos', dest='x', type=float, help='Selected site position as percent in [0,100] (required for discoal/msms). Ignored for ms,scrm and msprime.')
+    sg.add_argument('--sel-s', dest='s', type=float, help='Selection coefficient s per generation (required for discoal/msms). Converted to 2Ns using present-size N for the sweep population. Ignored for ms,scrm and msprime.')
     sg.add_argument('--sweep-time', dest='sweep_time', type=float, help='Origin time for the allele (units set by --time-units; default gens).')
     sg.add_argument('--fixation-time', dest='fix_time', type=float, default=0.0, help='Fixation time back (units set by --time-units; default gens=generations ago).')
     sg.add_argument('--time-units', dest='time_units', choices=['gens','4N'], default='gens',
@@ -2811,10 +2858,48 @@ def parse_args():
     # total system RAM usage (percent) and sets args._ram_exceeded when the
     # threshold is crossed so the runner can abort safely. Uses psutil when
     # available; otherwise monitoring is disabled with an informational note.
+    # Validate max_ram_percent: must be a float in [0,100]
     try:
-        max_ram_pct = float(getattr(args, 'max_ram_percent', 80.0)) if getattr(args, 'max_ram_percent', None) is not None else None
-    except Exception:
-        max_ram_pct = 80.0
+        max_ram_pct_raw = getattr(args, 'max_ram_percent', None)
+        if max_ram_pct_raw is None:
+            max_ram_pct = None
+        else:
+            max_ram_pct = float(max_ram_pct_raw)
+            if not (0.0 <= max_ram_pct <= 100.0):
+                raise ValueError('--max-ram-percent must be between 0 and 100')
+    except Exception as e:
+        # If validation fails, stop early with a clear message
+        sys.exit(f"ERROR: invalid --max-ram-percent: {e}")
+
+    # Normalize target-snps tolerance: require percent (0..100) only; convert to internal fraction
+    try:
+        raw_tol = getattr(args, 'min_snps_tol', 0.0)
+        if raw_tol is None:
+            tol_pct = 0.0
+        else:
+            tol_pct = float(raw_tol)
+        # Enforce percent-only input
+        if tol_pct < 0.0 or tol_pct > 100.0:
+            raise ValueError('--target-snps-tol must be between 0 and 100 (percent)')
+        # Store internal fraction (0..1)
+        setattr(args, 'min_snps_tol', float(tol_pct) / 100.0)
+    except Exception as e:
+        sys.exit(f"ERROR: invalid --target-snps-tol: {e}")
+
+    # Normalize sweep position: accept percent in [0,100] and convert to internal fraction [0,1]
+    try:
+        raw_x = getattr(args, 'x', None)
+        if raw_x is None:
+            x_pct = None
+        else:
+            x_pct = float(raw_x)
+        if x_pct is not None:
+            if x_pct < 0.0 or x_pct > 100.0:
+                raise ValueError('--sweep-pos must be between 0 and 100 (percent)')
+            # convert percent to fraction
+            setattr(args, 'x', float(x_pct) / 100.0)
+    except Exception as e:
+        sys.exit(f"ERROR: invalid --sweep-pos: {e}")
 
     def _ram_monitor_loop(stop_event, threshold_pct, args_obj):
         try:
@@ -2852,9 +2937,44 @@ def parse_args():
                                     pass
                         except Exception:
                             pass
-                        setattr(args_obj, '_ram_exceeded', True)
-                        sys.stderr.write(f"# ERROR: total system RAM usage {used:.1f}% exceeded threshold {threshold_pct}%. Aborting run.\n")
-                        sys.stderr.write('# SUGGESTION: reduce --sims-per-work, sample size, --length, or --replicates.\n')
+                        try:
+                            suggestion_parts = [
+                                'reduce the number of parallel workers with --parallel',
+                                "if not using msprime, lower --sims-per-work",
+                                'reduce --replicates or --sample-individuals',
+                                'or rerun with a larger --max-ram-percent'
+                            ]
+                            suggestion_text = '; '.join(suggestion_parts)
+                            friendly = (
+                                f"Memory usage {used:.1f}% exceeded the configured limit of {threshold_pct}%.\n"
+                                f"Suggested actions: {suggestion_text}.\n"
+                            )
+                        except Exception:
+                            friendly = (f"Memory usage {used:.1f}% exceeded the configured limit of {threshold_pct}%.\n")
+                        try:
+                            setattr(args_obj, '_ram_exceeded', True)
+                            setattr(args_obj, '_ram_exceeded_message', friendly)
+                            # Also store a module-level message so the signal handler
+                            # (which may run in the main thread) can print it.
+                            try:
+                                globals()['_LAST_RAM_EXCEEDED_MESSAGE'] = friendly
+                            except Exception:
+                                pass
+                            # Best-effort: request our own process to terminate so the
+                            # registered _signal_handler runs and can print the message.
+                            try:
+                                os.kill(os.getpid(), signal.SIGTERM)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        # Best-effort: try to terminate child processes we started
+                        try:
+                            _terminate_children()
+                        except Exception:
+                            pass
+                        # Do not print the friendly message here; let the top-level
+                        # handler print it once to avoid duplicate messages.
                     except Exception:
                         pass
                     # stop monitoring and exit
@@ -3850,12 +3970,23 @@ def _run_simulation_core(args):
                         pass
             except Exception:
                 pass
-            # If caller provided an explicit message, use it; otherwise exit silently
-            # since the RAM monitor already prints the informative message and suggestion.
-            if msg:
-                raise SystemExit(msg)
-            else:
-                raise SystemExit()
+            # If caller provided an explicit message, use it; otherwise raise a
+            # structured ExceedsMaxRam exception containing actionable suggestions.
+            # Raise a module-level ExceedsMaxRam so callers can catch it.
+            suggestion_parts = []
+            try:
+                suggestion_parts.append('Reduce --parallel')
+                suggestion_parts.append('lower --sims-per-work (for heavy per-worker memory)')
+                suggestion_parts.append('or lower --replicates or --sample-individuals')
+            except Exception:
+                pass
+            suggestion = '; '.join(p for p in suggestion_parts if p)
+            try:
+                arg_msg = getattr(args, '_ram_exceeded_message', None)
+            except Exception:
+                arg_msg = None
+            final_msg = msg or arg_msg or (f"Aborting run due to exceeding max RAM. Suggestion: {suggestion}")
+            raise ExceedsMaxRam(final_msg)
 
         # helper to update the progress bar only when RAM hasn't been exceeded
         def _maybe_update_bar(delta=1):
@@ -6717,5 +6848,48 @@ def main():
     args = parse_args()
     return run_simulation_from_args(args)
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        # Ensure main() return value is used as exit code when appropriate
+        rc = main()
+        if rc is None:
+            sys.exit(0)
+        else:
+            # If main returns an int-like value, use it as exit code
+            try:
+                sys.exit(int(rc))
+            except Exception:
+                sys.exit(0)
+    except ExceedsMaxRam as e:
+        # Friendly single-line message for RAM aborts (no traceback)
+        try:
+            msg = str(e)
+        except Exception:
+            msg = "Aborted due to exceeding configured maximum RAM"
+        sys.stderr.write(msg.rstrip() + "\n")
+        # exit with a distinct non-zero code
+        sys.exit(2)
+    except MemoryError as e:
+        # Out-of-memory inside Python: provide actionable suggestions without traceback
+        try:
+            msg = ("Aborted due to MemoryError (process ran out of memory). "
+                   "Suggested actions: reduce --parallel; lower --sims-per-work; "
+                   "reduce --replicates or --sample-individuals; or increase --max-ram-percent / add swap.")
+        except Exception:
+            msg = "Aborted due to MemoryError (out of memory)."
+        sys.stderr.write(msg.rstrip() + "\n")
+        sys.exit(2)
+    except OSError as e:
+        # Some low-level allocations raise OSError(errno.ENOMEM) when the OS cannot satisfy memory requests
+        try:
+            if getattr(e, 'errno', None) == errno.ENOMEM:
+                msg = (f"Aborted due to OS OOM (ENOMEM): {e}. "
+                       "Suggested actions: reduce parallelism or per-worker memory; "
+                       "increase system memory or add swap; or raise --max-ram-percent.")
+                sys.stderr.write(msg.rstrip() + "\n")
+                sys.exit(2)
+        except Exception:
+            pass
+        # Re-raise unexpected OSErrors
+        raise

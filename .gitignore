@@ -11,3 +11,4 @@
 !run.sh
 !.gitignore
 !README.md
+!ui_simulator.py

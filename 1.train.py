@@ -89,10 +89,10 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
         "--chromosome", str(chromosome),
         "--replicates", str(train_replicates),
         "--output", "sweep.ms",
-        "--sweep-pos", "0.5",
+        "--sweep-pos", "50",
         "--sel-s", str(sel_s),
         "--parallel", str(parallel),
-        "--target-snps-tol", "0.1",
+        "--target-snps-tol", "10",
     "--paired-neutral", "neutral.ms",
         ]
     if gpu:
