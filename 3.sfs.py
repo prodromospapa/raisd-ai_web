@@ -148,7 +148,10 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
                                 first = False
                                 continue
                             else:
-                                parallel -= 1
+                                if parallel >= 5:
+                                    parallel -= 1
+                                else:
+                                    parallel = parallel // 2
                                 base_args[base_args.index("--parallel") + 1] = str(parallel)
                                 continue
                         # Non-recoverable non-zero exit: raise to be handled below
