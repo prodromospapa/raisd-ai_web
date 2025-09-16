@@ -59,6 +59,18 @@ SIM_SCRIPT = "simulator.py"
 CLEANUP_TTL = 60 * 10
 CLEANUP_INTERVAL = 30
 
+# Toggle to enable developer diagnostics and console prints. Set to False for
+# normal user-facing UI to keep the interface clean.
+SHOW_DEV_DIAG = False
+
+def ui_diag(msg: str):
+    """Emit developer diagnostics to stdout only when SHOW_DEV_DIAG is True."""
+    try:
+        if SHOW_DEV_DIAG:
+            print(msg, flush=True)
+    except Exception:
+        pass
+
 
 def _start_cleanup_thread():
     """Start a background thread that periodically deletes expired temp artifacts.
@@ -1631,14 +1643,125 @@ with st.container():
     # We only present progress bars (percent/frac -> progress) and final
     # success/error state. The copyable CLI shown elsewhere remains available.
         import time, re
+        try:
+            ui_diag(f"[ui_simulator] run_and_report invoked for model_key={model_key} cmd={' '.join(cmd_list) if isinstance(cmd_list, (list,tuple)) else str(cmd_list)}")
+        except Exception:
+            pass
 
         # Start the subprocess, merging stderr into stdout so we only need one stream
+        # Use a simple file lock in artifacts/ to avoid concurrent runs for the same model_key
         try:
-            proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            workspace_dir = os.path.abspath(os.getcwd())
+            artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+            os.makedirs(artifacts_dir, exist_ok=True)
+            lock_path = os.path.join(artifacts_dir, f".runlock_{model_key}")
+            cancel_path = os.path.join(artifacts_dir, f".runlock_{model_key}.cancel")
+        except Exception:
+            lock_path = None
+            cancel_path = None
+
+        # track whether we actually created the lock so we can remove it on exit
+        lock_created = False
+
+        try:
+            # if a lock exists, try to detect whether it's stale by reading PID
+            if lock_path and os.path.exists(lock_path):
+                try:
+                    with open(lock_path, 'r') as fh:
+                        content = fh.read().strip()
+                    # expected format: <pid>\n<timestamp>
+                    parts = [p for p in content.split() if p.strip()]
+                    pid_existing = int(parts[0]) if parts else None
+                except Exception:
+                    pid_existing = None
+
+                alive = False
+                if pid_existing:
+                    try:
+                        # use psutil when available for a reliable check
+                        if psutil:
+                            alive = psutil.pid_exists(pid_existing)
+                        else:
+                            # os.kill(0) raises if not exists
+                            os.kill(pid_existing, 0)
+                            alive = True
+                    except Exception:
+                        alive = False
+
+                if alive:
+                    st.error("A run is already in progress for this model (another process is active).", icon="❌")
+                    return
+                else:
+                    # stale lock: remove it and continue
+                    try:
+                        os.remove(lock_path)
+                    except Exception:
+                        pass
+
+            # Start the subprocess in its own process group so we can signal it and its children
+            try:
+                # Prefer start_new_session for portability (creates separate process group)
+                proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+            except TypeError:
+                # Older Python/platforms might not accept start_new_session; fallback to preexec_fn
+                try:
+                    proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=os.setsid)
+                except Exception:
+                    proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+            # create the lock containing PID and timestamp so other attempts see an active run
+            if lock_path:
+                try:
+                    with open(lock_path, 'w') as fh:
+                        fh.write(f"{proc.pid}\n{time.time()}")
+                    lock_created = True
+                except Exception:
+                    lock_created = False
+                # store running pid in session_state so the UI Cancel handler
+                # can locate and signal the process group immediately
+                try:
+                    pid_key = f"_running_pid_{model_key}"
+                    st.session_state[pid_key] = int(proc.pid)
+                except Exception:
+                    pass
+                # artifact diagnostic: record run start (write to artifacts/ui_simulator_diag.log)
+                try:
+                    diag_path = os.path.join(artifacts_dir, 'ui_simulator_diag.log')
+                    with open(diag_path, 'a') as dh:
+                        dh.write(f"START {model_key} pid={proc.pid} time={time.time()}\n")
+                except Exception:
+                    pass
+                    try:
+                        pg = None
+                        try:
+                            pg = os.getpgid(proc.pid)
+                        except Exception:
+                            pg = None
+                        # check psutil existence if available
+                        alive = None
+                        try:
+                            if psutil:
+                                alive = psutil.pid_exists(proc.pid)
+                        except Exception:
+                            alive = None
+                        ui_diag(f"[ui_simulator] Started subprocess pid={proc.pid} pgid={pg} lock_created={lock_created} lock_path={lock_path} pid_alive={alive}")
+                    except Exception:
+                        pass
         except FileNotFoundError:
+            # ensure we remove the lock if we created it
+            try:
+                if lock_created and lock_path and os.path.exists(lock_path):
+                    os.remove(lock_path)
+            except Exception:
+                pass
             st.error("Could not find simulator.py in the working folder.", icon="❌")
             return
         except Exception as e:
+            try:
+                if lock_created and lock_path and os.path.exists(lock_path):
+                    os.remove(lock_path)
+            except Exception:
+                pass
             st.error(f"Failed to start process: {e}", icon="❌")
             return
         captured_lines = []
@@ -1787,16 +1910,119 @@ with st.container():
                 captured_lines.append(out_text)
             else:
                 while True:
-                    # check cancel request
-                    if st.session_state.get(cancel_key, False):
+                    # check cancel request (session flag or cancel sentinel file)
+                    cancel_flag = False
+                    try:
+                        if st.session_state.get(cancel_key, False):
+                            cancel_flag = True
+                    except Exception:
+                        cancel_flag = False
+                    try:
+                        if not cancel_flag and cancel_path and os.path.exists(cancel_path):
+                            cancel_flag = True
+                    except Exception:
+                        pass
+                    if cancel_flag:
+                        # Robust cancellation: try graceful termination of the
+                        # whole process group, fallback to terminating children
+                        # (via psutil) and finally force-kill the group.
                         try:
-                            proc.terminate()
+                            status.text("Cancelling…")
                         except Exception:
+                            pass
+
+                        try:
+                            pgid = None
+                            # Prefer signaling the process group so children are included
                             try:
-                                proc.kill()
+                                pgid = os.getpgid(proc.pid)
+                                ui_diag(f"[ui_simulator] Cancelling run pid={proc.pid} pgid={pgid}")
+                                try:
+                                    os.killpg(pgid, signal.SIGTERM)
+                                except Exception:
+                                    # fallback to terminating the process directly
+                                    proc.terminate()
                             except Exception:
-                                pass
-                        status.text("Cancelling…")
+                                # getpgid may fail; fallback
+                                try:
+                                    proc.terminate()
+                                except Exception:
+                                    pass
+
+                            # Allow a short grace period for processes to exit
+                            try:
+                                proc.wait(timeout=5)
+                                ui_diag(f"[ui_simulator] Process {proc.pid} terminated after SIGTERM.")
+                            except Exception:
+                                # If psutil is available, try terminating children first
+                                try:
+                                    if psutil:
+                                        try:
+                                            p = psutil.Process(proc.pid)
+                                            children = p.children(recursive=True)
+                                            for c in children:
+                                                try:
+                                                    ui_diag(f"[ui_simulator] terminating child pid={c.pid}")
+                                                    c.terminate()
+                                                except Exception:
+                                                    pass
+                                            gone, alive = psutil.wait_procs(children, timeout=3)
+                                            if alive:
+                                                for c in alive:
+                                                    try:
+                                                        ui_diag(f"[ui_simulator] killing child pid={c.pid}")
+                                                        c.kill()
+                                                    except Exception:
+                                                        pass
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+
+                                # Finally, force kill the entire process group
+                                try:
+                                    if pgid is not None:
+                                        os.killpg(pgid, signal.SIGKILL)
+                                    else:
+                                        proc.kill()
+                                    ui_diag(f"[ui_simulator] Sent SIGKILL to pid/group {proc.pid}")
+                                except Exception:
+                                    try:
+                                        proc.kill()
+                                    except Exception:
+                                        pass
+
+                        except Exception as e:
+                            ui_diag(f"[ui_simulator] Error during cancel: {e}")
+
+                        # Ensure lock cleaned up immediately so future runs are allowed
+                        try:
+                            if lock_created and lock_path and os.path.exists(lock_path):
+                                try:
+                                    os.remove(lock_path)
+                                    ui_diag(f"[ui_simulator] Removed run lock {lock_path} after cancel")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        # remove cancel sentinel if present
+                        try:
+                            if cancel_path and os.path.exists(cancel_path):
+                                try:
+                                    os.remove(cancel_path)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # artifact diagnostic: record cancel completion
+                        try:
+                            diag_path = os.path.join(artifacts_dir, 'ui_simulator_diag.log')
+                            with open(diag_path, 'a') as dh:
+                                dh.write(f"CANCELLED {model_key} pid={proc.pid} time={time.time()}\n")
+                        except Exception:
+                            pass
+
                         break
 
                     raw = proc.stdout.readline()
@@ -1993,9 +2219,11 @@ with st.container():
         except Exception:
             pass
         try:
-            if proc.returncode == 0:
-                st.success("Simulation completed.", icon="✅")
-            else:
+            # Do not display a success popup when the run finishes; keep
+            # the final progress bar and finalizing text visible for the
+            # user. Only show an error banner when the process exits
+            # with a non-zero return code.
+            if proc.returncode != 0:
                 st.error(f"Process exited with code {proc.returncode}.", icon="❌")
         except Exception:
             pass
@@ -2008,6 +2236,65 @@ with st.container():
             st.session_state[running_key] = False
             # reset cancel flag too so subsequent runs start clean
             st.session_state[cancel_key] = False
+        except Exception:
+            pass
+        # clear start_request/processed so Execute becomes available again
+        try:
+            start_request_key = f"_start_request_{model_key}"
+            processed_key = f"_exec_processed_{model_key}"
+            st.session_state[start_request_key] = False
+            st.session_state[processed_key] = False
+        except Exception:
+            pass
+        try:
+            immediate_key = f"_exec_start_immediate_{model_key}"
+            st.session_state[immediate_key] = False
+        except Exception:
+            pass
+        try:
+            ui_lock_key = f"_ui_lock_{model_key}"
+            st.session_state[ui_lock_key] = False
+        except Exception:
+            pass
+        # signal to the UI render that a run finished so it can perform a
+        # safe rerun from the top-level script (some Streamlit contexts do
+        # not allow experimental_rerun() directly from background threads).
+        try:
+            finished_key = f"_exec_finished_{model_key}"
+            st.session_state[finished_key] = True
+        except Exception:
+            pass
+        # Opportunistically clean up any stale lock files for ANY model key so
+        # the UI never remains disabled due to crashes or aborted runs.
+        try:
+            workspace_dir = os.path.abspath(os.getcwd())
+            artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+            for name in os.listdir(artifacts_dir):
+                if not name.startswith('.runlock_'):  # only inspect runlock files
+                    continue
+                path = os.path.join(artifacts_dir, name)
+                try:
+                    with open(path, 'r') as fh:
+                        content = fh.read().strip()
+                    parts = [p for p in content.split() if p.strip()]
+                    pid_existing = int(parts[0]) if parts else None
+                except Exception:
+                    pid_existing = None
+                alive = False
+                if pid_existing:
+                    try:
+                        if psutil:
+                            alive = psutil.pid_exists(pid_existing)
+                        else:
+                            os.kill(pid_existing, 0)
+                            alive = True
+                    except Exception:
+                        alive = False
+                if not alive:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
         except Exception:
             pass
         # ---------------------
@@ -2489,6 +2776,36 @@ with st.container():
         except Exception:
             pass
 
+        # remove lock file if we created it so future runs are allowed
+        try:
+            if lock_created and lock_path and os.path.exists(lock_path):
+                os.remove(lock_path)
+        except Exception:
+            pass
+        # Robust rerun attempt so the Execute button state refreshes immediately.
+        # Prefer stable st.rerun when available; fallback to experimental_rerun.
+        reran = False
+        try:
+            if hasattr(st, 'rerun'):
+                st.rerun()
+                reran = True
+        except Exception:
+            reran = False
+        if not reran:
+            try:
+                if hasattr(st, 'experimental_rerun'):
+                    st.experimental_rerun()
+                    reran = True
+            except Exception:
+                reran = False
+        # If we still couldn't rerun (older Streamlit), set a refresh flag the
+        # top-level UI will notice on the next natural interaction.
+        if not reran:
+            try:
+                st.session_state[f"_needs_refresh_{model_key}"] = True
+            except Exception:
+                pass
+
     with tab_map["Build & Run"]:
         # Button that prepares (but does not execute) the engine command and
         # makes it available as a copyable string.
@@ -2664,140 +2981,569 @@ with st.container():
                 st.session_state[cancel_key_ui] = False
 
             running_key = f"_running_{model_key}"
-            # Show Execute when not running, and a Cancel button replacement while running
-            if not st.session_state.get(running_key, False):
-                # Use the effective disabled flag which includes validation errors
-                if st.button("Execute", disabled=btn_disabled_effective):
-                    # clear cancel flag and mark running
-                    try:
-                        st.session_state[cancel_key_ui] = False
-                        st.session_state[running_key] = True
-                    except Exception:
-                        pass
-                    # compute expected output paths and stash them for detection
-                    try:
-                        # compute out_path_final same as build_cmd logic
-                        out_path_final = None
-                        run_sfs_only_ss = bool(st.session_state.get(f"run_sfs_only_{model_key}", False))
-                        if out_path and not run_sfs_only_ss:
-                            try:
-                                fmt = str(out_format or "").strip()
-                            except Exception:
-                                fmt = ""
-                            fmt_ext_map = {"ms": ".ms", "ms.gz": ".ms.gz", "vcf": ".vcf", "vcf.gz": ".vcf.gz", "bcf": ".bcf"}
-                            ext = fmt_ext_map.get(fmt, "")
-                            out_path_final = out_path
-                            if ext and not out_path_final.endswith(ext):
-                                out_path_final = out_path_final + ext
-                        # compute sfs_arg
-                        sfs_arg = None
-                        try:
-                            if sfs_output and sfs_output.strip():
-                                sfs_arg = sfs_output.strip()
-                            else:
-                                if out_path:
-                                    base = out_path
-                                    for e in [".ms.gz", ".vcf.gz"]:
-                                        if base.endswith(e):
-                                            base = base[:-len(e)]
-                                            break
-                                    else:
-                                        base = os.path.splitext(base)[0]
-                                    sfs_arg = base + ".sfs"
-                        except Exception:
-                            sfs_arg = None
-                        # paired neutral name: only register an expected paired-neutral
-                        # artifact when the user actually checked the paired-neutral box.
-                        paired_key_local = f"paired_neutral_{model_key}"
-                        try:
-                            pn_arg = (paired_neutral_name or "").strip() if bool(st.session_state.get(paired_key_local, False)) else ""
-                        except Exception:
-                            pn_arg = ""
+            # Ensure running key exists
+            if running_key not in st.session_state:
+                try:
+                    st.session_state[running_key] = False
+                except Exception:
+                    pass
 
-                        st.session_state[f"_expected_out_{model_key}"] = out_path_final
-                        st.session_state[f"_expected_sfs_{model_key}"] = sfs_arg
-                        st.session_state[f"_expected_pn_{model_key}"] = pn_arg
-                    except Exception:
-                        pass
+            # Render Execute and Cancel side-by-side so both widgets always exist
+            # Cancel is enabled only while running; Execute is disabled while running
+            # Also disable Execute when an artifacts lock file exists for this model
+            try:
+                workspace_dir = os.path.abspath(os.getcwd())
+                artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+                lock_path_check = os.path.join(artifacts_dir, f".runlock_{model_key}")
+                lock_exists = os.path.exists(lock_path_check)
+            except Exception:
+                lock_exists = False
 
-                    # Ensure the executed command always includes --progress so
-                    # the backend emits progress output for the UI, but do not
-                    # mutate the copyable CLI shown to the user.
+            # Ensure start_request and processed keys exist with safe defaults
+            # so stale/missing keys don't permanently disable Execute.
+            start_request_key = f"_start_request_{model_key}"
+            processed_key = f"_exec_processed_{model_key}"
+            ui_lock_key = f"_ui_lock_{model_key}"
+            if ui_lock_key not in st.session_state:
+                try:
+                    st.session_state[ui_lock_key] = False
+                except Exception:
+                    pass
+            if start_request_key not in st.session_state:
+                st.session_state[start_request_key] = False
+            if processed_key not in st.session_state:
+                st.session_state[processed_key] = False
+
+            
+
+            # Compute Execute disabled state. Only rely on running flag and lock
+            # presence so stale start_request flags cannot permanently disable Execute.
+            # If a run just finished in a different execution context, perform
+            # a safe UI-side rerun here: clear the finished flag and request
+            # an experimental rerun so widget states are refreshed.
+            try:
+                finished_key = f"_exec_finished_{model_key}"
+                if st.session_state.get(finished_key, False):
+                    # clear the finished marker and ensure running/cancel/ui_lock are false
+                    st.session_state[finished_key] = False
+                    st.session_state[running_key] = False
+                    st.session_state[cancel_key_ui] = False
+                    st.session_state[ui_lock_key] = False
+                    # If a lock file exists for this model, check whether the
+                    # PID recorded in it is still alive. If it's stale, remove
+                    # the lock so Execute becomes available.
                     try:
-                        # Build an executed command that prefixes runtime artifact
-                        # paths with ./artifacts/ (so outputs go into workspace
-                        # artifacts folder). We must NOT mutate the copyable CLI
-                        # shown to the user (cmd). Work on a shallow copy.
-                        cmd_exec = list(cmd) if isinstance(cmd, (list, tuple)) else cmd
                         try:
                             workspace_dir = os.path.abspath(os.getcwd())
                             artifacts_dir = os.path.join(workspace_dir, 'artifacts')
-                            os.makedirs(artifacts_dir, exist_ok=True)
+                            lock_path_check = os.path.join(artifacts_dir, f".runlock_{model_key}")
                         except Exception:
-                            artifacts_dir = os.path.join(os.path.abspath(os.getcwd()), 'artifacts')
-
-                        # Walk the command and when encountering flags that take
-                        # a path argument, prefix that argument with artifacts_dir
-                        # so runtime outputs are placed there. We handle --output,
-                        # --sfs and --paired-neutral specifically.
-                        runtime_cmd = []
-                        skip_next = False
-                        path_flags = {'--output', '--sfs', '--paired-neutral'}
-                        for i, token in enumerate(cmd_exec):
-                            if skip_next:
-                                # previous token told us this is a path; prefix it
-                                skip_next = False
-                                # token may be like 'name.ext' or a path; if it's
-                                # already absolute or already under artifacts_dir,
-                                # leave it unchanged to avoid double-prefix.
+                            lock_path_check = None
+                        if lock_path_check and os.path.exists(lock_path_check):
+                            try:
+                                with open(lock_path_check, 'r') as _lf:
+                                    content = _lf.read().strip()
+                                parts = [p for p in content.split() if p.strip()]
+                                pid_existing = int(parts[0]) if parts else None
+                            except Exception:
+                                pid_existing = None
+                            alive = False
+                            if pid_existing:
                                 try:
-                                    t = str(token)
-                                    if os.path.isabs(t) or os.path.commonpath([os.path.abspath(t), artifacts_dir]) == artifacts_dir:
-                                        runtime_cmd.append(t)
+                                    if psutil:
+                                        alive = psutil.pid_exists(pid_existing)
                                     else:
-                                        runtime_cmd.append(os.path.join(artifacts_dir, t))
+                                        os.kill(pid_existing, 0)
+                                        alive = True
+                                except Exception:
+                                    alive = False
+                            if not alive:
+                                try:
+                                    os.remove(lock_path_check)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(st, 'experimental_rerun'):
+                            st.experimental_rerun()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Consume any refresh flag left by run completion when rerun APIs
+            # were not available. This ensures we clear UI locks on next render.
+            try:
+                refresh_key = f"_needs_refresh_{model_key}"
+                if st.session_state.get(refresh_key, False):
+                    st.session_state[refresh_key] = False
+                    st.session_state[running_key] = False
+                    st.session_state[cancel_key_ui] = False
+                    st.session_state[ui_lock_key] = False
+                    # remove stale lock file for this model if PID dead
+                    try:
+                        workspace_dir = os.path.abspath(os.getcwd())
+                        artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+                        lock_path_check = os.path.join(artifacts_dir, f".runlock_{model_key}")
+                        if os.path.exists(lock_path_check):
+                            try:
+                                with open(lock_path_check, 'r') as _lf:
+                                    content = _lf.read().strip()
+                                parts = [p for p in content.split() if p.strip()]
+                                pid_existing = int(parts[0]) if parts else None
+                            except Exception:
+                                pid_existing = None
+                            alive = False
+                            if pid_existing:
+                                try:
+                                    if psutil:
+                                        alive = psutil.pid_exists(pid_existing)
+                                    else:
+                                        os.kill(pid_existing, 0)
+                                        alive = True
+                                except Exception:
+                                    alive = False
+                            if not alive:
+                                try:
+                                    os.remove(lock_path_check)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            exec_disabled = (
+                bool(btn_disabled_effective)
+                or bool(st.session_state.get(running_key, False))
+                or bool(st.session_state.get(ui_lock_key, False))
+                or bool(lock_exists)
+            )
+            cancel_disabled = not bool(st.session_state.get(running_key, False))
+            c_exec, c_cancel = st.columns([1, 1])
+            def _set_cancel_local():
+                """UI Cancel handler: create a cancel sentinel, try to signal the process/group,
+                fallback to psutil cleanup, update session state and remove lock files.
+                """
+                workspace_dir = os.path.abspath(os.getcwd())
+                artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+                lock_path = os.path.join(artifacts_dir, f".runlock_{model_key}")
+                cancel_path = os.path.join(artifacts_dir, f".runlock_{model_key}.cancel")
+
+                # ensure artifacts dir exists and write a cancel sentinel so the runner can see it
+                try:
+                    os.makedirs(artifacts_dir, exist_ok=True)
+                    with open(cancel_path, 'w') as _cf:
+                        _cf.write(f"{os.getpid()}\n{time.time()}\n")
+                    try:
+                        ui_diag(f"[ui_simulator] UI Cancel wrote cancel sentinel: {cancel_path}")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    try:
+                        ui_diag(f"[ui_simulator] UI Cancel failed to write sentinel: {e}")
+                    except Exception:
+                        pass
+
+                # attempt to find pid from session or lock
+                pid_val = None
+                try:
+                    pid_key = f"_running_pid_{model_key}"
+                    pid_val = st.session_state.get(pid_key)
+                except Exception:
+                    pid_val = None
+                if not pid_val:
+                    try:
+                        if os.path.exists(lock_path):
+                            with open(lock_path, 'r') as fh:
+                                content = fh.read().strip()
+                            parts = [p for p in content.split() if p.strip()]
+                            pid_val = int(parts[0]) if parts else None
+                    except Exception:
+                        pid_val = None
+
+                if pid_val:
+                    try:
+                        try:
+                            pg = os.getpgid(int(pid_val))
+                        except Exception:
+                            pg = None
+
+                        if pg is not None:
+                            try:
+                                ui_diag(f"[ui_simulator] UI Cancel sending SIGTERM to pgid={pg}")
+                                os.killpg(pg, signal.SIGTERM)
+                            except Exception as e:
+                                ui_diag(f"[ui_simulator] UI Cancel os.killpg failed: {e}")
+
+                        try:
+                            os.kill(int(pid_val), signal.SIGTERM)
+                        except Exception as e:
+                            ui_diag(f"[ui_simulator] UI Cancel os.kill(pid) failed: {e}")
+
+                        time.sleep(0.5)
+                        still = False
+                        try:
+                            if psutil:
+                                still = psutil.pid_exists(int(pid_val))
+                            else:
+                                os.kill(int(pid_val), 0)
+                                still = True
+                        except Exception:
+                            still = False
+
+                        if still and psutil:
+                            try:
+                                p = psutil.Process(int(pid_val))
+                                children = p.children(recursive=True)
+                                for c in children:
+                                    try:
+                                        ui_diag(f"[ui_simulator] UI Cancel terminating child pid={c.pid}")
+                                        c.terminate()
+                                    except Exception:
+                                        pass
+                                gone, alive = psutil.wait_procs(children, timeout=3)
+                                for c in alive:
+                                    try:
+                                        ui_diag(f"[ui_simulator] UI Cancel killing child pid={c.pid}")
+                                        c.kill()
+                                    except Exception:
+                                        pass
+                                try:
+                                    p.kill()
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                ui_diag(f"[ui_simulator] UI Cancel psutil cleanup failed: {e}")
+                    except Exception as e:
+                        ui_diag(f"[ui_simulator] UI Cancel outer error: {e}")
+
+                # set session flags so UI reflects cancellation
+                try:
+                    st.session_state[cancel_key_ui] = True
+                except Exception:
+                    pass
+                try:
+                    st.session_state[running_key] = False
+                except Exception:
+                    pass
+
+                # clear start_request/processed flags so Execute becomes available again
+                try:
+                    start_request_key = f"_start_request_{model_key}"
+                    processed_key = f"_exec_processed_{model_key}"
+                    st.session_state[start_request_key] = False
+                    st.session_state[processed_key] = False
+                    # clear transient immediate flag
+                    try:
+                        immediate_key = f"_exec_start_immediate_{model_key}"
+                        st.session_state[immediate_key] = False
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                # remove lock and cancel sentinel if present (cleanup)
+                try:
+                    if os.path.exists(lock_path):
+                        os.remove(lock_path)
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(cancel_path):
+                        os.remove(cancel_path)
+                except Exception:
+                    pass
+
+                # clear start_request/processed/ui_lock so Execute can be pressed again
+                try:
+                    start_request_key = f"_start_request_{model_key}"
+                    processed_key = f"_exec_processed_{model_key}"
+                    st.session_state[start_request_key] = False
+                    st.session_state[processed_key] = False
+                except Exception:
+                    pass
+                try:
+                    ui_lock_key = f"_ui_lock_{model_key}"
+                    st.session_state[ui_lock_key] = False
+                except Exception:
+                    pass
+
+                # Force an immediate rerun so the UI updates state (enables Execute)
+                try:
+                    if hasattr(st, 'experimental_rerun'):
+                        st.experimental_rerun()
+                except Exception:
+                    pass
+
+            with c_exec:
+                # Execute triggers a start-request so the app reruns before
+                # starting the long-running job. We set running immediately in
+                # the on_click handler so the Execute button is disabled right away.
+                start_request_key = f"_start_request_{model_key}"
+                if start_request_key not in st.session_state:
+                    st.session_state[start_request_key] = False
+
+                def _request_exec_local():
+                    try:
+                        # clear any stale processed flag so the start block will execute
+                        try:
+                            processed_key = f"_exec_processed_{model_key}"
+                            st.session_state[processed_key] = False
+                        except Exception:
+                            pass
+                        # mark immediate start so the run starter will kick off
+                        try:
+                            immediate_key = f"_exec_start_immediate_{model_key}"
+                            st.session_state[immediate_key] = True
+                        except Exception:
+                            pass
+                        # set a transient UI lock so repeated clicks before file-lock
+                        # creation do not spawn multiple runs
+                        try:
+                            st.session_state[ui_lock_key] = True
+                        except Exception:
+                            pass
+                        # Set the start_request and mark running immediately so
+                        # the Cancel button is enabled right away in the UI.
+                        try:
+                            running_key_local = f"_running_{model_key}"
+                            st.session_state[running_key_local] = True
+                        except Exception:
+                            pass
+                        st.session_state[start_request_key] = True
+                    except Exception:
+                        pass
+                    try:
+                        # clear any previous cancel flag so the new run starts clean
+                        st.session_state[cancel_key_ui] = False
+                    except Exception:
+                        pass
+                    # Do NOT set running here; the actual run will set running when
+                    # it begins. Setting running immediately prevents the start
+                    # condition below from firing. Log the request for debugging.
+                    try:
+                        ui_diag(f"[ui_simulator] Execute requested for model_key={model_key} (start_request set)")
+                        # Try to force an immediate rerun so the start_request is
+                        # processed in the same click (avoids double-click symptom).
+                        try:
+                            if hasattr(st, 'experimental_rerun'):
+                                st.experimental_rerun()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                st.button("Execute", disabled=exec_disabled, key=f"exec_btn_{model_key}", on_click=_request_exec_local)
+                # Diagnostics: intentionally hide any user-facing message when Execute is disabled
+                try:
+                    # Keep diagnostics internal-only via ui_diag (controlled by SHOW_DEV_DIAG)
+                    pass
+                except Exception:
+                    pass
+
+                # Developer diagnostics expander: show session_state keys and lock contents
+                try:
+                    # ensure lock_path_check exists for diagnostics
+                    try:
+                        workspace_dir = os.path.abspath(os.getcwd())
+                        artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+                        lock_path_check = os.path.join(artifacts_dir, f".runlock_{model_key}")
+                    except Exception:
+                        lock_path_check = None
+
+                    if SHOW_DEV_DIAG:
+                        with st.expander("Diagnostics (dev)", expanded=False):
+                            diag_state = {
+                                'btn_disabled_effective': bool(btn_disabled_effective),
+                                'exec_disabled': bool(exec_disabled),
+                                'running': bool(st.session_state.get(running_key, False)),
+                                'start_request': bool(st.session_state.get(start_request_key, False)),
+                                'exec_processed': bool(st.session_state.get(processed_key, False)),
+                                'running_pid': st.session_state.get(f"_running_pid_{model_key}", None),
+                            }
+
+                            # lock file contents
+                            lock_info = {'exists': False, 'content': None, 'content_error': None}
+                            try:
+                                if lock_path_check and os.path.exists(lock_path_check):
+                                    lock_info['exists'] = True
+                                    try:
+                                        with open(lock_path_check, 'r') as _lf:
+                                            lock_info['content'] = _lf.read().strip()
+                                    except Exception as e:
+                                        lock_info['content_error'] = str(e)
+                            except Exception:
+                                lock_info['exists'] = False
+
+                            st.write(diag_state)
+                            st.write(lock_info)
+
+                            try:
+                                # allow clearing a stale lock from UI during debugging
+                                if lock_info.get('exists'):
+                                    if st.button("Clear lock (dev)", key=f"clear_lock_{model_key}"):
+                                        try:
+                                            if lock_path_check:
+                                                os.remove(lock_path_check)
+                                        except Exception:
+                                            pass
+                                        # reset session flags that could have been left stale
+                                        try:
+                                            st.session_state[processed_key] = False
+                                            st.session_state[start_request_key] = False
+                                            st.session_state[running_key] = False
+                                            st.session_state[cancel_key_ui] = False
+                                            # clear transient UI lock too
+                                            try:
+                                                st.session_state[ui_lock_key] = False
+                                            except Exception:
+                                                pass
+                                        except Exception:
+                                            pass
+                                        try:
+                                            ui_diag(f"[ui_simulator] Dev cleared lock for model_key={model_key}")
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            with c_cancel:
+                # Cancel button: only enabled while running. Use on_click to reliably
+                # set the cancel session flag (avoids issues with immediate reruns).
+                st.button("Cancel", disabled=cancel_disabled, key=f"cancel_btn_{model_key}", on_click=_set_cancel_local)
+
+            # Start the run after rendering the Execute/Cancel buttons so Cancel
+            # is visible immediately while the run is starting.
+            start_request_key = f"_start_request_{model_key}"
+            processed_key = f"_exec_processed_{model_key}"
+            immediate_key = f"_exec_start_immediate_{model_key}"
+            immediate_flag = bool(st.session_state.get(immediate_key, False))
+            if (st.session_state.get(start_request_key, False) and not st.session_state.get(processed_key, False) and not st.session_state.get(running_key, False)) or immediate_flag:
+                try:
+                    st.session_state[processed_key] = True
+                except Exception:
+                    pass
+                try:
+                    # clear the transient immediate flag so we don't re-enter
+                    try:
+                        if immediate_flag:
+                            st.session_state[immediate_key] = False
+                    except Exception:
+                        pass
+                    st.session_state[start_request_key] = False
+                except Exception:
+                    pass
+                try:
+                    st.session_state[cancel_key_ui] = False
+                except Exception:
+                    pass
+                try:
+                    st.session_state[running_key] = True
+                except Exception:
+                    pass
+
+                # stash expected outputs for later artifact discovery
+                try:
+                    out_path_final = None
+                    run_sfs_only_ss = bool(st.session_state.get(f"run_sfs_only_{model_key}", False))
+                    if out_path and not run_sfs_only_ss:
+                        try:
+                            fmt = str(out_format or "").strip()
+                        except Exception:
+                            fmt = ""
+                        fmt_ext_map = {"ms": ".ms", "ms.gz": ".ms.gz", "vcf": ".vcf", "vcf.gz": ".vcf.gz", "bcf": ".bcf"}
+                        ext = fmt_ext_map.get(fmt, "")
+                        out_path_final = out_path
+                        if ext and not out_path_final.endswith(ext):
+                            out_path_final = out_path_final + ext
+                    sfs_arg = None
+                    try:
+                        if sfs_output and sfs_output.strip():
+                            sfs_arg = sfs_output.strip()
+                        else:
+                            if out_path:
+                                base = out_path
+                                for e in [".ms.gz", ".vcf.gz"]:
+                                    if base.endswith(e):
+                                        base = base[:-len(e)]
+                                        break
+                                else:
+                                    base = os.path.splitext(base)[0]
+                                sfs_arg = base + ".sfs"
+                    except Exception:
+                        sfs_arg = None
+                    paired_key_local = f"paired_neutral_{model_key}"
+                    try:
+                        pn_arg = (paired_neutral_name or "").strip() if bool(st.session_state.get(paired_key_local, False)) else ""
+                    except Exception:
+                        pn_arg = ""
+                    st.session_state[f"_expected_out_{model_key}"] = out_path_final
+                    st.session_state[f"_expected_sfs_{model_key}"] = sfs_arg
+                    st.session_state[f"_expected_pn_{model_key}"] = pn_arg
+                except Exception:
+                    pass
+
+                # Build runtime command and run (wrap paths into artifacts dir)
+                try:
+                    cmd_exec = list(cmd) if isinstance(cmd, (list, tuple)) else cmd
+                    try:
+                        workspace_dir = os.path.abspath(os.getcwd())
+                        artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+                        os.makedirs(artifacts_dir, exist_ok=True)
+                    except Exception:
+                        artifacts_dir = os.path.join(os.path.abspath(os.getcwd()), 'artifacts')
+                    runtime_cmd = []
+                    skip_next = False
+                    path_flags = {'--output', '--sfs', '--paired-neutral'}
+                    for i, token in enumerate(cmd_exec):
+                        if skip_next:
+                            skip_next = False
+                            try:
+                                t = str(token)
+                                if os.path.isabs(t) or os.path.commonpath([os.path.abspath(t), artifacts_dir]) == artifacts_dir:
+                                    runtime_cmd.append(t)
+                                else:
+                                    runtime_cmd.append(os.path.join(artifacts_dir, t))
+                            except Exception:
+                                runtime_cmd.append(token)
+                            continue
+                        if token in path_flags:
+                            runtime_cmd.append(token)
+                            skip_next = True
+                            continue
+                        appended = False
+                        for pf in path_flags:
+                            if isinstance(token, str) and token.startswith(pf + "="):
+                                try:
+                                    key, val = token.split('=', 1)
+                                    if os.path.isabs(val) or os.path.commonpath([os.path.abspath(val), artifacts_dir]) == artifacts_dir:
+                                        runtime_cmd.append(token)
+                                    else:
+                                        runtime_cmd.append(f"{key}={os.path.join(artifacts_dir, val)}")
+                                    appended = True
                                 except Exception:
                                     runtime_cmd.append(token)
-                                continue
-                            if token in path_flags:
-                                runtime_cmd.append(token)
-                                # next token is a path to prefix
-                                skip_next = True
-                                continue
-                            # also handle combined '=' form like --output=foo
-                            appended = False
-                            for pf in path_flags:
-                                if isinstance(token, str) and token.startswith(pf + "="):
-                                    try:
-                                        key, val = token.split('=', 1)
-                                        if os.path.isabs(val) or os.path.commonpath([os.path.abspath(val), artifacts_dir]) == artifacts_dir:
-                                            runtime_cmd.append(token)
-                                        else:
-                                            runtime_cmd.append(f"{key}={os.path.join(artifacts_dir, val)}")
-                                        appended = True
-                                    except Exception:
-                                        runtime_cmd.append(token)
-                                        appended = True
-                                    break
-                            if appended:
-                                continue
-                            runtime_cmd.append(token)
-
-                        cmd_exec = runtime_cmd
-
-                        # append --progress if not already present
-                        if '--progress' not in cmd_exec:
-                            cmd_exec = cmd_exec + ['--progress'] if isinstance(cmd_exec, list) else cmd_exec + ['--progress']
-                    except Exception:
-                        cmd_exec = cmd
-                    run_and_report(cmd_exec)
-            else:
-                # Running state: Cancel button removed per user request.
-                # Show a non-interactive running indicator instead.
+                                    appended = True
+                                break
+                        if appended:
+                            continue
+                        runtime_cmd.append(token)
+                    cmd_exec = runtime_cmd
+                    if '--progress' not in cmd_exec:
+                        cmd_exec = cmd_exec + ['--progress'] if isinstance(cmd_exec, list) else cmd_exec + ['--progress']
+                except Exception:
+                    cmd_exec = cmd
+                # start the run (blocks until finished inside run_and_report)
+                run_and_report(cmd_exec)
+                try:
+                    st.session_state[processed_key] = False
+                except Exception:
+                    pass
+            if st.session_state.get(running_key, False):
                 try:
                     st.caption("Running…")
                 except Exception:
-                    # fallback to simple text if caption fails
                     st.markdown("**Running…**")
 
             # Download panel: show any generated artifacts for this model.
