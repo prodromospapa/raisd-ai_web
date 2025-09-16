@@ -737,18 +737,16 @@ def _cleanup_local_tmpdir():
                         sys.stderr.flush()
                     except Exception:
                         pass
-                # Attempt to remove the .tmp parent directory and all its contents to free space
-                try:
-                    if os.path.isdir(parent):
-                        shutil.rmtree(parent, ignore_errors=True)
-                        if os.environ.get('SIMULATOR_DEBUG_TMP'):
-                            try:
-                                sys.stderr.write(f"DEBUG: removed .tmp parent directory: {parent}\n")
-                                sys.stderr.flush()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                # Do NOT remove the repo-level '.tmp' parent directory here.
+                # Removing the shared parent can race with other concurrent runs
+                # and cause unrelated run folders to be deleted. Keep only the
+                # per-run folder removal above.
+                if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                    try:
+                        sys.stderr.write(f"DEBUG: preserved .tmp parent directory: {parent}\n")
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
         # keep previous safety: support older naming convention
         elif base_name.startswith('.simulator_tmp_') and os.path.isdir(_LOCAL_TMP_ROOT):
             shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
