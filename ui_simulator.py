@@ -1240,17 +1240,49 @@ with st.container():
                         key=f"sweep_pos_{model_key}",
                     )
                 sel_s = st.number_input("Selection Coefficient (s)", value=0.1, step=0.0001, format="%g", disabled=not ordered_ready, key=f"sel_s_{model_key}")
-                time_units = st.selectbox("Time units", ["gens","4N"], disabled=not ordered_ready, key=f"time_units_{model_key}")
-                # Engine-specific sweep times (moved into sweep parameters block)
-                # Initialize to None so build_cmd can reference them safely.
+                # Engine-specific sweep times and time-units: render time units
+                # inline next to the relevant time field so the UI mirrors the
+                # placement of "Cap" next to Max RAM.
                 sweep_time = None
                 fixation_time = None
                 if ordered_ready and engine in {"discoal", "msms"}:
+                    # use two columns: time input (wider) and units selector (narrower)
+                    col_time, col_units = st.columns([3, 2])
                     if engine == "discoal":
-                        sweep_time = st.number_input("Sweep time", min_value=0.0, value=0.0, step=1.0, disabled=not ordered_ready, key=f"sweep_time_{model_key}")
+                        with col_time:
+                            sweep_time = st.number_input("Sweep time", min_value=0.0, value=0.0, step=1.0, disabled=not ordered_ready, key=f"sweep_time_{model_key}")
+                        with col_units:
+                            # Compact vertical radio similar to "Cap" control
+                            tu_key = f"time_units_{model_key}"
+                            if tu_key not in st.session_state:
+                                st.session_state[tu_key] = 'gens'
+                            time_units = st.radio(
+                                "Units",
+                                ["gens", "4N"],
+                                index=0 if st.session_state.get(tu_key, 'gens') == 'gens' else 1,
+                                key=tu_key,
+                                disabled=not ordered_ready,
+                            )
                     elif engine == "msms":
-                        # default fixation time as 0.0 (float) to keep numeric types consistent
-                        fixation_time = st.number_input("Fixation time", min_value=0.0, value=0.0, step=1.0, disabled=not ordered_ready, key=f"fixation_time_{model_key}")
+                        with col_time:
+                            # default fixation time as 0.0 (float) to keep numeric types consistent
+                            fixation_time = st.number_input("Fixation time", min_value=0.0, value=0.0, step=1.0, disabled=not ordered_ready, key=f"fixation_time_{model_key}")
+                        with col_units:
+                            # Compact vertical radio similar to "Cap" control
+                            tu_key = f"time_units_{model_key}"
+                            if tu_key not in st.session_state:
+                                st.session_state[tu_key] = 'gens'
+                            time_units = st.radio(
+                                "Units",
+                                ["gens", "4N"],
+                                index=0 if st.session_state.get(tu_key, 'gens') == 'gens' else 1,
+                                key=tu_key,
+                                disabled=not ordered_ready,
+                            )
+                else:
+                    # When sweep params are disabled or engine not sweep-capable,
+                    # default the units to 'gens' so build_cmd has a sensible value.
+                    time_units = "gens"
             else:
                 # default placeholders when sweep params disabled
                 sweep_pop = ""
@@ -1338,7 +1370,52 @@ with st.container():
                 sweep_pop = globals().get('sweep_pop', '')
         except Exception:
             sweep_pop = globals().get('sweep_pop', '')
-        sweep_pos_pct = _ss_glob_read(f"sweep_pos_{model_key}", 'sweep_pos_pct', float, 50.0)
+        # Determine sweep position percentage (0..100).
+        # The UI stores the slider under key `sweep_pos_{model_key}`. When a
+        # bp-based slider was shown this stores a base-pair integer; when a
+        # percent slider was shown it stores a percent float. Recompute the
+        # percentage here so the command builder always gets a percent.
+        sweep_pos_pct = 50.0
+        try:
+            # First, detect if an explicit sequence length was provided via UI
+            seq_len_ss = st.session_state.get(f"seq_length_{model_key}", None)
+            seq_len_val = int(seq_len_ss) if seq_len_ss not in (None, "") else 0
+        except Exception:
+            seq_len_val = 0
+        try:
+            chrom_length_mode_ss = bool(st.session_state.get(f"chrom_length_mode_{model_key}", False))
+        except Exception:
+            chrom_length_mode_ss = False
+        # Determine contig/native length fallback from globals (same logic as UI)
+        length_for_pos = None
+        try:
+            if seq_len_val and seq_len_val > 0:
+                length_for_pos = seq_len_val
+            elif not seq_len_val and chrom_length_mode_ss:
+                if 'contig_len' in globals() and contig_len:
+                    length_for_pos = int(contig_len)
+        except Exception:
+            length_for_pos = None
+
+        # Read raw slider value from session if present; otherwise fall back to global
+        raw_val = None
+        try:
+            if f"sweep_pos_{model_key}" in st.session_state:
+                raw_val = st.session_state.get(f"sweep_pos_{model_key}")
+            else:
+                raw_val = globals().get('sweep_pos_pct', None)
+        except Exception:
+            raw_val = globals().get('sweep_pos_pct', None)
+
+        try:
+            if length_for_pos and raw_val is not None:
+                # raw_val is bp position -> convert to percent
+                sweep_pos_pct = float(raw_val) / float(length_for_pos) * 100.0
+            else:
+                # raw_val is percent already (or None)
+                sweep_pos_pct = float(raw_val if raw_val is not None else 50.0)
+        except Exception:
+            sweep_pos_pct = 50.0
         sel_s = _ss_glob_read(f"sel_s_{model_key}", 'sel_s', float, 0.0)
         time_units = _ss_glob_read(f"time_units_{model_key}", 'time_units', str, 'gens')
         sweep_time = _ss_glob_read(f"sweep_time_{model_key}", 'sweep_time', float, 0.0)
@@ -1507,18 +1584,37 @@ with st.container():
                 cmd += ["--sel-s", str(float(sel_s))]
             # sweep_pos_pct holds percentage (0..100); pass it directly to the
             # simulator as a percentage value (0..100) per updated engine API.
+            # Ensure sweep_pos_pct is a float percentage (0..100). When sweep
+            # parameters are enabled we always pass --sweep-pos (clamped to the
+            # valid range) so downstream engines receive an explicit position.
             try:
                 sp_pct = float(sweep_pos_pct)
             except Exception:
-                sp_pct = None
-            if sp_pct is not None and 0.0 <= float(sp_pct) <= 100.0:
-                # pass percentage (0..100) as the engine expects
-                cmd += ["--sweep-pos", str(float(sp_pct))]
+                sp_pct = 50.0
+            # clamp into valid range
+            try:
+                if sp_pct < 0.0:
+                    sp_pct = 0.0
+                elif sp_pct > 100.0:
+                    sp_pct = 100.0
+            except Exception:
+                sp_pct = max(0.0, min(100.0, float(sp_pct or 50.0)))
+            # pass percentage (0..100) as the engine expects
+            cmd += ["--sweep-pos", str(float(sp_pct))]
             if time_units:
                 cmd += ["--time-units", time_units]
-            if sweep_time is not None:
+            # For msms engine, do not pass --sweep-time (msms expects selection
+            # strength via --sel-s and handles timing differently). For other
+            # engines include --sweep-time when provided.
+            try:
+                current_engine = engine
+            except Exception:
+                current_engine = None
+            if sweep_time is not None and (current_engine is None or current_engine != "msms"):
                 cmd += ["--sweep-time", str(float(sweep_time))]
-            if fixation_time is not None:
+            # For discoal, do not pass --fixation-time (discoal handles
+            # fixation timing differently). For other engines, include it when set.
+            if fixation_time is not None and (current_engine is None or current_engine != "discoal"):
                 cmd += ["--fixation-time", str(float(fixation_time))]
         # Optional developer toggle to include --show-command
         # include_show_flag variable is set lower when building for Execute;
