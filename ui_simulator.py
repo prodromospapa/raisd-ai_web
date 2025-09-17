@@ -3079,7 +3079,6 @@ with st.container():
             """
             try:
                 keys = [
-                    'engine',
                     f'seq_length_{model_key}',
                     f'target_snps_{model_key}',
                     f'target_snps_tol_choice_{model_key}',
@@ -3111,6 +3110,13 @@ with st.container():
                     'progress_flag',
                 ]
                 parts = []
+                # include current engine value from the local variable so
+                # switching engines triggers a fingerprint change even if
+                # 'engine' isn't stored in session_state.
+                try:
+                    parts.append(str(engine))
+                except Exception:
+                    parts.append('')
                 for k in keys:
                     try:
                         v = st.session_state.get(k, None)
@@ -3146,6 +3152,24 @@ with st.container():
                         st.session_state.pop(engine_cmd_visible_key, None)
                     except Exception:
                         st.session_state[engine_cmd_visible_key] = False
+                    # Also clear the stored fingerprint and filename so any
+                    # subsequent Download action will regenerate the command
+                    # and write a fresh filename. This ensures downloads reflect
+                    # parameter changes.
+                    try:
+                        st.session_state.pop(engine_cmd_fp_key, None)
+                    except Exception:
+                        try:
+                            st.session_state[engine_cmd_fp_key] = ''
+                        except Exception:
+                            pass
+                    try:
+                        st.session_state.pop(f"engine_cmd_filename_{model_key}", None)
+                    except Exception:
+                        try:
+                            st.session_state[f"engine_cmd_filename_{model_key}"] = ''
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -4175,17 +4199,27 @@ with st.container():
             dl_label = f"engine_command_{model_key}.txt"
         engine_text_now = st.session_state.get(engine_cmd_key, None)
 
+        # Respect the same disabled state as the Show engine command button.
+        # When show_engine_disabled is True we should not allow downloading
+        # the engine command because either inputs are invalid or the engine
+        # (e.g., msprime) doesn't produce an external engine command.
         if engine_text_now:
             try:
                 data = engine_text_now.encode('utf-8')
-                col_dl.download_button("Download Engine Command", data=data, file_name=dl_label, mime='text/plain')
+                col_dl.download_button(
+                    "Download Engine Command",
+                    data=data,
+                    file_name=dl_label,
+                    mime='text/plain',
+                    disabled=show_engine_disabled,
+                )
             except Exception:
                 col_dl.button("Download Engine Command", disabled=True)
         else:
             # No prepared command: clicking the button will prepare it AND
             # immediately download the generated engine command without
             # displaying it in the UI (single-click flow via data URI).
-            if col_dl.button("Download Engine Command"):
+            if col_dl.button("Download Engine Command", disabled=show_engine_disabled):
                 _ = prepare_engine_command(download_mode=True)
 
 # (Removed tip about progress bar per user request)
