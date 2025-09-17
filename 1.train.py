@@ -87,6 +87,7 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
         "--replicates", str(train_replicates),
         "--output", "sweep.ms",
         "--sweep-pos", "50",
+        "--fixation-time", "0",
         "--sel-s", str(sel_s),
         "--parallel", str(parallel),
         "--target-snps-tol", "10",

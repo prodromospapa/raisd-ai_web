@@ -185,7 +185,7 @@ def normalize_contig_names(contigs):
 
     seen = set()
     normalized = []
-    for nm in contigs:
+    for nm in (contigs or []):
         label = norm(nm)
         if label not in seen:
             seen.add(label)
@@ -194,52 +194,50 @@ def normalize_contig_names(contigs):
     # natural sort: numeric contigs first (by integer), then X, Y, MT, then others alphabetically
     def sort_key(s: str):
         s_up = s.upper()
-        if s.isdigit():
-            return (0, int(s))
-        if s_up in {'X'}:
+        try:
+            if s.isdigit():
+                return (0, int(s))
+        except Exception:
+            pass
+        if s_up == 'X':
             return (1, 0)
-        if s_up in {'Y'}:
+        if s_up == 'Y':
             return (1, 1)
         if s_up in {'MT', 'M'}:
             return (1, 2)
-        # fallback: put after numbered and special, sort by lowercase
         return (2, s.lower())
 
     return sorted(normalized, key=sort_key)
 
-def list_pop_names(sp, model_id):
+
+def list_pop_names(sp_obj, model_id):
+    """Return list of population/deme names for a given stdpopsim species model.
+
+    Tries demes graph names first, then falls back to model.populations entries.
+    """
     try:
-        model = sp.get_demographic_model(model_id)
+        model = sp_obj.get_demographic_model(model_id)
     except Exception:
         return []
-    # demes graph first
+    # demes graph names first
     try:
-        graph = getattr(model, "model", None)
-        if graph and hasattr(graph, "demes"):
-            return [d.name for d in graph.demes]
+        g = getattr(model, 'model', None)
+        if g and hasattr(g, 'demes'):
+            return [d.name for d in g.demes]
     except Exception:
         pass
-    # fallback
+    # fallback to model.populations
+    out = []
     try:
-        pops = getattr(model, "populations", [])
-        names = []
-        for p in pops:
-            nm = getattr(p, "name", None) or getattr(p, "id", None)
+        for p in getattr(model, 'populations', []):
+            nm = getattr(p, 'name', None) or getattr(p, 'id', None)
             if nm:
-                names.append(nm)
-        if names:
-            return names
+                out.append(nm)
     except Exception:
         pass
-    return []
-
-# species dropdown showing only species with >=1 model
-st.subheader("1) Species")
-if not sps:
-    st.error("`stdpopsim` is required for species/model discovery. Install it to enable the dropdowns.")
-    st.stop()
-
+    return out
 species_items = []
+
 for sp in sps.all_species():
     mids = list_models(sp)
     if mids:
@@ -1277,49 +1275,75 @@ with st.container():
                         key=f"sweep_pos_{model_key}",
                     )
                 sel_s = st.number_input("Selection Coefficient (s)", value=0.1, step=0.0001, format="%g", disabled=not ordered_ready, key=f"sel_s_{model_key}")
-                # Engine-specific sweep times and time-units: render time units
-                # inline next to the relevant time field so the UI mirrors the
-                # placement of "Cap" next to Max RAM.
+                # Time mode selector: let user pick which time to set (only one)
+                # Options: none (leave both unset), sweep origin, fixation time.
                 sweep_time = None
                 fixation_time = None
                 if ordered_ready and engine in {"discoal", "msms"}:
-                    # use two columns: time input (wider) and units selector (narrower)
+                    time_mode_key = f"time_mode_{model_key}"
+                    # Replace radio with a selectbox that has an empty placeholder
+                    # so no valid choice is selected by default; require explicit
+                    # user selection before running.
+                    cur_mode = st.session_state.get(time_mode_key, '')
+                    time_choices = ["", "Sweep Time", "Fixation Time"]
+                    display_map = {"": "-- pick time type --", "Sweep Time": "Sweep Time", "Fixation Time": "Fixation Time"}
+                    display_list = [display_map.get(x, x) for x in time_choices]
+                    sel_index = 0
+                    sel_display = st.selectbox("Time type", display_list, index=sel_index, key=time_mode_key)
+                    # Map back to canonical internal value (empty string means none)
+                    time_mode = "" if sel_display == display_map[""] else sel_display
+
                     col_time, col_units = st.columns([3, 2])
-                    if engine == "discoal":
-                        with col_time:
-                            sweep_time = st.number_input("Sweep time", min_value=0.0, value=0.0, step=1.0, disabled=not ordered_ready, key=f"sweep_time_{model_key}")
-                        with col_units:
-                            # Compact vertical radio similar to "Cap" control
-                            tu_key = f"time_units_{model_key}"
-                            if tu_key not in st.session_state:
-                                st.session_state[tu_key] = 'gens'
-                            time_units = st.radio(
-                                "Units",
-                                ["gens", "4N"],
-                                index=0 if st.session_state.get(tu_key, 'gens') == 'gens' else 1,
-                                key=tu_key,
-                                disabled=not ordered_ready,
-                            )
-                    elif engine == "msms":
-                        with col_time:
-                            # default fixation time as 0.0 (float) to keep numeric types consistent
-                            fixation_time = st.number_input("Fixation time", min_value=0.0, value=0.0, step=1.0, disabled=not ordered_ready, key=f"fixation_time_{model_key}")
-                        with col_units:
-                            # Compact vertical radio similar to "Cap" control
-                            tu_key = f"time_units_{model_key}"
-                            if tu_key not in st.session_state:
-                                st.session_state[tu_key] = 'gens'
-                            time_units = st.radio(
-                                "Units",
-                                ["gens", "4N"],
-                                index=0 if st.session_state.get(tu_key, 'gens') == 'gens' else 1,
-                                key=tu_key,
-                                disabled=not ordered_ready,
-                            )
+                    with col_time:
+                        if time_mode == 'Sweep Time':
+                            sweep_val = st.text_input('Sweep Time', value=st.session_state.get(f'sweep_time_{model_key}', ''), key=f'sweep_time_{model_key}')
+                            # Preserve fixation_time when switching; remember the value user set.
+                            # Auto-select the time_mode when the user types a value here so
+                            # entering a Sweep Time enables execution without separately
+                            # picking the time type.
+                            try:
+                                if isinstance(sweep_val, str) and sweep_val.strip() != '':
+                                    st.session_state[time_mode_key] = 'Sweep Time'
+                            except Exception:
+                                pass
+                            # If sweep is enabled and user selected this mode but left it blank, show an inline error
+                            # Removed inline popup: validation/messages for missing Sweep Time
+                            # are shown in Build & Run to avoid duplication.
+                        elif time_mode == 'Fixation Time':
+                            fix_val = st.text_input('Fixation Time', value=st.session_state.get(f'fixation_time_{model_key}', ''), key=f'fixation_time_{model_key}')
+                            # Preserve sweep_time when switching; remember the value user set.
+                            # Auto-select the time_mode when the user types a value here so
+                            # entering a Fixation Time enables execution without separately
+                            # picking the time type.
+                            try:
+                                if isinstance(fix_val, str) and fix_val.strip() != '':
+                                    st.session_state[time_mode_key] = 'Fixation Time'
+                            except Exception:
+                                pass
+                            # Removed inline popup: validation/messages for missing Fixation Time
+                            # are shown in Build & Run to avoid duplication.
+                        else:
+                            # If sweep is enabled and the user hasn't selected a time type,
+                            # guidance is shown in Build & Run instead.
+                            # Keep a no-op here so the block is syntactically valid.
+                            pass
+
+                    with col_units:
+                        tu_key = f"time_units_{model_key}"
+                        if tu_key not in st.session_state:
+                            st.session_state[tu_key] = 'gens'
+                        time_units = st.radio(
+                            "Units",
+                            ["gens", "4N"],
+                            index=0 if st.session_state.get(tu_key, 'gens') == 'gens' else 1,
+                            key=tu_key,
+                            disabled=not ordered_ready,
+                        )
+                    # If sweep is enabled but user left time as None/placeholder, show an error
+                    # Removed inline Build-time error here; Build & Run consolidates
+                    # and displays required validation messages to the user.
                 else:
-                    # When sweep params are disabled or engine not sweep-capable,
-                    # default the units to 'gens' so build_cmd has a sensible value.
-                    time_units = "gens"
+                    time_units = 'gens'
             else:
                 # default placeholders when sweep params disabled
                 sweep_pop = ""
@@ -1455,8 +1479,39 @@ with st.container():
             sweep_pos_pct = 50.0
         sel_s = _ss_glob_read(f"sel_s_{model_key}", 'sel_s', float, 0.0)
         time_units = _ss_glob_read(f"time_units_{model_key}", 'time_units', str, 'gens')
-        sweep_time = _ss_glob_read(f"sweep_time_{model_key}", 'sweep_time', float, 0.0)
-        fixation_time = _ss_glob_read(f"fixation_time_{model_key}", 'fixation_time', float, 0.0)
+        # treat unset values as None so we only include flags when explicitly provided
+        s_raw = None
+        f_raw = None
+        try:
+            s_raw = st.session_state.get(f"sweep_time_{model_key}", None)
+        except Exception:
+            s_raw = globals().get('sweep_time', None)
+        try:
+            f_raw = st.session_state.get(f"fixation_time_{model_key}", None)
+        except Exception:
+            f_raw = globals().get('fixation_time', None)
+
+        # Normalize and convert to floats when possible. Empty strings are treated as unset.
+        sweep_time = None
+        fixation_time = None
+        try:
+            if isinstance(s_raw, str):
+                s_strip = s_raw.strip()
+                if s_strip != "":
+                    sweep_time = float(s_strip)
+            elif s_raw is not None:
+                sweep_time = float(s_raw)
+        except Exception:
+            sweep_time = None
+        try:
+            if isinstance(f_raw, str):
+                f_strip = f_raw.strip()
+                if f_strip != "":
+                    fixation_time = float(f_strip)
+            elif f_raw is not None:
+                fixation_time = float(f_raw)
+        except Exception:
+            fixation_time = None
         cmd = [sys.executable, SIM_SCRIPT,
                "--engine", engine,
                "--pop-order", ",".join(pop_order),
@@ -1666,19 +1721,71 @@ with st.container():
                 current_engine = engine
             except Exception:
                 current_engine = None
-            if sweep_time is not None and (current_engine is None or current_engine != "msms"):
-                cmd += ["--sweep-time", str(float(sweep_time))]
-            # For discoal, do not pass --fixation-time (discoal handles
-            # fixation timing differently). For other engines, include it when set.
-            if fixation_time is not None and (current_engine is None or current_engine != "discoal"):
-                cmd += ["--fixation-time", str(float(fixation_time))]
+            # Include --sweep-time or --fixation-time only according to the
+            # user-selected time_mode. Never pass the non-selected value even
+            # if it contains data in session_state.
+            try:
+                tm_key = f"time_mode_{model_key}"
+                raw_tm = st.session_state.get(tm_key, '') or ''
+                placeholder_display = "-- pick time type --"
+                # Map placeholder back to empty; if empty, try to infer from entered values
+                tm_val = '' if raw_tm == placeholder_display else raw_tm
+                if not tm_val:
+                    # Try to infer from entered numeric values so users who type a
+                    # time don't have to manually re-select the time type.
+                    try:
+                        s_raw = st.session_state.get(f"sweep_time_{model_key}", "") or ""
+                        f_raw = st.session_state.get(f"fixation_time_{model_key}", "") or ""
+                        inferred = None
+                        try:
+                            if isinstance(f_raw, str) and f_raw.strip() != "":
+                                float(f_raw)
+                                inferred = 'Fixation Time'
+                        except Exception:
+                            inferred = None
+                        if inferred is None:
+                            try:
+                                if isinstance(s_raw, str) and s_raw.strip() != "":
+                                    float(s_raw)
+                                    inferred = 'Sweep Time'
+                            except Exception:
+                                inferred = None
+                        if inferred:
+                            tm_val = inferred
+                            try:
+                                # persist inferred choice so UI reflects it
+                                st.session_state[tm_key] = inferred
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                tm_val = ''
+            if tm_val == 'Sweep Time':
+                if sweep_time is not None:
+                    cmd += ["--sweep-time", str(float(sweep_time))]
+                else:
+                    # user selected sweep time but left field empty; do not
+                    # fall back to fixation_time
+                    pass
+            elif tm_val == 'Fixation Time':
+                if fixation_time is not None:
+                    cmd += ["--fixation-time", str(float(fixation_time))]
+                else:
+                    # user selected fixation time but left field empty; do
+                    # not fall back to sweep_time
+                    pass
+            else:
+                # no selection made; include nothing and let CLI-level
+                # validation handle missing required flags when running
+                pass
         # Optional developer toggle to include --show-command
         # include_show_flag variable is set lower when building for Execute;
         # here we default to False when invoked directly.
         return cmd
 
     # helper to run a command and show progress + stdout/stderr
-    def run_and_report(cmd_list):
+    def run_and_report(cmd_list):  # noqa: C901
         """Run the simulator subprocess and stream its stdout into the UI.
         Parse tqdm-like progress (percent or a/b) and update a Streamlit
         progress bar in real time. Capture full output and show it at the end.
@@ -2885,13 +2992,42 @@ with st.container():
                 primary_missing_req = True
                 st.error("Primary Output path is required unless 'Run SFS only' is checked and an SFS output path is provided.")
 
-        # If engine is discoal and sweep parameters are enabled, ensure sweep_time > 0
+        # If engine is discoal and sweep parameters are enabled, ensure the
+        # user provided either a positive sweep_time (>0) OR a valid
+        # fixation_time (>=0). Do not force sweep_time when fixation_time is set.
         try:
             sweep_enabled_ss_local = bool(st.session_state.get(f"sweep_enable_{model_key}", False))
             if engine == 'discoal' and sweep_enabled_ss_local:
-                sweep_time_val = float(st.session_state.get(f"sweep_time_{model_key}", 0.0) or 0.0)
-                if sweep_time_val <= 0.0:
-                    st.error("discoal requires a positive Sweep time. Set 'Sweep time' > 0.")
+                sw_raw = st.session_state.get(f"sweep_time_{model_key}", "") or ""
+                fix_raw = st.session_state.get(f"fixation_time_{model_key}", "") or ""
+                sw_ok = False
+                fix_ok = False
+                try:
+                    if isinstance(sw_raw, str):
+                        if sw_raw.strip() != "":
+                            swv = float(sw_raw)
+                            if swv > 0.0:
+                                sw_ok = True
+                    else:
+                        swv = float(sw_raw)
+                        if swv > 0.0:
+                            sw_ok = True
+                except Exception:
+                    sw_ok = False
+                try:
+                    if isinstance(fix_raw, str):
+                        if fix_raw.strip() != "":
+                            fxv = float(fix_raw)
+                            if fxv >= 0.0:
+                                fix_ok = True
+                    else:
+                        fxv = float(fix_raw)
+                        if fxv >= 0.0:
+                            fix_ok = True
+                except Exception:
+                    fix_ok = False
+                if not (sw_ok or fix_ok):
+                    # neither a positive sweep_time nor a valid fixation_time was provided
                     primary_missing_req = True
         except Exception:
             pass
@@ -2918,6 +3054,12 @@ with st.container():
             if not chrom_mode and seq_val <= 0 and snp_val <= 0:
                 primary_missing_req = True
                 st.error("Set either Length (bp), Target SNPs (>0), or enable Chromosome Length. At least one is required.")
+                # If time mode was missing, surface that message together here
+                try:
+                    if time_mode_missing:
+                        st.error("Pick either Sweep Time or Fixation Time before running the sweep.")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2952,6 +3094,50 @@ with st.container():
         except Exception:
             sweep_pop_required_missing = False
 
+        # If sweep parameters are enabled and engine requires a time type
+        # (discoal/msms), require the user to pick a time mode and provide a
+        # numeric value for the chosen mode before allowing execution.
+        time_mode_missing = False
+        time_value_missing = False
+        try:
+            sweep_enabled_ss_local = bool(st.session_state.get(f"sweep_enable_{model_key}", False))
+            if sweep_enabled_ss_local and engine in {"discoal", "msms"}:
+                tm_key = f"time_mode_{model_key}"
+                raw_tm = st.session_state.get(tm_key, "") or ""
+                # Map the selectbox placeholder display back to an empty value
+                placeholder_display = "-- pick time type --"
+                tm_val = "" if raw_tm == placeholder_display else raw_tm
+                # tm_val is '' when user hasn't picked a type (selectbox placeholder)
+                if not tm_val:
+                    time_mode_missing = True
+                    # Message moved to Build & Run gating; do not show inline error here.
+                    # In Build & Run we'll show a consolidated message prompting the user
+                    # to pick a Time type; nothing to do inline here.
+                    pass
+                else:
+                    # Validate that the chosen field contains a numeric value
+                    if tm_val == 'Sweep Time':
+                        raw = st.session_state.get(f"sweep_time_{model_key}", "") or ""
+                        try:
+                            if isinstance(raw, str) and raw.strip() == "":
+                                raise ValueError("empty")
+                            float(raw)
+                        except Exception:
+                            time_value_missing = True
+                            st.error("You selected Sweep Time but did not enter a valid numeric value. Please enter a numeric Sweep Time to proceed.")
+                    elif tm_val == 'Fixation Time':
+                        raw = st.session_state.get(f"fixation_time_{model_key}", "") or ""
+                        try:
+                            if isinstance(raw, str) and raw.strip() == "":
+                                raise ValueError("empty")
+                            float(raw)
+                        except Exception:
+                            time_value_missing = True
+                            st.error("You selected Fixation Time but did not enter a valid numeric value. Please enter a numeric Fixation Time to proceed.")
+        except Exception:
+            time_mode_missing = False
+            time_value_missing = False
+
         # btn_disabled_effective collects validation failures that disable
         # Prepare/Execute and the copyable CLI. Do NOT include engine==msprime
         # here — msprime should only disable the *Show engine command* button
@@ -2962,7 +3148,16 @@ with st.container():
             or primary_missing_req
             or sweep_pop_required_missing
             or tol_invalid_missing
+            or time_mode_missing
+            or time_value_missing
         )
+
+        # Surface the time-mode missing message prominently in Build & Run
+        try:
+            if time_mode_missing:
+                st.error('Sweep is enabled: pick either Sweep Time or Fixation Time before preparing/executing the command.')
+        except Exception:
+            pass
 
         # Separate flag used solely for the Show engine command button so
         # we can disable that button for msprime while leaving execution and
@@ -3177,6 +3372,57 @@ with st.container():
                 or bool(st.session_state.get(ui_lock_key, False))
                 or bool(lock_exists)
             )
+            # Additional explicit gating: when sweep is enabled for discoal/msms
+            # require a time-mode selection and a numeric value for that selection
+            try:
+                sweep_enabled_ui = bool(st.session_state.get(f"sweep_enable_{model_key}", False))
+                if sweep_enabled_ui and engine in {"discoal", "msms"}:
+                    raw_tm = st.session_state.get(f"time_mode_{model_key}", "") or ""
+                    placeholder_display = "-- pick time type --"
+                    tm_val_local = "" if raw_tm == placeholder_display else raw_tm
+                    # If no explicit selection, infer from entered numeric values
+                    if not tm_val_local:
+                        try:
+                            f_raw = st.session_state.get(f"fixation_time_{model_key}", "") or ""
+                            s_raw = st.session_state.get(f"sweep_time_{model_key}", "") or ""
+                            if isinstance(f_raw, str) and f_raw.strip() != "":
+                                try:
+                                    float(f_raw)
+                                    tm_val_local = 'Fixation Time'
+                                    st.session_state[f"time_mode_{model_key}"] = 'Fixation Time'
+                                except Exception:
+                                    tm_val_local = ''
+                            if not tm_val_local and isinstance(s_raw, str) and s_raw.strip() != "":
+                                try:
+                                    float(s_raw)
+                                    tm_val_local = 'Sweep Time'
+                                    st.session_state[f"time_mode_{model_key}"] = 'Sweep Time'
+                                except Exception:
+                                    tm_val_local = ''
+                        except Exception:
+                            tm_val_local = ''
+                    if not tm_val_local:
+                        time_mode_missing = True
+                        exec_disabled = True
+                    else:
+                        if tm_val_local == 'Sweep Time':
+                            raw = st.session_state.get(f"sweep_time_{model_key}", "") or ""
+                            try:
+                                if isinstance(raw, str) and raw.strip() == "":
+                                    raise ValueError("empty")
+                                float(raw)
+                            except Exception:
+                                exec_disabled = True
+                        elif tm_val_local == 'Fixation Time':
+                            raw = st.session_state.get(f"fixation_time_{model_key}", "") or ""
+                            try:
+                                if isinstance(raw, str) and raw.strip() == "":
+                                    raise ValueError("empty")
+                                float(raw)
+                            except Exception:
+                                exec_disabled = True
+            except Exception:
+                pass
             cancel_disabled = not bool(st.session_state.get(running_key, False))
             c_exec, c_cancel = st.columns([1, 1])
             def _set_cancel_local():
@@ -3330,7 +3576,9 @@ with st.container():
                 # Force an immediate rerun so the UI updates state (enables Execute)
                 try:
                     if hasattr(st, 'experimental_rerun'):
-                        st.experimental_rerun()
+                        # experimental_rerun is not available in some streamlit stubs
+                        # Return early to avoid attempting a rerun here.
+                        return
                 except Exception:
                     pass
 
@@ -3386,7 +3634,9 @@ with st.container():
                         # processed in the same click (avoids double-click symptom).
                         try:
                             if hasattr(st, 'experimental_rerun'):
-                                st.experimental_rerun()
+                                # experimental_rerun is not available in some streamlit stubs
+                                # Return early to avoid attempting a rerun here.
+                                return
                         except Exception:
                             pass
                     except Exception:
@@ -3503,6 +3753,9 @@ with st.container():
                     pass
 
                 # stash expected outputs for later artifact discovery
+                # We delay registering these in session_state until after we
+                # create a per-run artifacts subfolder so expected paths point
+                # into that run folder (artifacts/<run>/*).
                 try:
                     out_path_final = None
                     run_sfs_only_ss = bool(st.session_state.get(f"run_sfs_only_{model_key}", False))
@@ -3537,11 +3790,13 @@ with st.container():
                         pn_arg = (paired_neutral_name or "").strip() if bool(st.session_state.get(paired_key_local, False)) else ""
                     except Exception:
                         pn_arg = ""
-                    st.session_state[f"_expected_out_{model_key}"] = out_path_final
-                    st.session_state[f"_expected_sfs_{model_key}"] = sfs_arg
-                    st.session_state[f"_expected_pn_{model_key}"] = pn_arg
+                    # NOTE: do not set session_state expected keys yet; we'll set
+                    # them after creating a per-run artifacts folder below so
+                    # paths point into that folder.
                 except Exception:
-                    pass
+                    out_path_final = None
+                    sfs_arg = None
+                    pn_arg = ""
 
                 # Build runtime command and run (wrap paths into artifacts dir)
                 try:
@@ -3552,6 +3807,14 @@ with st.container():
                         os.makedirs(artifacts_dir, exist_ok=True)
                     except Exception:
                         artifacts_dir = os.path.join(os.path.abspath(os.getcwd()), 'artifacts')
+                    # create a per-run artifacts subfolder so every execution
+                    # places its outputs under artifacts/<run_name>/...
+                    try:
+                        run_name = f"run_{int(time.time())}_{os.getpid()}"
+                        run_artifacts_dir = os.path.join(artifacts_dir, run_name)
+                        os.makedirs(run_artifacts_dir, exist_ok=True)
+                    except Exception:
+                        run_artifacts_dir = artifacts_dir
                     runtime_cmd = []
                     skip_next = False
                     path_flags = {'--output', '--sfs', '--paired-neutral'}
@@ -3560,10 +3823,12 @@ with st.container():
                             skip_next = False
                             try:
                                 t = str(token)
-                                if os.path.isabs(t) or os.path.commonpath([os.path.abspath(t), artifacts_dir]) == artifacts_dir:
+                                # If the token is absolute or already inside the
+                                # per-run artifacts folder, leave it alone.
+                                if os.path.isabs(t) or os.path.commonpath([os.path.abspath(t), run_artifacts_dir]) == run_artifacts_dir:
                                     runtime_cmd.append(t)
                                 else:
-                                    runtime_cmd.append(os.path.join(artifacts_dir, t))
+                                    runtime_cmd.append(os.path.join(run_artifacts_dir, t))
                             except Exception:
                                 runtime_cmd.append(token)
                             continue
@@ -3576,10 +3841,10 @@ with st.container():
                             if isinstance(token, str) and token.startswith(pf + "="):
                                 try:
                                     key, val = token.split('=', 1)
-                                    if os.path.isabs(val) or os.path.commonpath([os.path.abspath(val), artifacts_dir]) == artifacts_dir:
+                                    if os.path.isabs(val) or os.path.commonpath([os.path.abspath(val), run_artifacts_dir]) == run_artifacts_dir:
                                         runtime_cmd.append(token)
                                     else:
-                                        runtime_cmd.append(f"{key}={os.path.join(artifacts_dir, val)}")
+                                        runtime_cmd.append(f"{key}={os.path.join(run_artifacts_dir, val)}")
                                     appended = True
                                 except Exception:
                                     runtime_cmd.append(token)
@@ -3589,6 +3854,40 @@ with st.container():
                             continue
                         runtime_cmd.append(token)
                     cmd_exec = runtime_cmd
+                    # Register the expected outputs to point into the per-run
+                    # artifacts folder so discovery will look there.
+                    try:
+                        if out_path_final:
+                            try:
+                                out_expected = os.path.join(run_artifacts_dir, os.path.basename(out_path_final))
+                            except Exception:
+                                out_expected = out_path_final
+                        else:
+                            out_expected = None
+                        if sfs_arg:
+                            try:
+                                sfs_expected = os.path.join(run_artifacts_dir, os.path.basename(sfs_arg))
+                            except Exception:
+                                sfs_expected = sfs_arg
+                        else:
+                            sfs_expected = None
+                        if pn_arg:
+                            try:
+                                pn_expected = os.path.join(run_artifacts_dir, os.path.basename(pn_arg))
+                            except Exception:
+                                pn_expected = pn_arg
+                        else:
+                            pn_expected = None
+                        st.session_state[f"_expected_out_{model_key}"] = out_expected
+                        st.session_state[f"_expected_sfs_{model_key}"] = sfs_expected
+                        st.session_state[f"_expected_pn_{model_key}"] = pn_expected
+                    except Exception:
+                        try:
+                            st.session_state[f"_expected_out_{model_key}"] = out_path_final
+                            st.session_state[f"_expected_sfs_{model_key}"] = sfs_arg
+                            st.session_state[f"_expected_pn_{model_key}"] = pn_arg
+                        except Exception:
+                            pass
                     if '--progress' not in cmd_exec:
                         cmd_exec = cmd_exec + ['--progress'] if isinstance(cmd_exec, list) else cmd_exec + ['--progress']
                 except Exception:

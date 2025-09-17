@@ -2546,7 +2546,7 @@ def build_msprime_command(*, species, model_id, user_order, individual_counts, p
 def build_msms_command(*, species, model_id, user_order, individual_counts, pop0,
                        reps, length, max_fold_per_step, chr_name=None,
                        min_snps=None, disable_en_ladder=False, a=None, s=None, x=None,
-                       fixation_time=0.0, seed=None, time_units='gens'):
+                       fixation_time=None, sweep_time=None, seed=None, time_units='gens'):
     sp = sps.get_species(species)
     model = sp.get_demographic_model(model_id)
     raw_demog = model.model
@@ -2672,17 +2672,20 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
         if x is None:
             x = 0.5
         sel_args += ['-Sp', str(x), '-Smark']
-        # Derive origin time (backwards) given fixation at present (fixation_time must be 0 per spec).
-        # Approx fixation duration in coalescent units (duration from origin to fixation):
-        # T_duration ≈ ln(a)/a for a>1 else ln(1+a)/a. (a = 2Ns)
-        # If fixation_time > 0 (fixed in the past), origin_time = fixation_time + T_duration.
+    # Derive origin time (backwards) and handle fixation-time / sweep_time semantics.
+    # Approx fixation duration in coalescent units (duration from origin to fixation):
+    # T_duration ≈ ln(a)/a for a>1 else ln(1+a)/a. (a = 2Ns)
+    # If fixation_time > 0 (meaning the allele was fixed in the past at time "fixation_time"), we will
+    # instruct msms to set the allele frequency to ~1.0 at that time via `-SI <t> ...` and NOT use `-SFC`.
+    # If fixation_time == 0 (fixation at present), we keep the existing behavior: initialize at a small
+    # frequency at tstart and use `-SFC` to condition on fixation at present.
         if a <= 0:
             raise SystemExit('ERROR: --sel-2Ns/--sel-s must be > 0 for msms selection.')
         if a > 1.0:
             t_duration = math.log(a) / a
         else:
             t_duration = math.log(1.0 + a) / a
-        # interpret fixation_time according to time_units
+    # interpret fixation_time or sweep_time according to time_units, convert to 4N units when needed
         fixation_time_gen = None
         fixation_time_4N = 0.0
         if fixation_time is not None:
@@ -2696,12 +2699,92 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
                     raise SystemExit('ERROR: Failed to convert --fixation-time (generations) to 4N units using N0.')
             else:
                 fixation_time_4N = float(fixation_time)
-        tstart = t_duration + (fixation_time_4N or 0.0)
-        f0 = max(1.0 / (2.0 * N0), 1e-6)
-        init_freqs = ['0'] * npop
-        sel_deme_index = desired_order.index(pop0)  # 0-based index into our order list
-        init_freqs[sel_deme_index] = str(f0)
-        sel_args += ['-SI', str(tstart), str(npop), *init_freqs, '-SFC']
+        # sweep_time represents the origin time when the allele became beneficial (same semantics as discoal)
+        sweep_time_gen = None
+        sweep_time_4N = None
+        if fixation_time is not None:
+            if time_units == 'gens':
+                fixation_time_gen = fixation_time
+                try:
+                    if not (N0 and float(N0) > 0):
+                        raise Exception('Invalid N0 for conversion')
+                    fixation_time_4N = float(fixation_time_gen) / (4.0 * float(N0))
+                except Exception:
+                    raise SystemExit('ERROR: Failed to convert --fixation-time (generations) to 4N units using N0.')
+            else:
+                fixation_time_4N = float(fixation_time)
+        if sweep_time is not None:
+            if time_units == 'gens':
+                sweep_time_gen = sweep_time
+                try:
+                    if not (N0 and float(N0) > 0):
+                        raise Exception('Invalid N0 for conversion')
+                    sweep_time_4N = float(sweep_time_gen) / (4.0 * float(N0))
+                except Exception:
+                    raise SystemExit('ERROR: Failed to convert --sweep-time (generations) to msms 4N units using N0.')
+            else:
+                sweep_time_4N = float(sweep_time)
+
+        # t_duration is the approximate time (in 4N units) from origin to fixation
+        tstart_duration = t_duration
+
+    # Priority: if sweep_time provided, treat it as origin time where selected allele was at low freq
+    # and will sweep to fixation at present (we initialize at a small freq at sweep_time and use -SFC to
+    # condition on fixation at present). If sweep_time is not provided but fixation_time is provided
+    # and >0, that means the allele was already fixed at that past time; we model this by setting the
+    # allele frequency ~1 at fixation_time via -SI and NOT using -SFC.
+        # initialize at a small frequency at origin time (t_duration + fixation_time) and use -SFC to
+        # condition on fixation at present.
+        if fixation_time is None or float(fixation_time) == 0.0:
+            tstart = tstart_duration + (fixation_time_4N or 0.0)
+            f0 = max(1.0 / (2.0 * N0), 1e-6)
+            init_freqs = ['0'] * npop
+            sel_deme_index = desired_order.index(pop0)  # 0-based index into our order list
+            init_freqs[sel_deme_index] = str(f0)
+            sel_args += ['-SI', str(tstart), str(npop), *init_freqs, '-SFC']
+        else:
+            # fixation_time > 0: user wants the allele to be fixed at time fixation_time in the past.
+            # Emit -SI <fixation_time_4N> ... with frequency ~1.0 for the sweep population and DO NOT add -SFC.
+            # Use a numerically safe frequency slightly below 1.0: 1 - 1/(2N0) (haploid sample scaling)
+            try:
+                safe_one = 1.0 - (1.0 / (2.0 * float(N0)))
+                if safe_one <= 0.0:
+                    safe_one = 0.999999
+            except Exception:
+                safe_one = 0.999999
+            init_freqs = ['0'] * npop
+            sel_deme_index = desired_order.index(pop0)
+            init_freqs[sel_deme_index] = str(safe_one)
+            sel_args += ['-SI', str(fixation_time_4N), str(npop), *init_freqs]
+        if sweep_time is not None:
+            # initialize at small frequency at sweep origin (sweep_time_4N) and use -SFC to condition on fixation
+            tstart = tstart_duration + (sweep_time_4N or 0.0)
+            f0 = max(1.0 / (2.0 * N0), 1e-6)
+            init_freqs = ['0'] * npop
+            sel_deme_index = desired_order.index(pop0)
+            init_freqs[sel_deme_index] = str(f0)
+            sel_args += ['-SI', str(tstart), str(npop), *init_freqs, '-SFC']
+        elif fixation_time is None or float(fixation_time) == 0.0:
+            # default / present-fixation behavior: initialize a small freq at tstart and use -SFC
+            tstart = tstart_duration + (fixation_time_4N or 0.0)
+            f0 = max(1.0 / (2.0 * N0), 1e-6)
+            init_freqs = ['0'] * npop
+            sel_deme_index = desired_order.index(pop0)  # 0-based index into our order list
+            init_freqs[sel_deme_index] = str(f0)
+            sel_args += ['-SI', str(tstart), str(npop), *init_freqs, '-SFC']
+        else:
+            # fixation_time > 0: user wants the allele to be fixed at time fixation_time in the past.
+            # Emit -SI <fixation_time_4N> ... with frequency ~1.0 for the sweep population and DO NOT add -SFC.
+            try:
+                safe_one = 1.0 - (1.0 / (2.0 * float(N0)))
+                if safe_one <= 0.0:
+                    safe_one = 0.999999
+            except Exception:
+                safe_one = 0.999999
+            init_freqs = ['0'] * npop
+            sel_deme_index = desired_order.index(pop0)
+            init_freqs[sel_deme_index] = str(safe_one)
+            sel_args += ['-SI', str(fixation_time_4N), str(npop), *init_freqs]
 
     if sel_args:
         parts.extend(sel_args)
@@ -2848,7 +2931,7 @@ def parse_args():
     sg.add_argument('--sweep-pos', dest='x', type=float, help='Selected site position as percent in [0,100] (required for discoal/msms). Ignored for ms,scrm and msprime.')
     sg.add_argument('--sel-s', dest='s', type=float, help='Selection coefficient s per generation (required for discoal/msms). Converted to 2Ns using present-size N for the sweep population. Ignored for ms,scrm and msprime.')
     sg.add_argument('--sweep-time', dest='sweep_time', type=float, help='Origin time for the allele (units set by --time-units; default gens).')
-    sg.add_argument('--fixation-time', dest='fix_time', type=float, default=0.0, help='Fixation time back (units set by --time-units; default gens=generations ago).')
+    sg.add_argument('--fixation-time', dest='fix_time', type=float, default=None, help='Fixation time back (units set by --time-units; gens=generations ago). If omitted, no explicit past-fixation time is assumed.')
     sg.add_argument('--time-units', dest='time_units', choices=['gens','4N'], default='gens',
                    help="Units for --sweep-time and --fixation-time: 'gens' = generations ago, '4N' = coalescent units (4N generations). Default: gens.")
 
@@ -3063,25 +3146,43 @@ def parse_args():
         pass
     argv_full = sys.argv[1:]
     # Misuse checks
-    if engine == 'msms' and any(a.startswith('--sweep-time') for a in argv_full):
-        raise SystemExit('ERROR: engine=msms uses --fixation-time; do not use --sweep-time.')
-    if engine == 'discoal' and any(a.startswith('--fixation-time') for a in argv_full):
-        raise SystemExit('ERROR: engine=discoal uses --sweep-time; do not use --fixation-time.')
+    # Allow msms to accept --sweep-time (origin time) as an alternative to --fixation-time.
     # Required selection params
     if engine == 'discoal':
         # Neutral discoal run permitted when all selection params omitted.
-        have_sel = (getattr(args, 's', None) is not None)
-        have_any = any(v is not None for v in (getattr(args, 's', None), args.x, args.sweep_time))
-        have_all = have_sel and (args.x is not None) and (args.sweep_time is not None)
-        if have_any and not have_all:
-            raise SystemExit('ERROR: discoal selection requires --sel-s, --sweep-pos, and --sweep-time or none (neutral).')
+        # If the user requests selection we require --sel-s and --sweep-pos
+        # and exactly one of --sweep-time or --fixation-time (mutually exclusive).
+        user_attempted_selection = (getattr(args, 's', None) is not None) or (args.x is not None) or (args.sweep_time is not None) or (getattr(args, 'fix_time', None) is not None)
+        if user_attempted_selection:
+            # require sel-s and sweep-pos
+            if getattr(args, 's', None) is None or args.x is None:
+                raise SystemExit('ERROR: discoal selection requires --sel-s and --sweep-pos.')
+            # require exactly one of sweep-time or fixation-time
+            has_sweep_time = args.sweep_time is not None
+            has_fix_time = getattr(args, 'fix_time', None) is not None
+            if not (has_sweep_time ^ has_fix_time):
+                raise SystemExit('ERROR: discoal selection requires exactly one of --sweep-time or --fixation-time (they are mutually exclusive).')
+            # Validate non-negativity of provided time value(s)
+            tt = args.sweep_time if has_sweep_time else getattr(args, 'fix_time', None)
+            if tt is not None and tt < 0:
+                sys.exit('ERROR: --sweep-time/--fixation-time must be >= 0.')
     elif engine == 'msms':
-        have_any = any(v is not None for v in (getattr(args, 's', None), args.x))
-        have_all = (getattr(args, 's', None) is not None) and (args.x is not None)
-        if args.sweep_time is not None:
-            raise SystemExit('ERROR: msms uses --fixation-time not --sweep-time.')
-        if have_any and not have_all:
-            raise SystemExit('ERROR: msms selection requires --sel-s and --sweep-pos or neither (neutral).')
+        # msms selection: if user attempts selection require --sel-s and --sweep-pos
+        # and exactly one of --sweep-time or --fixation-time.
+        user_provided_fix = any(a.startswith('--fixation-time') for a in sys.argv[1:])
+        user_attempted_selection = (getattr(args, 's', None) is not None) or (args.x is not None) or user_provided_fix
+        if user_attempted_selection:
+            if getattr(args, 's', None) is None or args.x is None:
+                sys.exit('ERROR: msms selection requires both --sel-s and --sweep-pos.')
+            has_sweep_time = args.sweep_time is not None
+            has_fix_time = getattr(args, 'fix_time', None) is not None
+            if not (has_sweep_time ^ has_fix_time):
+                sys.exit('ERROR: msms selection requires exactly one of --sweep-time or --fixation-time (they are mutually exclusive).')
+            if getattr(args, 'fix_time', None) is not None and getattr(args, 'fix_time', None) < 0:
+                sys.exit('ERROR: --fixation-time must be >= 0 (time back in gens or 4N units as specified).')
+            # Also validate sweep_time when provided for msms
+            if args.sweep_time is not None and args.sweep_time < 0:
+                sys.exit('ERROR: --sweep-time must be >= 0.')
     else:  # ms or other neutral-like engines
         sel_flags = ['--sweep-pos', '--sel-s', '--sweep-time', '--fixation-time', '--sweep-pop']
         provided = [fl for fl in sel_flags if any(a == fl or a.startswith(fl + '=') for a in argv_full)]
@@ -3347,19 +3448,19 @@ def _run_simulation_core(args):
     def _pilot_build(engine_name, length_val, reps_override=1, min_snps_forward=None):
         if engine_name == 'discoal':
             cmd, meta_local = build_discoal_command(
-                species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
-                discoal_pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
-                max_fold_per_step=args.max_fold_per_step, sweep_time=getattr(args,'sweep_time',None),
-                x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=min_snps_forward, chr_name=args.chromosome,
-                disable_en_ladder=args.no_en_ladder, seed=None, time_units=getattr(args,'time_units','gens'),
-            )
+                    species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
+                    discoal_pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
+                    max_fold_per_step=args.max_fold_per_step, sweep_time=(getattr(args,'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)),
+                    x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=min_snps_forward, chr_name=args.chromosome,
+                    disable_en_ladder=args.no_en_ladder, seed=None, time_units=getattr(args,'time_units','gens'),
+                )
         elif engine_name == 'msms':
             cmd, meta_local = build_msms_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
                 min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder,
-                a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), seed=None, time_units=getattr(args,'time_units','gens'),
+                a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=(getattr(args,'fix_time', None) if getattr(args,'fix_time', None) is not None else None), sweep_time=(getattr(args,'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)), seed=None, time_units=getattr(args,'time_units','gens'),
             )
         elif engine_name == 'scrm':
             cmd, meta_local = build_scrm_command(
@@ -3468,7 +3569,7 @@ def _run_simulation_core(args):
         sim_cmd, meta = build_discoal_command(
             species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
             discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
-            max_fold_per_step=args.max_fold_per_step, sweep_time=getattr(args,'sweep_time',None),
+            max_fold_per_step=args.max_fold_per_step, sweep_time=(getattr(args,'sweep_time',None) if getattr(args,'sweep_time',None) is not None else getattr(args,'fix_time', None)),
             x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=args.min_snps, chr_name=args.chromosome,
             disable_en_ladder=args.no_en_ladder, seed=None, time_units=getattr(args,'time_units','gens'),
         )
@@ -3478,7 +3579,7 @@ def _run_simulation_core(args):
             pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
             min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder,
-            a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=getattr(args,'fix_time',0.0), seed=None, time_units=getattr(args,'time_units','gens'),
+            a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=(getattr(args,'fix_time', None) if getattr(args,'fix_time', None) is not None else None), sweep_time=(getattr(args,'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)), seed=None, time_units=getattr(args,'time_units','gens'),
         )
     else:
         # ms neutral only: selection flags were already warned & ignored in parse_args.
@@ -3527,7 +3628,7 @@ def _run_simulation_core(args):
             sim_cmd_loc, meta_loc = build_discoal_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 discoal_pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
-                max_fold_per_step=args.max_fold_per_step, sweep_time=getattr(args, 'sweep_time', None),
+                max_fold_per_step=args.max_fold_per_step, sweep_time=(getattr(args, 'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)),
                 x=getattr(args, 'x', None), s=getattr(args, 's', None), min_snps=args.min_snps, chr_name=args.chromosome,
                 disable_en_ladder=args.no_en_ladder, seed=None,
             )
@@ -3537,7 +3638,7 @@ def _run_simulation_core(args):
                 pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
                 min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder,
-                a=getattr(args, 'a', None), s=getattr(args, 's', None), x=getattr(args, 'x', None), fixation_time=getattr(args, 'fix_time', 0.0), seed=None,
+                a=getattr(args, 'a', None), s=getattr(args, 's', None), x=getattr(args, 'x', None), fixation_time=(getattr(args, 'fix_time', None) if getattr(args,'fix_time', None) is not None else None), sweep_time=(getattr(args,'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)), seed=None,
             )
         elif engine == 'scrm':
             sim_cmd_loc, meta_loc = build_scrm_command(
@@ -6081,15 +6182,17 @@ def _run_simulation_core(args):
             if 'sfs_path' in locals() and 'sfs_text' in locals():
                 sfs_pending = (sfs_path, sfs_text)
         else:
-            if neut_engine=='discoal':
-                neut_cmd, neut_meta = build_discoal_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
+            if neut_engine == 'discoal':
+                neut_cmd, neut_meta = build_discoal_command(
+                    species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    sweep_time=None, x=None, s=None, min_snps=None, chr_name=args.chromosome, disable_en_ladder=args.no_en_ladder,
-                    seed=neut_seed, time_units=getattr(args,'time_units','gens'))
+                    sweep_time=(getattr(args,'sweep_time',None) if getattr(args,'sweep_time',None) is not None else getattr(args,'fix_time', None)), x=None, s=None, min_snps=None, chr_name=args.chromosome, disable_en_ladder=args.no_en_ladder,
+                    seed=neut_seed, time_units=getattr(args,'time_units','gens')
+                )
             elif neut_engine=='msms':
                 neut_cmd, neut_meta = build_msms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, a=None, s=None, x=None, fixation_time=0.0,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, a=None, s=None, x=None, fixation_time=0.0, sweep_time=None,
                     seed=neut_seed, time_units=getattr(args,'time_units','gens'))
             elif neut_engine=='ms':
                 neut_cmd, neut_meta = build_ms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
