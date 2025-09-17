@@ -506,6 +506,12 @@ def _set_paired_default(paired_name_key: str, paired_key: str, model_key: str):
 
         if default_neutral_name:
             st.session_state[paired_name_key] = default_neutral_name
+            # Also register an expected paired-neutral name so other UI
+            # components can react immediately to the user's choice.
+            try:
+                st.session_state[f"_expected_pn_{model_key}"] = default_neutral_name
+            except Exception:
+                pass
     except Exception:
         # best effort; don't crash the UI
         pass
@@ -1177,8 +1183,51 @@ with st.container():
             # Ensure SFS output ends with .sfs when the user types a name without extension.
             def _ensure_sfs_ext():
                 cur = st.session_state.get(sfs_output_key, "") or ""
+                cur = cur.strip()
+                # Ensure .sfs extension when user types a base name
                 if cur and not cur.lower().endswith('.sfs'):
                     st.session_state[sfs_output_key] = cur + '.sfs'
+                    cur = st.session_state[sfs_output_key]
+
+                # If the user provided an SFS name but left the primary output
+                # empty, and the user did not select "Run SFS only", then
+                # propagate a sensible primary output path derived from the
+                # SFS base using the currently selected output format.
+                try:
+                    out_path_key = f"output_path_{model_key}"
+                    out_val = (st.session_state.get(out_path_key, "") or "").strip()
+                    run_sfs_only_key = f"run_sfs_only_{model_key}"
+                    run_sfs_only = bool(st.session_state.get(run_sfs_only_key, False))
+                    # Only set primary output when user hasn't provided one and
+                    # they're not explicitly requesting SFS-only output.
+                    if cur and (not run_sfs_only) and (not out_val):
+                        out_format_key = f"output_format_{model_key}"
+                        fmt = str(st.session_state.get(out_format_key, "ms") or "ms").strip()
+                        fmt_ext_map = {
+                            "ms": ".ms",
+                            "ms.gz": ".ms.gz",
+                            "vcf": ".vcf",
+                            "vcf.gz": ".vcf.gz",
+                            "bcf": ".bcf",
+                        }
+                        desired_ext = fmt_ext_map.get(fmt, "")
+
+                        # Derive a base by stripping common extensions (including .sfs)
+                        base = cur
+                        if base.lower().endswith('.sfs'):
+                            base = base[:-4]
+                        for e in [".ms.gz", ".vcf.gz", ".ms", ".vcf", ".bcf"]:
+                            if base.endswith(e):
+                                base = base[:-len(e)]
+                                break
+
+                        if desired_ext:
+                            st.session_state[out_path_key] = base + desired_ext
+                        else:
+                            st.session_state[out_path_key] = base
+                except Exception:
+                    # best-effort: do not crash the UI on unexpected errors
+                    pass
 
             # Avoid passing `value=` when the session key already exists (prevents Streamlit warning)
             if sfs_output_key in st.session_state:
@@ -1541,12 +1590,75 @@ with st.container():
         run_sfs_only_key = f"run_sfs_only_{model_key}"
         if run_sfs_only_key not in st.session_state:
             st.session_state[run_sfs_only_key] = False
+        def _sync_output_from_sfs():
+            """When Run SFS only is toggled off, populate primary output path
+            from the SFS name if the primary output is empty and SFS name exists.
+            """
+            try:
+                sfs_k = f"sfs_output_{model_key}"
+                out_k = f"output_path_{model_key}"
+                run_sfs_k = f"run_sfs_only_{model_key}"
+                sfs_val = (st.session_state.get(sfs_k, "") or "").strip()
+                out_val = (st.session_state.get(out_k, "") or "").strip()
+                run_sfs_only_now = bool(st.session_state.get(run_sfs_k, False))
+                # Only populate when user did not ask for SFS-only and output is empty
+                if sfs_val and (not run_sfs_only_now) and (not out_val):
+                    fmt_k = f"output_format_{model_key}"
+                    fmt = str(st.session_state.get(fmt_k, "ms") or "ms").strip()
+                    fmt_ext_map = {
+                        "ms": ".ms",
+                        "ms.gz": ".ms.gz",
+                        "vcf": ".vcf",
+                        "vcf.gz": ".vcf.gz",
+                        "bcf": ".bcf",
+                    }
+                    desired_ext = fmt_ext_map.get(fmt, "")
+                    base = sfs_val
+                    if base.lower().endswith('.sfs'):
+                        base = base[:-4]
+                    for e in [".ms.gz", ".vcf.gz", ".ms", ".vcf", ".bcf"]:
+                        if base.endswith(e):
+                            base = base[:-len(e)]
+                            break
+                    if desired_ext:
+                        st.session_state[out_k] = base + desired_ext
+                    else:
+                        st.session_state[out_k] = base
+                # If the user enabled Run SFS only, and the paired-neutral
+                # checkbox is already checked but no paired-neutral name was
+                # provided by the user, derive a default from the SFS base
+                # (base + "_neutral") and set it now so the UI reflects it.
+                try:
+                    if sfs_val and run_sfs_only_now:
+                        paired_key = f"paired_neutral_{model_key}"
+                        paired_name_key = f"paired_neutral_name_{model_key}"
+                        user_set_key = f"paired_neutral_name_user_set_{model_key}"
+                        paired_checked = bool(st.session_state.get(paired_key, False))
+                        user_set = bool(st.session_state.get(user_set_key, False))
+                        cur_pn = (st.session_state.get(paired_name_key, "") or "").strip()
+                        if paired_checked and (not user_set) and not cur_pn:
+                            pn_base = sfs_val
+                            if pn_base.lower().endswith('.sfs'):
+                                pn_base = pn_base[:-4]
+                            pn_base = os.path.splitext(pn_base)[0]
+                            default_pn = pn_base + "_neutral"
+                            st.session_state[paired_name_key] = default_pn
+                            try:
+                                st.session_state[f"_expected_pn_{model_key}"] = default_pn
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         run_sfs_only = st.checkbox(
             "Run SFS only (omit primary output)",
             value=st.session_state.get(run_sfs_only_key, False),
             key=run_sfs_only_key,
             disabled=not ordered_ready or not sfs_on,
-            help="When enabled the simulator will produce only the SFS artifact (no primary ms/vcf output). Requires Compute SFS to be checked."
+            help="When enabled the simulator will produce only the SFS artifact (no primary ms/vcf output). Requires Compute SFS to be checked.",
+            on_change=_sync_output_from_sfs,
         )
     # Button area for preparing or executing the engine command. Disabled
     # when required UI steps aren't complete. msprime is supported by the
