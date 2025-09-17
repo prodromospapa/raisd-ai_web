@@ -95,7 +95,8 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
         ]
     if gpu:
         args.append("--gpu")
-
+    print(subprocess.list2cmdline(args))
+    exit()
     # run inside the target directory; if it fails, retry once using discoal and add --sweep-time (in generations)
     try:
         run_subprocess(args, out_dir, f"simulation {model_id}/{population}/{chromosome}")

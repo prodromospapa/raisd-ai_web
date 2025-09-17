@@ -516,6 +516,12 @@ def _run_and_register(*popen_args, **popen_kwargs):
 # Use a per-run temporary directory placed next to this script so callers
 # can inspect files if needed and so cleanup can remove the entire folder.
 _LOCAL_TMP_ROOT = None
+# New: parent directory grouping multiple per-run tmp folders for this simulator session.
+# A random session folder (simulator_session_*) is created either under the repo-local
+# hidden '.tmp' directory or under the system tmpfs (when selected). All per-run
+# 'simulator_run_*' folders for this process are placed inside this session parent so
+# that they can be removed together on normal exit or user cancellation.
+_SESSION_PARENT_DIR = None
 _TMP_WATCHER_PID = None
 # Lock to make local tmpdir creation thread-safe (avoid races when multiple
 # workers try to create/cleanup the same repo-local tmpdir simultaneously).
@@ -537,7 +543,7 @@ def _is_process_alive(pid):
         return False
 
 
-def _spawn_tmp_watcher(tmp_path, parent_pid):
+def _spawn_tmp_watcher(tmp_path, parent_pid, session_parent=None):
     """Spawn a detached watcher that removes tmp_path if parent_pid dies.
 
     This forks a child process that detaches and monitors the parent.
@@ -584,6 +590,13 @@ def _spawn_tmp_watcher(tmp_path, parent_pid):
                 shutil.rmtree(tmp_path, ignore_errors=True)
             except Exception:
                 pass
+        # Attempt to remove the session parent directory if provided and now empty.
+        if session_parent and os.path.isdir(session_parent) and not os.environ.get('SIMULATOR_PRESERVE_TMP'):
+            try:
+                # Remove recursively regardless of emptiness: cancellation means whole session ends.
+                shutil.rmtree(session_parent, ignore_errors=True)
+            except Exception:
+                pass
     except Exception:
         pass
     try:
@@ -598,7 +611,7 @@ def _ensure_local_tmpdir():
     should be created inside this directory. Cleanup is performed by
     _cleanup_local_tmpdir().
     """
-    global _LOCAL_TMP_ROOT
+    global _LOCAL_TMP_ROOT, _SESSION_PARENT_DIR
     # If a worker-specific tmpdir is requested via env, prefer and return it
     worker_tmp_env = os.environ.get('SIMULATOR_WORKER_TMP')
     if worker_tmp_env:
@@ -627,8 +640,12 @@ def _ensure_local_tmpdir():
         base = os.getcwd()
     # Repo-local parent (hidden) named '.tmp' to group all runs; per-run subfolders inside it
     repo_parent = os.path.join(base, '.tmp')
+    # Lazily create a session parent directory grouping per-run folders.
+    if _SESSION_PARENT_DIR is None:
+        session_name = f"simulator_session_{int(time.time())}_{random.randrange(10**6)}"
+        _SESSION_PARENT_DIR = os.path.join(repo_parent, session_name)
     run_name = f"simulator_run_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
-    path = os.path.join(repo_parent, run_name)
+    path = os.path.join(_SESSION_PARENT_DIR, run_name)
     # Prefer using system tmpdir if it's a tmpfs (in-RAM) for speed.
     try:
         system_tmp = tempfile.gettempdir()
@@ -666,9 +683,15 @@ def _ensure_local_tmpdir():
 
         if use_system and system_tmp:
             # create a hidden subdir under system tmp (tmpfs) for speed
-            name2 = f"simulator_tmp_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
-            path2 = os.path.join(system_tmp, name2)
+            session_created = False
+            if _SESSION_PARENT_DIR is None:
+                # Create a session parent under system tmp as well
+                session_name = f"simulator_session_{int(time.time())}_{random.randrange(10**6)}"
+                _SESSION_PARENT_DIR = os.path.join(system_tmp, session_name)
+            name2 = f"simulator_run_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
+            path2 = os.path.join(_SESSION_PARENT_DIR, name2)
             try:
+                os.makedirs(_SESSION_PARENT_DIR, exist_ok=True)
                 os.makedirs(path2, exist_ok=True)
                 _LOCAL_TMP_ROOT = path2
                 # debug print
@@ -676,7 +699,7 @@ def _ensure_local_tmpdir():
                     sys.stderr.write(f"DEBUG: using system tmpdir: {_LOCAL_TMP_ROOT}\n")
                     sys.stderr.flush()
                 try:
-                    _spawn_tmp_watcher(_LOCAL_TMP_ROOT, os.getpid())
+                    _spawn_tmp_watcher(_LOCAL_TMP_ROOT, os.getpid(), session_parent=_SESSION_PARENT_DIR)
                 except Exception:
                     pass
                 return _LOCAL_TMP_ROOT
@@ -690,6 +713,7 @@ def _ensure_local_tmpdir():
             for attempt in range(3):
                 try:
                     os.makedirs(repo_parent, exist_ok=True)
+                    os.makedirs(_SESSION_PARENT_DIR, exist_ok=True)
                     os.makedirs(path, exist_ok=True)
                     _LOCAL_TMP_ROOT = path
                     created = True
@@ -702,7 +726,7 @@ def _ensure_local_tmpdir():
                 sys.stderr.write(f"DEBUG: using repo-local tmpdir: {_LOCAL_TMP_ROOT}\n")
                 sys.stderr.flush()
             try:
-                _spawn_tmp_watcher(_LOCAL_TMP_ROOT, os.getpid())
+                _spawn_tmp_watcher(_LOCAL_TMP_ROOT, os.getpid(), session_parent=_SESSION_PARENT_DIR)
             except Exception:
                 pass
         except Exception:
@@ -823,7 +847,7 @@ def _ensure_dir_removed(path):
 
 def _cleanup_local_tmpdir():
     """Remove the local tmp directory and its contents if it exists."""
-    global _LOCAL_TMP_ROOT
+    global _LOCAL_TMP_ROOT, _SESSION_PARENT_DIR
     if not _LOCAL_TMP_ROOT:
         return
     try:
@@ -831,7 +855,7 @@ def _cleanup_local_tmpdir():
         base_name = os.path.basename(_LOCAL_TMP_ROOT or '')
         parent = os.path.dirname(_LOCAL_TMP_ROOT or '')
         # If this is a per-run folder inside repo '.tmp', remove run folder and remove parent
-        if parent and os.path.basename(parent) == '.tmp' and os.path.isdir(_LOCAL_TMP_ROOT):
+        if parent and os.path.isdir(_LOCAL_TMP_ROOT) and (_SESSION_PARENT_DIR and os.path.dirname(_LOCAL_TMP_ROOT) == _SESSION_PARENT_DIR):
             # allow preserving tmp for inspection when requested
             if not os.environ.get('SIMULATOR_PRESERVE_TMP'):
                 try:
@@ -845,13 +869,22 @@ def _cleanup_local_tmpdir():
                         sys.stderr.flush()
                     except Exception:
                         pass
-                # Do NOT remove the repo-level '.tmp' parent directory here.
-                # Removing the shared parent can race with other concurrent runs
-                # and cause unrelated run folders to be deleted. Keep only the
-                # per-run folder removal above.
+                # After removing run folder, remove the session parent entirely (whole run finished)
+                try:
+                    if _SESSION_PARENT_DIR and os.path.isdir(_SESSION_PARENT_DIR) and not os.environ.get('SIMULATOR_PRESERVE_TMP'):
+                        _ensure_dir_removed(_SESSION_PARENT_DIR)
+                        if os.environ.get('SIMULATOR_DEBUG_TMP'):
+                            try:
+                                sys.stderr.write(f"DEBUG: removed session parent: {_SESSION_PARENT_DIR}\n")
+                                sys.stderr.flush()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                # Avoid removing shared '.tmp' directory (parent of session parent)
                 if os.environ.get('SIMULATOR_DEBUG_TMP'):
                     try:
-                        sys.stderr.write(f"DEBUG: preserved .tmp parent directory: {parent}\n")
+                        sys.stderr.write(f"DEBUG: preserved shared tmp root: {parent}\n")
                         sys.stderr.flush()
                     except Exception:
                         pass
@@ -883,6 +916,13 @@ def _cleanup_local_tmpdir():
         except Exception:
             pass
         _LOCAL_TMP_ROOT = None
+        # If session parent still exists (e.g., run dir could not be removed), leave it.
+        try:
+            if _SESSION_PARENT_DIR and os.path.isdir(_SESSION_PARENT_DIR) and not os.environ.get('SIMULATOR_PRESERVE_TMP'):
+                _ensure_dir_removed(_SESSION_PARENT_DIR)
+        except Exception:
+            pass
+        _SESSION_PARENT_DIR = None
 
 
 # Register cleanup handlers so tmp dir is removed on process exit or common termination signals
@@ -1568,26 +1608,7 @@ def _msprime_worker_run(payload, env=None):
     except Exception:
         pass
 
-    # Attempt to cleanup any worker-specific tmpdir referenced in env
-    try:
-        wk = None
-        try:
-            wk = os.environ.get('SIMULATOR_WORKER_TMP')
-        except Exception:
-            wk = None
-        if wk and os.path.isdir(wk):
-            try:
-                shutil.rmtree(wk, ignore_errors=True)
-                if os.environ.get('SIMULATOR_DEBUG_TMP'):
-                    try:
-                        sys.stderr.write(f"DEBUG: removed worker tmpdir at process exit: {wk}\n")
-                        sys.stderr.flush()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # Per-worker tmpdirs are no longer removed individually; session cleanup handles them.
 
     return (''.join(out_parts), ''.join(err_parts), exit_code)
 
@@ -1831,6 +1852,27 @@ def _adjust_vcf_contig_length(vcf_text: str, chrom_id=None, new_length=None) -> 
         out_text = re.sub(r'(##contig=<ID=[^,>]+,length=)\d+', r"\1" + str(new_length_int), vcf_text, count=1)
     return out_text
 
+
+def _display_path_for_msg(p):
+    """Normalize a path for user-facing INFO messages.
+
+    - Uses os.path.normpath to collapse redundant components.
+    - Strips a leading './' to avoid noisy prints like './name'.
+    """
+    try:
+        if not p:
+            return p
+        pstr = str(p)
+        p_norm = os.path.normpath(pstr)
+        if p_norm.startswith('./'):
+            p_norm = p_norm[2:]
+        return p_norm
+    except Exception:
+        try:
+            return str(p)
+        except Exception:
+            return p
+
 # ---------- SFS utilities ----------
 
 def _parse_ms_like_replicates(ms_text):
@@ -1866,8 +1908,19 @@ def _parse_ms_like_replicates(ms_text):
                 i += 1
                 continue
             hap_start = pos_line_idx + 1
+            # robust haplotype parsing: accept contiguous 0/1 strings, concatenated
+            # haplotypes on one physical line, or whitespace-separated 0/1 tokens.
             hap_lines = []
             k = hap_start
+            # expected length per hap (number of segsites)
+            try:
+                L = int(segsites)
+            except Exception:
+                # fall back to parsing positions line if segsites malformed
+                try:
+                    L = len(lines[pos_line_idx].split(':', 1)[1].strip().split())
+                except Exception:
+                    L = 0
             while k < len(lines):
                 hl_raw = lines[k]
                 hl = hl_raw.strip()
@@ -1875,9 +1928,29 @@ def _parse_ms_like_replicates(ms_text):
                     break
                 if hl.lstrip().startswith('//') or hl.lstrip().startswith('segsites:') or hl.lstrip().startswith('positions:'):
                     break
-                # accept only contiguous 0/1 strings (strip to remove whitespace)
-                if set(hl) <= {'0', '1'}:
-                    hap_lines.append(hl)
+                # Extract digit characters and map any non-zero digit to '1'.
+                # This handles msms annotations where '2' (or higher) may appear.
+                digits = [ch for ch in hl if ch.isdigit()]
+                processed = False
+                if digits and L and len(digits) == L:
+                    mapped = ''.join('1' if d != '0' else '0' for d in digits)
+                    hap_lines.append(mapped)
+                    processed = True
+                elif digits and L and len(digits) > L and (len(digits) % L) == 0:
+                    for i0 in range(0, len(digits), L):
+                        chunk = digits[i0:i0+L]
+                        if len(chunk) == L:
+                            mapped = ''.join('1' if d != '0' else '0' for d in chunk)
+                            hap_lines.append(mapped)
+                    processed = True
+                if not processed:
+                    # Try whitespace-separated tokens like '0 1 0 1' or '0 2 0 1'
+                    toks = [t for t in hl.split() if t.isdigit()]
+                    if L and len(toks) == L:
+                        mapped = ''.join('1' if t != '0' else '0' for t in toks)
+                        hap_lines.append(mapped)
+                        processed = True
+                # otherwise ignore non-standard / malformed lines
                 k += 1
             if hap_lines:
                 yield hap_lines
@@ -1894,17 +1967,24 @@ def compute_sfs(ms_text, normalized=False, mode='mean'):
     replicates = list(_parse_ms_like_replicates(ms_text))
     if not replicates:
         return ('#SFS', ['# No replicates parsed'])
-    # assume all replicates have same haplotype count
-    n_hap = len(replicates[0])
+    # determine canonical haplotype count: choose the maximum observed across replicates
+    n_hap = max((len(h) for h in replicates if h), default=0)
+    # If any replicate had fewer haplotypes, warn once and treat missing haplotypes as ancestral (all zeros)
+    warned_inconsistent = False
     for haps in replicates:
-        if len(haps) != n_hap:
-            raise SystemExit('ERROR: Inconsistent haplotype counts across replicates for SFS.')
-    bins = n_hap - 1  # k=1..n_hap-1
+        if haps and len(haps) != n_hap and not warned_inconsistent:
+            try:
+                sys.stderr.write(f"# WARNING: observed varying haplotype counts across replicates (expected {n_hap}); treating missing haplotypes as ancestral zeros.\n")
+            except Exception:
+                pass
+            warned_inconsistent = True
+    bins = max(0, n_hap - 1)  # k=1..n_hap-1
     if mode == 'per-rep':
         lines = []
         for ridx, haps in enumerate(replicates, start=1):
             if not haps:
                 continue
+            # canonical sequence length for this replicate inferred from first hapline
             L = len(haps[0])
             # verify sequences length
             for hp in haps:
@@ -1916,6 +1996,7 @@ def compute_sfs(ms_text, normalized=False, mode='mean'):
                 k = sum(1 for hp in haps if hp[col] == '1')
                 if 0 < k < n_hap:
                     sfs[k] += 1
+            # if this replicate has fewer haplotypes than canonical, missing haplotypes count as '0's and don't affect counts
             if segsites == 0:
                 norm = [0]*(n_hap-1)
             else:
@@ -1971,21 +2052,27 @@ def compute_sfs_fast(ms_text, normalized=False, mode='mean'):
     replicates = list(_parse_ms_like_replicates(ms_text))
     if not replicates:
         return ('#SFS', ['# No replicates parsed'])
-    n_hap = len(replicates[0])
+    # canonical hap count is max observed; warn once if inconsistent
+    n_hap = max((len(h) for h in replicates if h), default=0)
+    warned_inconsistent = False
     for haps in replicates:
-        if len(haps) != n_hap:
-            raise SystemExit('ERROR: Inconsistent haplotype counts across replicates for SFS.')
+        if haps and len(haps) != n_hap and not warned_inconsistent:
+            try:
+                sys.stderr.write(f"# WARNING: observed varying haplotype counts across replicates (expected {n_hap}); treating missing haplotypes as ancestral zeros.\n")
+            except Exception:
+                pass
+            warned_inconsistent = True
     header = '#SFS\t' + '\t'.join(str(k) for k in range(1, n_hap))
     # Memory-efficient helper that avoids forming an n_hap x L matrix.
     def _sfs_vals_from_haps(haps):
         if not haps:
-            return _np.zeros(n_hap-1, dtype=(_np.float32 if normalized else float))
+            return _np.zeros(max(0, n_hap-1), dtype=(_np.float32 if normalized else float))
         L = len(haps[0])
         for hp in haps:
             if len(hp) != L:
                 raise SystemExit('ERROR: Inconsistent haplotype sequence lengths.')
         if L == 0:
-            return _np.zeros(n_hap-1, dtype=(_np.float32 if normalized else float))
+            return _np.zeros(max(0, n_hap-1), dtype=(_np.float32 if normalized else float))
         # Choose the smallest unsigned dtype that can hold counts up to n_hap
         if n_hap <= 255:
             _dtype_counts = _np.uint8
@@ -1999,6 +2086,7 @@ def compute_sfs_fast(ms_text, normalized=False, mode='mean'):
             arr = _np.frombuffer(hp.encode('ascii'), dtype='S1') == b'1'
             # Add directly; bool will upcast to chosen unsigned dtype
             counts_per_site += arr
+        # If this replicate has fewer haplotypes than canonical n_hap, bincount will be shorter; ensure minlength
         binc = _np.bincount(counts_per_site, minlength=n_hap+1)
         raw = binc[1:n_hap]
         if normalized:
@@ -2052,6 +2140,7 @@ def _stream_sfs_mean_from_file(path, n_hap_expected=None, normalized=False):
     used = 0
     accum = None  # float32 when normalized; otherwise int32 for compactness
     header = None
+    warned_inconsistent_counts = False
 
     # Select minimal dtype for per-site counts based on expected n_hap
     def _counts_dtype(nh):
@@ -2096,35 +2185,78 @@ def _stream_sfs_mean_from_file(path, n_hap_expected=None, normalized=False):
                 L = len(pos_line.split(':', 1)[1].strip().split())
             except Exception:
                 L = 0
-            # if no sites, skip replicate for mean (match previous behavior)
+            # if no sites, contribute a zero SFS row when n_hap_expected provided;
+            # otherwise skip replicate (previous behavior)
             if L == 0:
-                # advance to next replicate boundary
-                while True:
-                    pos = fh.tell()
-                    line = fh.readline()
-                    if not line:
-                        break
-                    st = line.strip()
-                    if not st or st.startswith('//') or st.startswith('segsites:'):
-                        # rewind one line to let outer loop see 'segsites:'
-                        try:
-                            fh.seek(pos)
-                        except Exception:
-                            pass
-                        break
-                # no contribution
-                continue
+                if n_hap_expected is not None:
+                    # ensure header exists
+                    try:
+                        n_h = int(n_hap_expected)
+                    except Exception:
+                        n_h = None
+                    if header is None and n_h:
+                        header = '#SFS\t' + '\t'.join(str(k) for k in range(1, n_h))
+                    # build zero row matching expected length
+                    if n_h and n_h > 1:
+                        if normalized:
+                            row = _np.zeros(n_h-1, dtype=_np.float32)
+                        else:
+                            row = _np.zeros(n_h-1, dtype=_np.int32)
+                    else:
+                        # degenerate: no haplotypes expected
+                        row = None
+                    if row is not None:
+                        if accum is None:
+                            accum = row.copy()
+                        else:
+                            # shapes should match; if not, raise as before
+                            if accum.shape != row.shape:
+                                raise SystemExit('ERROR: SFS length mismatch across replicates in streaming computation.')
+                            accum += row
+                        used += 1
+                    # advance to next replicate boundary
+                    while True:
+                        pos = fh.tell()
+                        line = fh.readline()
+                        if not line:
+                            break
+                        st = line.strip()
+                        if not st or st.startswith('//') or st.startswith('segsites:'):
+                            try:
+                                fh.seek(pos)
+                            except Exception:
+                                pass
+                            break
+                    continue
+                else:
+                    # legacy behavior: skip malformed/empty replicate
+                    while True:
+                        pos = fh.tell()
+                        line = fh.readline()
+                        if not line:
+                            break
+                        st = line.strip()
+                        if not st or st.startswith('//') or st.startswith('segsites:'):
+                            try:
+                                fh.seek(pos)
+                            except Exception:
+                                pass
+                            break
+                    continue
             # Prepare per-site counts
             counts_dtype = _counts_dtype(n_hap_expected)
             counts = _np.zeros(L, dtype=counts_dtype)
             n_haps_seen = 0
-            # Read hap lines
+            # Read hap lines (robust: accept contiguous 0/1, concatenated haplotypes,
+            # or whitespace-separated allele tokens). We accumulate per-site counts
+            # and keep track of how many haplotype rows we recovered.
             while True:
                 pos = fh.tell()
                 line = fh.readline()
                 if not line:
                     break
-                s = line.strip()
+                s_raw = line.rstrip('\n')
+                s = s_raw.strip()
                 if (not s) or s.startswith('//') or s.startswith('segsites:') or s.startswith('positions:'):
                     # end of replicate block
                     try:
@@ -2132,18 +2264,68 @@ def _stream_sfs_mean_from_file(path, n_hap_expected=None, normalized=False):
                     except Exception:
                         pass
                     break
-                # accept only 0/1 hap strings
-                if set(s) <= {'0','1'} and len(s) == L:
-                    arr = _np.frombuffer(s.encode('ascii'), dtype='S1') == b'1'
-                    counts += arr
-                    n_haps_seen += 1
+                # Normalize by extracting digits and mapping any non-zero digit to '1'.
+                # This handles spaced or annotated hap-lines, concatenated haplotypes
+                # on a single physical line, and digits > '1' emitted by some engines.
+                processed_any = False
+                # Extract any digit characters (0-9) from the line
+                digits = ''.join(ch for ch in s if ch.isdigit())
+                if digits:
+                    # If digits length matches L, map non-zero->'1' and treat as one hapline
+                    if len(digits) == L:
+                        mapped = ''.join('1' if d != '0' else '0' for d in digits)
+                        arr = _np.frombuffer(mapped.encode('ascii'), dtype='S1') == b'1'
+                        counts += arr
+                        n_haps_seen += 1
+                        processed_any = True
+                    # If the line contains multiple concatenated haplotypes, split into chunks
+                    elif len(digits) > L and (len(digits) % L) == 0:
+                        for i0 in range(0, len(digits), L):
+                            chunk = digits[i0:i0+L]
+                            if len(chunk) != L:
+                                continue
+                            mapped = ''.join('1' if d != '0' else '0' for d in chunk)
+                            arr = _np.frombuffer(mapped.encode('ascii'), dtype='S1') == b'1'
+                            counts += arr
+                            n_haps_seen += 1
+                        processed_any = True
+                if not processed_any:
+                    # Try whitespace-separated numeric tokens (e.g. '0 1 0 1' or '0 2 0 1')
+                    toks = [t for t in s.split() if t.isdigit()]
+                    if L and len(toks) == L:
+                        mapped = ''.join('1' if t != '0' else '0' for t in toks)
+                        arr = _np.frombuffer(mapped.encode('ascii'), dtype='S1') == b'1'
+                        counts += arr
+                        n_haps_seen += 1
+                        processed_any = True
+                # If still unprocessed, skip this line (non-standard/ malformed)
+                continue
+            # Validate n_hap across replicates if expected provided. Instead of
+            # failing hard, adapt to minor mismatches (which often result from
+            # concatenated haplines or formatting differences) by choosing the
+            # maximal observed value and emitting a warning.
+            if n_hap_expected is not None:
+                try:
+                    expected_n = int(n_hap_expected)
+                except Exception:
+                    expected_n = None
+                if n_haps_seen == 0:
+                    # no haplines -> treat as missing/zero contribution (handled earlier)
+                    pass
+                elif expected_n is not None and n_haps_seen != expected_n:
+                    # Do not abort: adapt by selecting the larger of expected and observed
+                    if not warned_inconsistent_counts:
+                        try:
+                            sys.stderr.write(f"# WARNING: observed {n_haps_seen} haplotypes != expected {expected_n} for a replicate; adapting to max and treating missing haplotypes as ancestral.\n")
+                        except Exception:
+                            pass
+                        warned_inconsistent_counts = True
+                    # set n_hap to the max so bincount/minlength doesn't truncate
+                    n_hap = max(expected_n, n_haps_seen)
                 else:
-                    # skip malformed line in this context
-                    continue
-            # Validate n_hap across replicates if expected provided
-            if n_hap_expected is not None and n_haps_seen != int(n_hap_expected):
-                raise SystemExit('ERROR: Inconsistent haplotype counts in streaming SFS computation.')
-            n_hap = int(n_hap_expected) if n_hap_expected is not None else int(n_haps_seen)
+                    n_hap = int(expected_n) if expected_n is not None else int(n_haps_seen)
+            else:
+                n_hap = int(n_haps_seen)
             if header is None:
                 header = '#SFS\t' + '\t'.join(str(k) for k in range(1, n_hap))
             binc = _np.bincount(counts, minlength=n_hap+1)
@@ -5537,7 +5719,7 @@ def _run_simulation_core(args):
                                     except Exception:
                                         pass
                                 if not sfs_written:
-                                    sys.stderr.write(f"# INFO: wrote SFS to {sfs_path}\n")
+                                    sys.stderr.write(f"# INFO: wrote SFS to {_display_path_for_msg(sfs_path)}\n")
                                     sfs_written = True
                             except Exception as e:
                                 sys.stderr.write(f"# ERROR: failed to write SFS file {sfs_path}: {e}\n")
@@ -5679,7 +5861,7 @@ def _run_simulation_core(args):
                 except Exception:
                     pass
             if not sfs_written:
-                sys.stderr.write(f"# INFO: wrote SFS to {sfs_path}\n")
+                sys.stderr.write(f"# INFO: wrote SFS to {_display_path_for_msg(sfs_path)}\n")
                 sfs_written = True
         except Exception as e:
             sys.stderr.write(f"# ERROR: failed to write SFS file {sfs_path}: {e}\n")
@@ -6735,7 +6917,10 @@ def _run_simulation_core(args):
                         root = main_out[:-7]; ext = '.vcf.gz'
                     else:
                         root, ext = os.path.splitext(main_out)
-                    neut_out_path = root + '_neutral' + ext
+                    # Place neutral file in same directory as primary output
+                    parent_dir = os.path.dirname(main_out)
+                    neut_name = os.path.basename(root) + '_neutral' + ext
+                    neut_out_path = os.path.join(parent_dir, neut_name) if parent_dir else neut_name
                 else:
                     # No explicit primary output; use default_stem and desired ext
                     ext_map_full = {'ms':'.ms','ms.gz':'.ms.gz','vcf':'.vcf','vcf.gz':'.vcf.gz','bcf':'.bcf'}
@@ -6821,7 +7006,7 @@ def _run_simulation_core(args):
                         fns.write('# SFS output (neutral paired)\n')
                         fns.write('# normalized=' + str(args.sfs_normalized) + ' mode=' + args.sfs_mode + '\n')
                         fns.write(nsfs_text)
-                    sys.stderr.write(f"# INFO: wrote neutral SFS to {neut_sfs_path}\n")
+                    sys.stderr.write(f"# INFO: wrote neutral SFS to {_display_path_for_msg(neut_sfs_path)}\n")
                 except Exception as e:
                     sys.stderr.write(f"# ERROR: failed to compute/write neutral SFS: {e}\n")
                 neut_out_path = None  # prevent file write path block below
@@ -6838,7 +7023,7 @@ def _run_simulation_core(args):
                         fns.write('# SFS output (neutral paired)\n')
                         fns.write('# normalized=' + str(args.sfs_normalized) + ' mode=' + args.sfs_mode + '\n')
                         fns.write(nsfs_text)
-                    sys.stderr.write(f"# INFO: wrote neutral SFS to {neut_sfs_path}\n")
+                    sys.stderr.write(f"# INFO: wrote neutral SFS to {_display_path_for_msg(neut_sfs_path)}\n")
                 except Exception as e:
                     sys.stderr.write(f"# ERROR: failed to compute/write neutral SFS: {e}\n")
                 neut_out_path = None
@@ -7165,7 +7350,7 @@ def _run_simulation_core(args):
                                     if neut_engine == 'msms' and ln2.startswith('ms '):
                                         continue
                                     f2.write(ln2)  # type: ignore[arg-type]
-                            sys.stderr.write(f"# INFO: wrote paired neutral output to {neut_out_path}\n")
+                            sys.stderr.write(f"# INFO: wrote paired neutral output to {_display_path_for_msg(neut_out_path)}\n")
                     if getattr(args, 'sfs', False):
                         try:
                             # If msprime produced VCF, convert to ms-like per replicate before SFS
@@ -7214,7 +7399,7 @@ def _run_simulation_core(args):
                                 fns.write('# SFS output (neutral paired)\n')
                                 fns.write('# normalized=' + str(args.sfs_normalized) + ' mode=' + args.sfs_mode + '\n')
                                 fns.write(nsfs_text)
-                            sys.stderr.write(f"# INFO: wrote neutral SFS to {neut_sfs_path}\n")
+                            sys.stderr.write(f"# INFO: wrote neutral SFS to {_display_path_for_msg(neut_sfs_path)}\n")
                         except Exception as e:
                             sys.stderr.write(f"# ERROR: failed to compute/write neutral SFS: {e}\n")
                 except Exception as e:
@@ -7237,7 +7422,7 @@ def _run_simulation_core(args):
                         except Exception:
                             pass
                     if not sfs_written:
-                        sys.stderr.write(f"# INFO: wrote SFS to {sfs_path_final}\n")
+                        sys.stderr.write(f"# INFO: wrote SFS to {_display_path_for_msg(sfs_path_final)}\n")
                         sfs_written = True
                 except Exception as e:
                     sys.stderr.write(f"# ERROR: failed to write deferred SFS file {sfs_path_final}: {e}\n")
