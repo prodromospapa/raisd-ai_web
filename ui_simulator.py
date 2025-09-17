@@ -27,6 +27,48 @@ except Exception:
 
 st.set_page_config(page_title="Genomic Simulator UI", page_icon="🧬", layout="wide")
 
+
+# Compatibility: some Python builds may lack math.nextafter (older versions or
+# limited stdlib builds). Provide a tiny fallback implementing IEEE-754
+# nextafter for double-precision floats using struct if math.nextafter is
+# unavailable.
+def _nextafter(x: float, y: float) -> float:
+    try:
+        return math.nextafter(x, y)
+    except AttributeError:
+        # Fallback implementation adapted for IEEE-754 binary64.
+        import struct
+
+        if not (isinstance(x, float) and isinstance(y, float)):
+            return float(x)
+
+        if x == y:
+            return x
+
+        # pack as unsigned 64-bit integer representation
+        packed = struct.pack('>d', x)
+        ui = int.from_bytes(packed, 'big')
+
+        # handle sign bit and direction
+        if x == 0.0:
+            # smallest subnormal towards y
+            tiny = 1 if y > 0.0 else -1
+            ui = 1 if tiny > 0 else (1 << 63) | 1
+        else:
+            # if x < y and x > 0, increment; if x < y and x < 0, decrement
+            if (x < y) == (x > 0.0):
+                ui += 1
+            else:
+                ui -= 1
+
+        # re-pack
+        try:
+            b = ui.to_bytes(8, 'big')
+            return struct.unpack('>d', b)[0]
+        except Exception:
+            return float(x)
+
+
 # ---- Minimal style polish ----
 st.markdown(
     '''
@@ -570,7 +612,7 @@ with st.container():
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         engine = st.selectbox("Engine", ["discoal","ms","msms","scrm","msprime"], index=2, disabled=not ordered_ready)
-        # make replicates session-backed so changes can trigger parallel default reset
+        # left column intentionally left without caption
         reps_key = f"replicates_{model_key}"
         if reps_key not in st.session_state:
             # Create the widget with an explicit default value; do NOT pre-set
@@ -580,6 +622,9 @@ with st.container():
         else:
             # when the session key exists, do not pass `value=` (Streamlit warns)
             replicates = st.number_input("Replicates", min_value=1, step=1, disabled=not ordered_ready, key=reps_key)
+
+        # sweep checkbox removed from Core & Engine: it is rendered inside the
+        # Selection card so selection controls appear in the Selection context.
     with c2:
         # Use stable keys so values persist per model and we can reference each other's state
         seq_key = f"seq_length_{model_key}"
@@ -726,7 +771,8 @@ with st.container():
                 target_snps_tol = float(st.session_state.get(tol_key_ss, 0.0) or 0.0)
 
         if tol_disabled:
-            st.caption("Tolerance applies only when 'Target SNPs' is set to a positive value.")
+            # Tolerance caption intentionally removed per user request.
+            pass
         elif st.session_state.get(tol_auto_key, True):
             st.caption("Tolerance: Auto (simulator chooses). Uncheck Auto to set a custom percent.)")
 
@@ -806,190 +852,265 @@ with st.container():
             temp_loc = st.selectbox("Temp location", ["local","system"], disabled=not ordered_ready)
         else:
             temp_loc = 'local'
+        # sweep checkbox moved to the left column (Engine/Replicates)
     
 
+    st.markdown("### Optimization")
     st.markdown('<div class="card" style="margin-top:0.75rem;">', unsafe_allow_html=True)
-    d1, d2, d3, d4 = st.columns(4)
-    with d1:
-        # Show a slider from 1 up to either physical cores (for msprime) or
-        # logical threads (for other engines). Prefer psutil when available
-        # for accurate physical core count; fall back to os.cpu_count().
-        try:
-            logical_count = psutil.cpu_count(logical=True) if psutil else os.cpu_count()
-        except Exception:
-            logical_count = os.cpu_count()
-        try:
-            physical_count = psutil.cpu_count(logical=False) if psutil else None
-        except Exception:
-            physical_count = None
 
-        # Determine max workers based on engine
-        if engine == "msprime":
-            engine_max = int(physical_count or logical_count or 1)
-        else:
-            engine_max = int(logical_count or 1)
+    # --- Determine environment and sizing ---
+    try:
+        logical_count = psutil.cpu_count(logical=True) if psutil else os.cpu_count()
+    except Exception:
+        logical_count = os.cpu_count()
+    try:
+        physical_count = psutil.cpu_count(logical=False) if psutil else None
+    except Exception:
+        physical_count = None
 
-        # Cap parallel workers by number of replicates (can't have more workers than work units)
-        try:
-            reps = int(replicates) if replicates else 1
-        except Exception:
-            reps = 1
+    if engine == "msprime":
+        engine_max = int(physical_count or logical_count or 1)
+    else:
+        engine_max = int(logical_count or 1)
 
-        max_workers = max(1, min(engine_max, reps))
+    try:
+        reps = int(replicates) if replicates else 1
+    except Exception:
+        reps = 1
 
-        # session-backed parallel so we can reset when replicates change
-        par_key = f"parallel_{model_key}"
-        stored_reps_key = f"_stored_reps_{model_key}"
-        # default: more than half the available workers (floor(engine_max/2)+1)
-        try:
-            half_plus = max(1, (engine_max // 2) + 1)
-        except Exception:
-            half_plus = 1
-        # desired default must not exceed engine_max or replicates
-        desired_default = max(1, min(half_plus, engine_max, reps))
-        try:
-            prev_reps = int(st.session_state.get(stored_reps_key, 0) or 0)
-        except Exception:
-            prev_reps = 0
-        # if replicates changed, reset parallel to desired default
-        if prev_reps != reps:
-            st.session_state[stored_reps_key] = reps
-            st.session_state[par_key] = desired_default
+    max_workers = max(1, min(engine_max, reps))
 
-        if par_key not in st.session_state:
-            st.session_state[par_key] = desired_default
+    # session-backed parallel key and defaults
+    par_key = f"parallel_{model_key}"
+    stored_reps_key = f"_stored_reps_{model_key}"
+    try:
+        half_plus = max(1, (engine_max // 2) + 1)
+    except Exception:
+        half_plus = 1
+    desired_default = max(1, min(half_plus, engine_max, reps))
+    try:
+        prev_reps = int(st.session_state.get(stored_reps_key, 0) or 0)
+    except Exception:
+        prev_reps = 0
+    if prev_reps != reps:
+        st.session_state[stored_reps_key] = reps
+        st.session_state[par_key] = desired_default
+    if par_key not in st.session_state:
+        st.session_state[par_key] = desired_default
 
-        # If only one worker is possible, show a read-only caption instead of a slider
-        if max_workers <= 1:
-            parallel = 1
-            st.session_state[par_key] = 1
-            st.caption("Parallel workers: 1 (computed)")
-        else:
-            # clamp stored parallel to valid range
-            try:
-                stored_par = int(st.session_state.get(par_key, 1) or 1)
-            except Exception:
-                stored_par = 1
-            if stored_par < 1:
-                stored_par = 1
-            if stored_par > max_workers:
-                stored_par = max_workers
-            # render slider using the session-backed key so its value persists
-            # Avoid passing `value=` when the session key exists to prevent
-            # Streamlit warnings about widgets created with a default then set
-            # via session state. Use the session-backed key directly when present.
-            if par_key in st.session_state:
-                parallel = st.slider(
-                    "Parallel workers",
-                    min_value=1,
-                    max_value=max_workers,
-                    step=1,
-                    disabled=not ordered_ready,
-                    key=par_key,
-                    help=("Number of parallel workers. Uses physical cores for msprime, "
-                          "and logical threads for other engines. Capped at the number of replicates.")
-                )
+    # Determine visibility rules per user request:
+    # - hide Parallel entirely when replicates == 1
+    # - hide Simulation-per-Work when replicates == parallel
+    par_effective = int(st.session_state.get(par_key, desired_default) or desired_default)
+    show_parallel = (reps > 1) and (max_workers > 1)
+    show_sims = (engine != 'msprime') and not (reps == par_effective)
+    show_ram = True
+    show_growth = (engine != 'msprime')
+
+    visible_flags = [show_parallel, show_sims, show_ram, show_growth]
+    num_visible = sum(1 for f in visible_flags if f)
+    if num_visible <= 0:
+        num_visible = 1
+
+    cols = st.columns(num_visible)
+    idx = 0
+
+    # Parallel workers (may be hidden when reps==1)
+    if show_parallel:
+        with cols[idx]:
+            # If only one worker possible, default to 1 silently (don't show caption)
+            if max_workers <= 1 or reps == 1:
+                parallel = 1
+                st.session_state[par_key] = 1
             else:
-                parallel = st.slider(
-                    "Parallel workers",
+                try:
+                    stored_par = int(st.session_state.get(par_key, 1) or 1)
+                except Exception:
+                    stored_par = 1
+                if stored_par < 1:
+                    stored_par = 1
+                if stored_par > max_workers:
+                    stored_par = max_workers
+                if par_key in st.session_state:
+                    parallel = st.slider(
+                        "Parallel workers",
+                        min_value=1,
+                        max_value=max_workers,
+                        step=1,
+                        disabled=not ordered_ready,
+                        key=par_key,
+                        help=("Number of parallel workers. Uses physical cores for msprime, "
+                              "and logical threads for other engines. Capped at the number of replicates.")
+                    )
+                else:
+                    parallel = st.slider(
+                        "Parallel workers",
+                        min_value=1,
+                        max_value=max_workers,
+                        value=stored_par,
+                        step=1,
+                        disabled=not ordered_ready,
+                        key=par_key,
+                        help=("Number of parallel workers. Uses physical cores for msprime, "
+                              "and logical threads for other engines. Capped at the number of replicates.")
+                    )
+        idx += 1
+    else:
+        # hidden => ensure parallel variable exists for downstream code
+        parallel = 1
+        st.session_state[par_key] = 1
+
+    # Simulation per Work
+    if show_sims:
+        with cols[idx]:
+            sims_auto_key = f"sims_per_work_auto_{model_key}"
+            sims_auto_default = st.session_state.get(sims_auto_key, True)
+            if engine == "msprime":
+                st.session_state[sims_auto_key] = True
+                sims_per_work_auto = True
+                sims_per_work = 0
+                st.caption("Simulation per Work: not applicable for msprime; using automatic scheduling.")
+            else:
+                col_sims_a, col_sims_b = st.columns([1, 3])
+                with col_sims_a:
+                    sims_choice = st.radio(
+                        "Simulation per Work",
+                        options=["Auto", "Custom"],
+                        index=0 if sims_auto_default else 1,
+                        key=f"sims_per_work_choice_{model_key}",
+                        horizontal=True,
+                        disabled=not ordered_ready,
+                    )
+                    sims_per_work_auto = (sims_choice == "Auto")
+                    st.session_state[sims_auto_key] = sims_per_work_auto
+                with col_sims_b:
+                    if sims_per_work_auto:
+                        sims_per_work = 0
+                    else:
+                        try:
+                            par = int(parallel) if parallel else 1
+                        except Exception:
+                            par = 1
+                        try:
+                            reps = int(replicates) if replicates else 1
+                        except Exception:
+                            reps = 1
+                        import math
+                        max_val = max(1, math.ceil(reps / max(1, par)))
+                        if max_val <= 1:
+                            st.caption("Simulation per Work: 1 (computed)")
+                            sims_per_work = 1
+                        else:
+                            sims_per_work = st.slider(
+                                "Simulation per Work",
+                                min_value=1,
+                                max_value=max_val,
+                                value=1,
+                                step=1,
+                                disabled=not ordered_ready,
+                                help=f"Workers will process this many simulations per work (1..{max_val}).",
+                                key=f"sims_per_work_slider_{model_key}",
+                            )
+        idx += 1
+    else:
+        # hidden => set sensible default
+        sims_per_work = 0
+
+    # Max RAM % and Cap
+    if show_ram:
+        with cols[idx]:
+            col_ram_slider, col_ram_mode = st.columns([3, 1])
+            with col_ram_slider:
+                max_ram_percent = st.slider(
+                    "Max RAM %",
                     min_value=1,
-                    max_value=max_workers,
-                    value=stored_par,
+                    max_value=100,
+                    value=80,
                     step=1,
                     disabled=not ordered_ready,
-                    key=par_key,
-                    help=("Number of parallel workers. Uses physical cores for msprime, "
-                          "and logical threads for other engines. Capped at the number of replicates.")
+                    help="Numeric threshold (1-100). Interpretation depends on Max RAM cap mode."
                 )
-    with d2:
-        # Simulation per Work: prettier Auto vs Custom radio and renamed label
-        sims_auto_key = f"sims_per_work_auto_{model_key}"
-        sims_auto_default = st.session_state.get(sims_auto_key, True)
-
-        # Hide the Simulation-per-Work controls for msprime (not applicable).
-        # Ensure session state and local variables are set so later code can
-        # safely reference `sims_per_work` and the session key.
-        if engine == "msprime":
-            # Force Auto mode and define sims_per_work as 0 (meaning Auto)
-            st.session_state[sims_auto_key] = True
-            sims_per_work_auto = True
-            sims_per_work = 0
-            # Inform the user briefly
-            st.caption("Simulation per Work: not applicable for msprime; using automatic scheduling.")
-        else:
-            col_sims_a, col_sims_b = st.columns([1, 3])
-            with col_sims_a:
-                sims_choice = st.radio(
-                    "Simulation per Work",
-                    options=["Auto", "Custom"],
-                    index=0 if sims_auto_default else 1,
-                    key=f"sims_per_work_choice_{model_key}",
-                    horizontal=True,
+            with col_ram_mode:
+                max_ram_cap_key = f"max_ram_cap_{model_key}"
+                if max_ram_cap_key not in st.session_state:
+                    st.session_state[max_ram_cap_key] = 'system'
+                max_ram_cap = st.radio(
+                    "Cap",
+                    options=['system', 'run'],
+                    index=0 if st.session_state.get(max_ram_cap_key, 'system') == 'system' else 1,
+                    key=max_ram_cap_key,
+                    horizontal=False,
                     disabled=not ordered_ready,
+                    help="Interpretation: 'system' compares to total system RAM usage; 'run' compares the run's RSS as % of total RAM."
                 )
-                sims_per_work_auto = (sims_choice == "Auto")
-                st.session_state[sims_auto_key] = sims_per_work_auto
-            with col_sims_b:
-                # If Auto is selected we do not set the argument; if Custom is
-                # selected, show a slider whose max is ceil(replicates / parallel)
-                if sims_per_work_auto:
-                    sims_per_work = 0
+        idx += 1
+
+    # Growth max fold
+    if show_growth:
+        with cols[idx]:
+            try:
+                if engine == 'msprime':
+                    try:
+                        if 'growth_max_fold' not in st.session_state:
+                            st.session_state['growth_max_fold'] = '1.05'
+                    except Exception:
+                        pass
+                    st.caption("Growth discretization is not applicable for msprime (continuous growth supported).")
                 else:
-                    try:
-                        par = int(parallel) if parallel else 1
-                    except Exception:
-                        par = 1
-                    try:
-                        reps = int(replicates) if replicates else 1
-                    except Exception:
-                        reps = 1
-                    import math
-                    max_val = max(1, math.ceil(reps / max(1, par)))
-                    if max_val <= 1:
-                        # Slider requires min < max; when only 1 is possible show a caption/read-only value
-                        st.caption("Simulation per Work: 1 (computed)")
-                        sims_per_work = 1
+                    help_text = (
+                        "Maximum multiplicative change per discretized growth step when approximating continuous growth. "
+                        "Controls discretization granularity; the approximate number of steps is log(N)/log(growth_max_fold) for total growth factor N."
+                    )
+                    if 'growth_max_fold' not in st.session_state:
+                        st.session_state['growth_max_fold'] = '1.05'
+                    if 'growth_max_fold_last_good' not in st.session_state:
+                        st.session_state['growth_max_fold_last_good'] = st.session_state.get('growth_max_fold', '1.05')
+                    raw_ss_val = st.session_state.get('growth_max_fold', '1.05')
+                    if isinstance(raw_ss_val, float):
+                        try:
+                            display_val = format(raw_ss_val, '.12g')
+                        except Exception:
+                            display_val = str(raw_ss_val)
                     else:
-                        sims_per_work = st.slider(
-                            "Simulation per Work",
-                            min_value=1,
-                            max_value=max_val,
-                            value=1,
-                            step=1,
-                            disabled=not ordered_ready,
-                            help=f"Workers will process this many simulations per work (1..{max_val}).",
-                            key=f"sims_per_work_slider_{model_key}",
-                        )
-    with d3:
-        # Render slider and a small radio selector for cap mode (system/run) side-by-side
-        col_ram_slider, col_ram_mode = st.columns([3, 1])
-        with col_ram_slider:
-            max_ram_percent = st.slider(
-                "Max RAM %",
-                min_value=1,
-                max_value=100,
-                value=80,
-                step=1,
-                disabled=not ordered_ready,
-                help="Numeric threshold (1-100). Interpretation depends on Max RAM cap mode."
-            )
-        with col_ram_mode:
-            # session-backed key so selection persists per model
-            max_ram_cap_key = f"max_ram_cap_{model_key}"
-            if max_ram_cap_key not in st.session_state:
-                st.session_state[max_ram_cap_key] = 'system'
-            max_ram_cap = st.radio(
-                "Cap",
-                options=['system', 'run'],
-                index=0 if st.session_state.get(max_ram_cap_key, 'system') == 'system' else 1,
-                key=max_ram_cap_key,
-                horizontal=False,
-                disabled=not ordered_ready,
-                help="Interpretation: 'system' compares to total system RAM usage; 'run' compares the run's RSS as % of total RAM."
-            )
-    with d4:
-        # Progress flag moved to Build & Run tab per UX change; placeholder here to preserve layout
-        st.write(" ")
+                        display_val = str(raw_ss_val)
+                    input_key = 'growth_max_fold_input'
+                    # Ensure the session state key exists before creating the widget.
+                    # Avoid passing an explicit `value=` together with `key` which
+                    # causes Streamlit to warn when the key already exists in
+                    # session_state. Setting the session_state entry first lets
+                    # Streamlit populate the widget from session state without a
+                    # conflicting default value.
+                    if input_key not in st.session_state:
+                        st.session_state[input_key] = display_val
+                    user_input = st.text_input(
+                        "Growth max fold",
+                        key=input_key,
+                        disabled=not ordered_ready,
+                        help=help_text,
+                    )
+                    try:
+                        from decimal import Decimal
+                        ui_str = str(user_input).strip()
+                        gmf_dec = Decimal(ui_str)
+                        if gmf_dec > Decimal('1'):
+                            st.session_state['growth_max_fold'] = ui_str
+                            st.session_state['growth_max_fold_last_good'] = ui_str
+                        else:
+                            st.error("Enter a decimal number strictly greater than 1.0")
+                            st.session_state[input_key] = st.session_state.get('growth_max_fold_last_good', '1.05')
+                    except Exception:
+                        if user_input is not None and str(user_input).strip() != "":
+                            st.error("Enter a valid decimal number (e.g. 1.05).")
+                            st.session_state[input_key] = st.session_state.get('growth_max_fold_last_good', '1.05')
+                        else:
+                            pass
+            except Exception:
+                try:
+                    if 'growth_max_fold' not in st.session_state:
+                        st.session_state['growth_max_fold'] = '1.05'
+                except Exception:
+                    pass
+                st.caption("Growth discretization control unavailable.")
     
 
     # Build dynamic tabs list: include Paired neutral only when sweep params enabled and engine supports selection engines
@@ -1011,12 +1132,15 @@ with st.container():
     paired_neutral_name = ""
     neutral_engine = ""
 
-    tabs_labels = ["SFS"]
+    # Order: Site Frequency Spectrum, then Selection, then Paired Neutral (if present), then Build & Run
+    tabs_labels = ["SFS", "Selection"]
     if show_paired_tab:
         tabs_labels.append("Paired neutral")
-    tabs_labels += ["Demography & Selection", "Build & Run"]
-    tabs = st.tabs(tabs_labels)
-    tab_map = {name: tab for name, tab in zip(tabs_labels, tabs)}
+    # Render these sections inline (not as tabs) to match the rest of the UI.
+    tabs_labels += ["Build & Run"]
+    # Map each logical 'tab' name to an inline container so existing
+    # `with tab_map["..."]:` blocks continue to work but render inline.
+    tab_map = {name: st.container() for name in tabs_labels}
 
     # Site Frequency Spectrum (SFS)
     with tab_map["SFS"]:
@@ -1026,54 +1150,58 @@ with st.container():
         if sfs_key not in st.session_state: 
             st.session_state[sfs_key] = False
         sfs_on = st.checkbox("Compute SFS", value=st.session_state.get(sfs_key, False), disabled=not ordered_ready, key=sfs_key)
-        # session-backed SFS output so we can auto-fill it from the Output path
+        # session-backed SFS output key exists even when hidden; only show
+        # the SFS controls when the user explicitly requests Compute SFS.
         sfs_output_key = f"sfs_output_{model_key}"
         if sfs_output_key not in st.session_state:
             st.session_state[sfs_output_key] = ""
 
-        # If sfs is empty but output path exists, derive a sensible default
-        try:
-            out_path_key = f"output_path_{model_key}"
-            cur_sfs = st.session_state.get(sfs_output_key, "") 
-            cur_out = st.session_state.get(out_path_key, "")
-            if (not cur_sfs or not cur_sfs.strip()) and cur_out and cur_out.strip():
-                base = cur_out
-                for e in [".ms.gz", ".vcf.gz"]:
-                    if base.endswith(e):
-                        base = base[:-len(e)]
-                        break
-                else:
-                    base = os.path.splitext(base)[0]
-                st.session_state[sfs_output_key] = base + ".sfs"
-        except Exception:
-            pass
+        if sfs_on:
+            # If sfs is empty but output path exists, derive a sensible default
+            try:
+                out_path_key = f"output_path_{model_key}"
+                cur_sfs = st.session_state.get(sfs_output_key, "") 
+                cur_out = st.session_state.get(out_path_key, "")
+                if (not cur_sfs or not cur_sfs.strip()) and cur_out and cur_out.strip():
+                    base = cur_out
+                    for e in [".ms.gz", ".vcf.gz"]:
+                        if base.endswith(e):
+                            base = base[:-len(e)]
+                            break
+                    else:
+                        base = os.path.splitext(base)[0]
+                    st.session_state[sfs_output_key] = base + ".sfs"
+            except Exception:
+                pass
 
-        # Ensure SFS output ends with .sfs when the user types a name without extension.
-        def _ensure_sfs_ext():
-            cur = st.session_state.get(sfs_output_key, "") or ""
-            if cur and not cur.lower().endswith('.sfs'): 
-                st.session_state[sfs_output_key] = cur + '.sfs'
+            # Ensure SFS output ends with .sfs when the user types a name without extension.
+            def _ensure_sfs_ext():
+                cur = st.session_state.get(sfs_output_key, "") or ""
+                if cur and not cur.lower().endswith('.sfs'):
+                    st.session_state[sfs_output_key] = cur + '.sfs'
 
-        # Avoid passing `value=` when the session key already exists (prevents Streamlit warning)
-        if sfs_output_key in st.session_state:
-            sfs_output = st.text_input(
-                "SFS output",
-                disabled=not ordered_ready,
-                key=sfs_output_key, 
-                on_change=_ensure_sfs_ext,
-                help="SFS output path. If left empty the UI derives a filename from the Output path (replaces extension with .sfs)."
-            )
-        else:
-            sfs_output = st.text_input(
-                "SFS output",
-                value=st.session_state.get(sfs_output_key, ""),
-                disabled=not ordered_ready,
-                key=sfs_output_key,
-                on_change=_ensure_sfs_ext,
-                help="SFS output path. If left empty the UI derives a filename from the Output path (replaces extension with .sfs)."
-            )
-        sfs_normalized = st.checkbox("Normalize SFS", value=False, disabled=not ordered_ready)
-        sfs_mode = st.selectbox("SFS mode", ["mean","per-rep"], disabled=not ordered_ready)
+            # Avoid passing `value=` when the session key already exists (prevents Streamlit warning)
+            if sfs_output_key in st.session_state:
+                sfs_output = st.text_input(
+                    "SFS output",
+                    disabled=not ordered_ready,
+                    key=sfs_output_key, 
+                    on_change=_ensure_sfs_ext,
+                    help="SFS output path. If left empty the UI derives a filename from the Output path (replaces extension with .sfs)."
+                )
+            else:
+                sfs_output = st.text_input(
+                    "SFS output",
+                    value=st.session_state.get(sfs_output_key, ""),
+                    disabled=not ordered_ready,
+                    key=sfs_output_key,
+                    on_change=_ensure_sfs_ext,
+                    help="SFS output path. If left empty the UI derives a filename from the Output path (replaces extension with .sfs)."
+                )
+            sfs_normalized = st.checkbox("Normalize SFS", value=False, disabled=not ordered_ready)
+            sfs_mode = st.selectbox("SFS mode", ["mean","per-rep"], disabled=not ordered_ready)
+        # session-backed SFS output key exists even when hidden; only show
+        # the SFS controls when the user explicitly requests Compute SFS.
         
 
     # Paired neutral tab (conditionally present in tab_map)
@@ -1153,66 +1281,64 @@ with st.container():
                     except Exception:
                         pass
 
-            # Text input: when the user edits it, _mark_pn_user_set will mark it as user-set
-            if paired_name_key in st.session_state:
-                paired_neutral_name = st.text_input("Paired Neutral output", disabled=not (ordered_ready and paired_neutral), key=paired_name_key, on_change=_mark_pn_user_set)
-            else:
-                paired_neutral_name = st.text_input("Paired Neutral output", value=default_neutral_name, disabled=not (ordered_ready and paired_neutral), key=paired_name_key, on_change=_mark_pn_user_set)
-            # Neutral engine is optional (empty => use same engine as sweep). Only enable
-            # when user ticked sweep parameters AND the selected engine supports sweeps
-            # (msms or discoal) and paired_neutral is checked.
-            neutral_engine_options = ["", "discoal", "ms", "msms", "scrm", "msprime"]
-            # Determine if sweep is enabled via session_state (sweep_enable widget has its own key)
-            sweep_key = f"sweep_enable_{model_key}"
-            sweep_enabled_ss = bool(st.session_state.get(sweep_key, False))
-            neutral_engine_enabled = bool(ordered_ready and st.session_state.get(paired_key, False) and sweep_enabled_ss and engine in {"msms", "discoal"})
-            # Default the neutral engine to the current sweep/core engine when
-            # available. Persist choice in session_state using a model-scoped key.
-            neutral_engine_key = f"neutral_engine_{model_key}"
-            try:
-                default_index = neutral_engine_options.index(engine) if engine in neutral_engine_options else 0
-            except Exception:
-                default_index = 0
-            neutral_engine = st.selectbox(
-                "Neutral engine",
-                neutral_engine_options,
-                index=default_index,
-                key=neutral_engine_key,
-                disabled=not neutral_engine_enabled,
-                help="Leave empty to use the same engine as the sweep. Enabled only when sweep params are on and engine is msms/discoal."
-            )
-            if not neutral_engine_enabled:
-                if not sweep_enabled_ss:
-                    st.caption("Enable sweep parameters to choose a neutral engine (defaults to sweep engine).")
-                elif engine not in {"msms", "discoal"}:
-                    st.caption("Paired neutral engine selection is meaningful mainly for msms or discoal engines.")
-            
+            # Only show the Paired Neutral name and engine selection when the
+            # user has explicitly checked 'Run paired neutral'. This avoids
+            # clutter and accidental edits when the feature is not active.
+            if paired_neutral:
+                # Text input: when the user edits it, _mark_pn_user_set will mark it as user-set
+                if paired_name_key in st.session_state:
+                    paired_neutral_name = st.text_input("Paired Neutral output", key=paired_name_key, on_change=_mark_pn_user_set)
+                else:
+                    paired_neutral_name = st.text_input("Paired Neutral output", value=default_neutral_name, key=paired_name_key, on_change=_mark_pn_user_set)
 
-    with tab_map["Demography & Selection"]:
-        st.markdown("### Demography & Selection")
+                # Neutral engine is optional (empty => use same engine as sweep).
+                # Only enable the selector when paired_neutral is checked and the
+                # sweep parameters are enabled for an engine that supports it.
+                neutral_engine_options = ["", "discoal", "ms", "msms", "scrm", "msprime"]
+                sweep_key = f"sweep_enable_{model_key}"
+                sweep_enabled_ss = bool(st.session_state.get(sweep_key, False))
+                neutral_engine_enabled = bool(ordered_ready and sweep_enabled_ss and engine in {"msms", "discoal"})
+                neutral_engine_key = f"neutral_engine_{model_key}"
+                try:
+                    default_index = neutral_engine_options.index(engine) if engine in neutral_engine_options else 0
+                except Exception:
+                    default_index = 0
+                neutral_engine = st.selectbox(
+                    "Neutral engine",
+                    neutral_engine_options,
+                    index=default_index,
+                    key=neutral_engine_key,
+                    disabled=not neutral_engine_enabled,
+                    help="Leave empty to use the same engine as the sweep. Enabled only when sweep params are on and engine is msms/discoal."
+                )
+                if not neutral_engine_enabled:
+                    if not sweep_enabled_ss:
+                        st.caption("Enable sweep parameters to choose a neutral engine (defaults to sweep engine).")
+                    elif engine not in {"msms", "discoal"}:
+                        st.caption("Paired neutral engine selection is meaningful mainly for msms or discoal engines.")
+    
+    with tab_map["Selection"]:
+        st.markdown("### Selection")
         st.markdown('<div class="card">', unsafe_allow_html=True)
         e1, e2 = st.columns(2)
+        # Render sweep checkbox and parameters in the left column so parameters
+        # appear together and aligned to the left per user request.
         with e1:
-            no_en_ladder = st.checkbox("Disable growth discretization", value=False, disabled=not ordered_ready)
-            growth_max_fold = st.number_input("Growth max fold", min_value=1.0, value=1.05, step=0.01, disabled=not ordered_ready)
-        with e2:
-            # Allow user to enable sweep/selection parameters. When enabled, the UI
-            # reveals the sweep population (dropdown of model populations) and other params.
-            # Use a stable key so other tabs can read the value from session_state.
-            sweep_key = f"sweep_enable_{model_key}"
-            # Only show sweep enable when engine supports sweep simulations
-            if engine in {"msms", "discoal"}:
-                sweep_enable = st.checkbox("Enable sweep/selection parameters", value=False, disabled=not ordered_ready, key=sweep_key)
-            else:
-                # Ensure session flag off and present explanatory caption
-                try:
-                    st.session_state[sweep_key] = False
-                except Exception:
-                    pass
-                sweep_enable = False
-                st.caption("Sweep/selection parameters are available only for msms or discoal engines.")
-            if not ordered_ready:
-                st.caption("Set populations in order and sample sizes (step 4) to enable sweep/selection parameters.")
+            sweep_key = f'sweep_enable_{model_key}'
+            sweep_supported = engine in {"msms", "discoal"}
+            if sweep_key not in st.session_state:
+                st.session_state[sweep_key] = False
+
+            # Checkbox: enable/disable sweep parameters
+            sweep_enable = st.checkbox(
+                "Sweep (selection)",
+                value=bool(st.session_state.get(sweep_key, False)),
+                key=sweep_key,
+                disabled=(not ordered_ready) or (not sweep_supported),
+                help="Enable sweep/selection parameters for engines that support them (msms, discoal)."
+            )
+
+            # When enabled show parameters
             if sweep_enable:
                 if names:
                     # Do not pre-select a population. Insert a placeholder
@@ -1298,32 +1424,81 @@ with st.container():
                     col_time, col_units = st.columns([3, 2])
                     with col_time:
                         if time_mode == 'Sweep Time':
-                            sweep_val = st.text_input('Sweep Time', value=st.session_state.get(f'sweep_time_{model_key}', ''), key=f'sweep_time_{model_key}')
-                            # Preserve fixation_time when switching; remember the value user set.
-                            # Auto-select the time_mode when the user types a value here so
-                            # entering a Sweep Time enables execution without separately
-                            # picking the time type.
-                            try:
-                                if isinstance(sweep_val, str) and sweep_val.strip() != '':
-                                    st.session_state[time_mode_key] = 'Sweep Time'
-                            except Exception:
-                                pass
-                            # If sweep is enabled and user selected this mode but left it blank, show an inline error
-                            # Removed inline popup: validation/messages for missing Sweep Time
-                            # are shown in Build & Run to avoid duplication.
+                            # Use a separate input key for validation so we only accept
+                            # decimal numbers >= 0 and preserve the canonical string
+                            # under `sweep_time_{model_key}` when valid.
+                            in_key = f'sweep_time_input_{model_key}'
+                            canon_key = f'sweep_time_{model_key}'
+                            last_key = f'sweep_time_last_good_{model_key}'
+                            err_key = f'{in_key}_error'
+                            if canon_key not in st.session_state:
+                                st.session_state[canon_key] = ''
+                            if last_key not in st.session_state:
+                                st.session_state[last_key] = st.session_state.get(canon_key, '')
+                            if in_key not in st.session_state:
+                                st.session_state[in_key] = st.session_state.get(canon_key, '')
+
+                            # Validator runs as an on_change callback so it can safely
+                            # mutate session_state (including the widget key).
+                            def _validate_sweep_time(i_key=in_key, c_key=canon_key, l_key=last_key, t_key=time_mode_key, e_key=err_key):
+                                from decimal import Decimal
+                                ui = str(st.session_state.get(i_key, '')).strip()
+                                # clear previous error
+                                st.session_state.pop(e_key, None)
+                                if ui == '':
+                                    return
+                                try:
+                                    dec = Decimal(ui)
+                                    if dec >= Decimal('0'):
+                                        st.session_state[c_key] = ui
+                                        st.session_state[l_key] = ui
+                                        st.session_state[t_key] = 'Sweep Time'
+                                    else:
+                                        # revert visible input to last good and set error flag
+                                        st.session_state[i_key] = st.session_state.get(l_key, '')
+                                        st.session_state[e_key] = 'Enter a non-negative number for Sweep Time'
+                                except Exception:
+                                    st.session_state[i_key] = st.session_state.get(l_key, '')
+                                    st.session_state[e_key] = 'Enter a valid non-negative number for Sweep Time'
+
+                            sweep_val = st.text_input('Sweep Time', key=in_key, on_change=_validate_sweep_time)
+                            # show error if callback set an error flag
+                            if st.session_state.get(err_key):
+                                st.error(st.session_state.get(err_key))
                         elif time_mode == 'Fixation Time':
-                            fix_val = st.text_input('Fixation Time', value=st.session_state.get(f'fixation_time_{model_key}', ''), key=f'fixation_time_{model_key}')
-                            # Preserve sweep_time when switching; remember the value user set.
-                            # Auto-select the time_mode when the user types a value here so
-                            # entering a Fixation Time enables execution without separately
-                            # picking the time type.
-                            try:
-                                if isinstance(fix_val, str) and fix_val.strip() != '':
-                                    st.session_state[time_mode_key] = 'Fixation Time'
-                            except Exception:
-                                pass
-                            # Removed inline popup: validation/messages for missing Fixation Time
-                            # are shown in Build & Run to avoid duplication.
+                            in_key = f'fixation_time_input_{model_key}'
+                            canon_key = f'fixation_time_{model_key}'
+                            last_key = f'fixation_time_last_good_{model_key}'
+                            err_key = f'{in_key}_error'
+                            if canon_key not in st.session_state:
+                                st.session_state[canon_key] = ''
+                            if last_key not in st.session_state:
+                                st.session_state[last_key] = st.session_state.get(canon_key, '')
+                            if in_key not in st.session_state:
+                                st.session_state[in_key] = st.session_state.get(canon_key, '')
+
+                            def _validate_fixation_time(i_key=in_key, c_key=canon_key, l_key=last_key, t_key=time_mode_key, e_key=err_key):
+                                from decimal import Decimal
+                                ui = str(st.session_state.get(i_key, '')).strip()
+                                st.session_state.pop(e_key, None)
+                                if ui == '':
+                                    return
+                                try:
+                                    dec = Decimal(ui)
+                                    if dec >= Decimal('0'):
+                                        st.session_state[c_key] = ui
+                                        st.session_state[l_key] = ui
+                                        st.session_state[t_key] = 'Fixation Time'
+                                    else:
+                                        st.session_state[i_key] = st.session_state.get(l_key, '')
+                                        st.session_state[e_key] = 'Enter a non-negative number for Fixation Time'
+                                except Exception:
+                                    st.session_state[i_key] = st.session_state.get(l_key, '')
+                                    st.session_state[e_key] = 'Enter a valid non-negative number for Fixation Time'
+
+                            fix_val = st.text_input('Fixation Time', key=in_key, on_change=_validate_fixation_time)
+                            if st.session_state.get(err_key):
+                                st.error(st.session_state.get(err_key))
                         else:
                             # If sweep is enabled and the user hasn't selected a time type,
                             # guidance is shown in Build & Run instead.
@@ -1418,8 +1593,11 @@ with st.container():
         paired_neutral_name = _ss_glob_read(f"paired_neutral_name_{model_key}", 'paired_neutral_name', str, None)
         paired_neutral = _ss_glob_read(f"paired_neutral_{model_key}", 'paired_neutral', bool, False)
         neutral_engine = _ss_glob_read(f"neutral_engine_{model_key}", 'neutral_engine', str, '')
-        no_en_ladder = _ss_glob_read('no_en_ladder', 'no_en_ladder', bool, False)
-        growth_max_fold = _ss_glob_read('growth_max_fold', 'growth_max_fold', float, 1.05)
+        # Read the raw string the user entered for growth_max_fold; default to '1.05'
+        try:
+            growth_max_fold_raw = _ss_glob_read('growth_max_fold', 'growth_max_fold', str, '1.05')
+        except Exception:
+            growth_max_fold_raw = '1.05'
         sweep_enabled_ss_local = bool(st.session_state.get(f"sweep_enable_{model_key}", False))
         # sweep_pop: prefer selectbox value, then manual entry, then globals fallback
         try:
@@ -1684,10 +1862,18 @@ with st.container():
                 cmd += ["--paired-neutral"]
             if neutral_engine.strip():
                 cmd += ["--neutral-engine", neutral_engine.strip()]
-        if no_en_ladder:
-            cmd += ["--disable-growth-discretization"]
-        if growth_max_fold and growth_max_fold != 1.05:
-            cmd += ["--growth-max-fold", str(float(growth_max_fold))]
+        # Validate and include growth_max_fold only when it parses and is > 1.0
+        try:
+            from decimal import Decimal, InvalidOperation
+            gmf_str = str(growth_max_fold_raw).strip()
+            gmf_dec = Decimal(gmf_str)
+            # Decimal comparison: ensure strictly greater than 1
+            if gmf_dec > Decimal('1') and gmf_str != '1.05':
+                # Use the user's exact string (trimmed) to avoid float repr artifacts
+                cmd += ["--growth-max-fold", gmf_str]
+        except Exception:
+            # If parsing fails, skip adding the argument and let the simulator use its default
+            pass
         # selection (only include when sweep parameters are enabled)
         sweep_enabled_ss_local = bool(st.session_state.get(f"sweep_enable_{model_key}", False))
         if sweep_enabled_ss_local:
@@ -2983,9 +3169,13 @@ with st.container():
         sfs_missing_req = False
         primary_missing_req = False
 
-        if sfs_on_local and not out_val and not sfs_val:
+        # Require an explicit SFS output only when the user intends to run SFS-only
+        # (no primary output). If Compute SFS is enabled but a primary Output is
+        # missing, prefer asking the user to set the primary Output rather than
+        # asking for an SFS name.
+        if sfs_on_local and not out_val and not sfs_val and run_sfs_only_local:
             sfs_missing_req = True
-            st.error("Compute SFS is enabled: provide an SFS output path when no primary Output path is set.")
+            st.error("Run SFS only is checked: provide an SFS output path.")
 
         # require primary output unless (run_sfs_only_local is True AND sfs_val is set)
         if not (run_sfs_only_local and sfs_val):
@@ -3096,7 +3286,6 @@ with st.container():
                     f'paired_neutral_{model_key}',
                     f'paired_neutral_name_{model_key}',
                     f'neutral_engine_{model_key}',
-                    f'no_en_ladder',
                     f'growth_max_fold',
                     f'sweep_enable_{model_key}',
                     f'sweep_pop_{model_key}_sel',

@@ -713,6 +713,114 @@ def _ensure_local_tmpdir():
     return _LOCAL_TMP_ROOT
 
 
+def _schedule_background_removal(path, max_wait=300.0, interval=0.5):
+    """Fork a detached background process that repeatedly attempts to remove `path`.
+
+    This is a best-effort fallback when immediate removal fails (open file handles,
+    NFS staleness, or cross-filesystem atomicity issues). The child detaches and
+    will stop if SIMULATOR_PRESERVE_TMP is set.
+    """
+    if not path:
+        return
+    try:
+        pid = os.fork()
+    except OSError:
+        return
+    if pid > 0:
+        # parent: nothing more to do
+        return
+    # child: detach
+    try:
+        os.setsid()
+    except Exception:
+        pass
+    start = time.time()
+    try:
+        # Try repeatedly until timeout or removal succeeds
+        while True:
+            try:
+                if not os.path.exists(path):
+                    break
+                if os.environ.get('SIMULATOR_PRESERVE_TMP'):
+                    break
+                try:
+                    shutil.rmtree(path, ignore_errors=False)
+                    break
+                except Exception:
+                    # On failure, try an atomic rename to a local 'pending' name then remove that
+                    parent = os.path.dirname(path) or '.'
+                    pending = os.path.join(parent, f'.simulator_pending_rm_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}')
+                    try:
+                        try:
+                            os.rename(path, pending)
+                            # attempt to remove renamed path
+                            shutil.rmtree(pending, ignore_errors=True)
+                            break
+                        except Exception:
+                            # fallback to shutil.move (cross-fs)
+                            try:
+                                shutil.move(path, pending)
+                                shutil.rmtree(pending, ignore_errors=True)
+                                break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # stop if exceeded timeout
+            if (time.time() - start) > float(max_wait):
+                break
+            time.sleep(interval)
+    finally:
+        try:
+            os._exit(0)
+        except Exception:
+            os._exit(0)
+
+
+def _ensure_dir_removed(path):
+    """Ensure removal of a directory path with fallbacks.
+
+    Tries shutil.rmtree first. If that fails, tries to atomically rename/move the
+    directory to a pending name and schedule background removal.
+    """
+    if not path:
+        return
+    try:
+        if not os.path.exists(path):
+            return
+    except Exception:
+        return
+    try:
+        # First attempt: best-effort rmtree (may fail if files in use)
+        try:
+            shutil.rmtree(path, ignore_errors=False)
+            return
+        except Exception:
+            # try to rename atomically into same parent, then spawn background remover
+            parent = os.path.dirname(path) or '.'
+            pending = os.path.join(parent, f'.simulator_pending_rm_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}')
+            try:
+                os.rename(path, pending)
+                # spawn background remover to clear pending
+                _schedule_background_removal(pending)
+                return
+            except Exception:
+                # rename failed (maybe cross-filesystem) try move
+                try:
+                    shutil.move(path, pending)
+                    _schedule_background_removal(pending)
+                    return
+                except Exception:
+                    # as last resort spawn background remover on original path
+                    _schedule_background_removal(path)
+                    return
+    except Exception:
+        # Give up silently (best-effort)
+        return
+
+
 def _cleanup_local_tmpdir():
     """Remove the local tmp directory and its contents if it exists."""
     global _LOCAL_TMP_ROOT
@@ -727,8 +835,8 @@ def _cleanup_local_tmpdir():
             # allow preserving tmp for inspection when requested
             if not os.environ.get('SIMULATOR_PRESERVE_TMP'):
                 try:
-                    # remove the entire run folder
-                    shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
+                    # robustly remove the entire run folder (may schedule background removal)
+                    _ensure_dir_removed(_LOCAL_TMP_ROOT)
                 except Exception:
                     pass
                 if os.environ.get('SIMULATOR_DEBUG_TMP'):
@@ -749,7 +857,7 @@ def _cleanup_local_tmpdir():
                         pass
         # keep previous safety: support older naming convention
         elif base_name.startswith('.simulator_tmp_') and os.path.isdir(_LOCAL_TMP_ROOT):
-            shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
+            _ensure_dir_removed(_LOCAL_TMP_ROOT)
             if os.environ.get('SIMULATOR_DEBUG_TMP'):
                 try:
                     sys.stderr.write(f"DEBUG: removed old-style tmpdir: {_LOCAL_TMP_ROOT}\n")
@@ -758,7 +866,7 @@ def _cleanup_local_tmpdir():
                     pass
         # Also support system tmp names created by this helper
         elif os.path.basename(_LOCAL_TMP_ROOT).startswith('simulator_tmp_') and os.path.isdir(_LOCAL_TMP_ROOT):
-            shutil.rmtree(_LOCAL_TMP_ROOT, ignore_errors=True)
+            _ensure_dir_removed(_LOCAL_TMP_ROOT)
             if os.environ.get('SIMULATOR_DEBUG_TMP'):
                 try:
                     sys.stderr.write(f"DEBUG: removed system tmpdir: {_LOCAL_TMP_ROOT}\n")
@@ -804,9 +912,17 @@ def _register_cleanup_handlers():
                     pass
         except Exception:
             pass
-        # Cleanup local temporary directory
+        # Attempt robust removal of the local temporary directory (best-effort).
         try:
-            _cleanup_local_tmpdir()
+            try:
+                _ensure_dir_removed(globals().get('_LOCAL_TMP_ROOT'))
+            except Exception:
+                pass
+            # Call existing cleanup to clear module state and watcher pid
+            try:
+                _cleanup_local_tmpdir()
+            except Exception:
+                pass
         except Exception:
             pass
         # Revert handler to default first to avoid recursive invocation
@@ -2976,21 +3092,7 @@ def parse_args():
                          " or 'system' (use Python's tempfile.gettempdir()). Default: local."))
     g.add_argument('--output-format', dest='format', default='ms', choices=['ms','ms.gz','vcf','vcf.gz','bcf'],
                    help="Output format. 'ms'/'ms.gz' write raw ms-like (optionally gzipped); 'vcf'/'vcf.gz' convert single replicate to VCF.")
-    g.add_argument('--parallel', dest='parallel', type=int, default=1,
-                   help="Parallel workers for replicate chunks.")
-    g.add_argument('--sims-per-work', dest='sims_per_work', type=int, default=None,
-             help=("Number of simulation replicates to group per worker invocation (per core/thread) for external engines. "
-                 "If omitted the runner will split total replicates into exactly --parallel parts (parts need not be equal); "
-                 "the base size is floor(replicates/parallel) and any remainder is added to the final part. "
-                 "This flag is ignored for engine=msprime (internal in-process batching). "
-                 "Minimum 1; values greater than total replicates are capped to total replicates."))
-    g.add_argument('--max-ram-percent', dest='max_ram_percent', type=float, default=80.0,
-             help=("Numeric threshold (percent 0..100) used by the RAM watchdog. Interpretation depends on"
-                 " --max-ram-cap (system|run). Default 80.0."))
-    g.add_argument('--max-ram-cap', dest='max_ram_cap', choices=['system', 'run'], default='system',
-             help=("How to interpret --max-ram-percent: 'system' (default) compares to total system RAM usage percent;"
-                 " 'run' compares the current process RSS as a percentage of total system RAM (i.e. the run's share)."
-                 " Note: if system RAM usage reaches 99%% the run will be terminated regardless of this setting."))
+    # NOTE: optimization-related tunables are grouped separately below.
     # Show-only command flag
     g.add_argument('--show-command', action='store_true', help="Print the external simulator command that would run and exit (no execution).")
     g.add_argument('--progress', action='store_true', help="Show progress bar (requires tqdm).")
@@ -3012,8 +3114,34 @@ def parse_args():
     pn.add_argument('--neutral-engine', choices=['discoal','ms','msms','scrm','msprime'], help='Engine to use for neutral run (default: same as --engine).')
 
     gd = ap.add_argument_group('Demography')
-    gd.add_argument('--disable-growth-discretization', dest='no_en_ladder', action='store_true', help='Disable exponential growth discretization.')
-    gd.add_argument('--growth-max-fold', dest='max_fold_per_step', type=float, default=1.05, help='Max fold change per discretized growth step.')
+    # Optimization parameters: performance/tradeoff tunables for parallelism, batching and RAM
+    opt = ap.add_argument_group('Optimization')
+    opt.add_argument('--parallel', dest='parallel', type=int, default=1,
+                   help="Parallel workers for replicate chunks.")
+    opt.add_argument('--sims-per-work', dest='sims_per_work', type=int, default=None,
+             help=("Number of simulation replicates to group per worker invocation (per core/thread) for external engines. "
+                 "If omitted the runner will split total replicates into exactly --parallel parts (parts need not be equal); "
+                 "the base size is floor(replicates/parallel) and any remainder is added to the final part. "
+                 "This flag is ignored for engine=msprime (internal in-process batching). "
+                 "Minimum 1; values greater than total replicates are capped to total replicates."))
+    opt.add_argument('--max-ram-percent', dest='max_ram_percent', type=float, default=80.0,
+             help=("Numeric threshold (percent 0..100) used by the RAM watchdog. Interpretation depends on"
+                 " --max-ram-cap (system|run). Default 80.0."))
+    opt.add_argument('--max-ram-cap', dest='max_ram_cap', choices=['system', 'run'], default='system',
+             help=("How to interpret --max-ram-percent: 'system' (default) compares to total system RAM usage percent;"
+                 " if usage reaches 99% the run will be terminated regardless of this setting."))
+    opt.add_argument(
+        '--growth-max-fold', dest='max_fold_per_step', type=float, default=1.05,
+        help=(
+            "Maximum multiplicative change in population size allowed for each discretized growth step when approximating "
+            "continuous exponential growth. Must be > 1.0.\n\n"
+            "Smaller values (closer to 1.0, e.g. 1.01) produce a finer discretization (more -en steps) and a more accurate "
+            "approximation at the cost of larger external ms-like command lines and potentially higher runtime overhead. "
+            "Larger values yield coarser discretization (fewer steps).\n\n"
+            "Note: this option is ignored when using engine=msprime because msprime supports continuous growth directly. "
+            "Default: 1.05."
+        )
+    )
 
     sg = ap.add_argument_group('Selection (engine-specific), required for discoal/msms')
     sg.add_argument('--sweep-pop', dest='discoal_pop0', help='Sweep population (discoal/msms). Ignored for ms.')
@@ -3082,6 +3210,14 @@ def parse_args():
             setattr(args, 'x', float(x_pct) / 100.0)
     except Exception as e:
         sys.exit(f"ERROR: invalid --sweep-pos: {e}")
+
+    # Validate growth-max-fold: must be > 1.0 (fold-change per step)
+    try:
+        max_fold = float(getattr(args, 'max_fold_per_step', 1.05))
+        if not (max_fold > 1.0):
+            raise ValueError('--growth-max-fold must be > 1.0 (e.g. 1.05)')
+    except Exception as e:
+        sys.exit(f"ERROR: invalid --growth-max-fold: {e}")
 
     def _ram_monitor_loop(stop_event, threshold_pct, args_obj):
         try:
@@ -3557,14 +3693,14 @@ def _run_simulation_core(args):
                     discoal_pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                     max_fold_per_step=args.max_fold_per_step, sweep_time=(getattr(args,'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)),
                     x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=min_snps_forward, chr_name=args.chromosome,
-                    disable_en_ladder=args.no_en_ladder, seed=None, time_units=getattr(args,'time_units','gens'),
+                    disable_en_ladder=False, seed=None, time_units=getattr(args,'time_units','gens'),
                 )
         elif engine_name == 'msms':
             cmd, meta_local = build_msms_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder,
+                min_snps=min_snps_forward, disable_en_ladder=False,
                 a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=(getattr(args,'fix_time', None) if getattr(args,'fix_time', None) is not None else None), sweep_time=(getattr(args,'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)), seed=None, time_units=getattr(args,'time_units','gens'),
             )
         elif engine_name == 'scrm':
@@ -3572,21 +3708,21 @@ def _run_simulation_core(args):
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder, seed=None,
+                min_snps=min_snps_forward, disable_en_ladder=False, seed=None,
             )
         elif engine_name == 'msprime':
             cmd, meta_local = build_msprime_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder, seed=None,
+                min_snps=min_snps_forward, disable_en_ladder=False, seed=None,
             )
         else:  # ms
             cmd, meta_local = build_ms_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=min_snps_forward, disable_en_ladder=args.no_en_ladder, seed=None,
+                min_snps=min_snps_forward, disable_en_ladder=False, seed=None,
             )
         return cmd, meta_local
 
@@ -3666,8 +3802,8 @@ def _run_simulation_core(args):
     # build command (final, using possibly refined args.length unless in debug mode which skips refinement)
     # Inform about growth-discretization flags with msprime (no effect across the pipeline)
     try:
-        if engine == 'msprime' and (getattr(args, 'no_en_ladder', False) or (float(getattr(args, 'max_fold_per_step', 1.05)) != 1.05)):
-            sys.stderr.write('# INFO: --disable-growth-discretization/--growth-max-fold have no effect for engine=msprime (continuous growth simulated natively).\n')
+        if engine == 'msprime' and (float(getattr(args, 'max_fold_per_step', 1.05)) != 1.05):
+            sys.stderr.write('# INFO: --growth-max-fold has no effect for engine=msprime (continuous growth simulated natively).\n')
     except Exception:
         pass
     if engine == 'discoal':
@@ -3676,14 +3812,14 @@ def _run_simulation_core(args):
             discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, sweep_time=(getattr(args,'sweep_time',None) if getattr(args,'sweep_time',None) is not None else getattr(args,'fix_time', None)),
             x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=args.min_snps, chr_name=args.chromosome,
-            disable_en_ladder=args.no_en_ladder, seed=None, time_units=getattr(args,'time_units','gens'),
+            disable_en_ladder=False, seed=None, time_units=getattr(args,'time_units','gens'),
         )
     elif engine == 'msms':
         sim_cmd, meta = build_msms_command(
             species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
             pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-            min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder,
+            min_snps=args.min_snps, disable_en_ladder=False,
             a=getattr(args,'a',None), s=getattr(args,'s',None), x=getattr(args,'x',None), fixation_time=(getattr(args,'fix_time', None) if getattr(args,'fix_time', None) is not None else None), sweep_time=(getattr(args,'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)), seed=None, time_units=getattr(args,'time_units','gens'),
         )
     else:
@@ -3693,14 +3829,14 @@ def _run_simulation_core(args):
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=args.length,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=False, seed=None,
             )
         elif engine == 'msprime':
             sim_cmd, meta = build_msprime_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=args.length,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=False, seed=None,
             )
         else:
             sim_cmd, meta = build_ms_command(
@@ -3708,7 +3844,7 @@ def _run_simulation_core(args):
             # For engine=ms there is no --sweep-pop/--sweep-pos group; pop0 falls back to first deme.
             pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-            min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
+            min_snps=args.min_snps, disable_en_ladder=False, seed=None,
         )
 
     # Show-only mode: print the external command and exit (do not execute). For msprime, no external command.
@@ -3735,14 +3871,14 @@ def _run_simulation_core(args):
                 discoal_pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, sweep_time=(getattr(args, 'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)),
                 x=getattr(args, 'x', None), s=getattr(args, 's', None), min_snps=args.min_snps, chr_name=args.chromosome,
-                disable_en_ladder=args.no_en_ladder, seed=None,
+                disable_en_ladder=False, seed=None,
             )
         elif engine == 'msms':
             sim_cmd_loc, meta_loc = build_msms_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder,
+                min_snps=args.min_snps, disable_en_ladder=False,
                 a=getattr(args, 'a', None), s=getattr(args, 's', None), x=getattr(args, 'x', None), fixation_time=(getattr(args, 'fix_time', None) if getattr(args,'fix_time', None) is not None else None), sweep_time=(getattr(args,'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)), seed=None,
             )
         elif engine == 'scrm':
@@ -3750,21 +3886,21 @@ def _run_simulation_core(args):
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=False, seed=None,
             )
         elif engine == 'msprime':
             sim_cmd_loc, meta_loc = build_msprime_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=False, seed=None,
             )
         else:
             sim_cmd_loc, meta_loc = build_ms_command(
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, chr_name=args.chromosome,
-                min_snps=args.min_snps, disable_en_ladder=args.no_en_ladder, seed=None,
+                min_snps=args.min_snps, disable_en_ladder=False, seed=None,
             )
         raw_cmd_line_loc = None
         for ln in sim_cmd_loc.splitlines():
@@ -6291,34 +6427,34 @@ def _run_simulation_core(args):
                 neut_cmd, neut_meta = build_discoal_command(
                     species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    sweep_time=(getattr(args,'sweep_time',None) if getattr(args,'sweep_time',None) is not None else getattr(args,'fix_time', None)), x=None, s=None, min_snps=None, chr_name=args.chromosome, disable_en_ladder=args.no_en_ladder,
+                    sweep_time=(getattr(args,'sweep_time',None) if getattr(args,'sweep_time',None) is not None else getattr(args,'fix_time', None)), x=None, s=None, min_snps=None, chr_name=args.chromosome, disable_en_ladder=False,
                     seed=neut_seed, time_units=getattr(args,'time_units','gens')
                 )
             elif neut_engine=='msms':
                 neut_cmd, neut_meta = build_msms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder, a=None, s=None, x=None, fixation_time=0.0, sweep_time=None,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=False, a=None, s=None, x=None, fixation_time=0.0, sweep_time=None,
                     seed=neut_seed, time_units=getattr(args,'time_units','gens'))
             elif neut_engine=='ms':
                 neut_cmd, neut_meta = build_ms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=False,
                     seed=neut_seed)
             elif neut_engine=='scrm':
                 neut_cmd, neut_meta = build_scrm_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=False,
                     seed=neut_seed)
             elif neut_engine=='msprime':
                 neut_cmd, neut_meta = build_msprime_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=False,
                     seed=neut_seed)
             else:
                 # Fallback to ms neutral if an unknown engine is somehow specified
                 neut_cmd, neut_meta = build_ms_command(species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length, max_fold_per_step=args.max_fold_per_step,
-                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=args.no_en_ladder,
+                    chr_name=args.chromosome, min_snps=None, disable_en_ladder=False,
                     seed=neut_seed)
         # Extract raw neutral line
         raw_neut=None
