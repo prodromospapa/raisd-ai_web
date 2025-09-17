@@ -893,13 +893,102 @@ def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int =
                 pos_vals = []
             # collect haplotypes after positions
             k = pos_line_idx + 1
+            raw_hap_lines = []
             while k < len(lines):
-                s = lines[k].strip()
-                if not s or s.lstrip().startswith('//') or s.lstrip().startswith('segsites:') or s.lstrip().startswith('positions:'):
+                s = lines[k].rstrip('\n')
+                s_strip = s.strip()
+                if not s_strip or s_strip.lstrip().startswith('//') or s_strip.lstrip().startswith('segsites:') or s_strip.lstrip().startswith('positions:'):
                     break
-                if set(s) <= {'0', '1'}:
-                    hap_lines.append(s)
+                raw_hap_lines.append(s)
                 k += 1
+
+            # Normalize collected lines into pure 0/1 haplotype strings of length `segsites`.
+            # Be permissive: accept lines that contain spaces, other separators, or multiple
+            # concatenated haplotypes on the same physical line. This handles msms output
+            # variants that may include spacing or markers when -SI/-Smark/-SFC are used.
+            hap_lines = []
+            if segsites > 0:
+                for line in raw_hap_lines:
+                    ls = line.strip()
+                    # Fast-path: line already a contiguous 0/1 string
+                    if ls and set(ls) <= {'0', '1'} and len(ls) == segsites:
+                        hap_lines.append(ls)
+                        continue
+
+                    # Remove any non 0/1 characters to collapse tokens like '0 1 0' -> '010'
+                    only01 = ''.join(ch for ch in line if ch in ('0', '1'))
+                    if len(only01) == segsites:
+                        hap_lines.append(only01)
+                        continue
+
+                    # If the line contains multiple concatenated haplotypes (e.g. '010...010...'),
+                    # split into chunks of segsites
+                    if len(only01) > segsites and (len(only01) % segsites) == 0:
+                        for i0 in range(0, len(only01), segsites):
+                            chunk = only01[i0:i0+segsites]
+                            if len(chunk) == segsites:
+                                hap_lines.append(chunk)
+                        continue
+
+                    # Finally, consider whitespace-separated tokens that are individual alleles
+                    toks = [t for t in ls.split() if t in ('0', '1')]
+                    if len(toks) == segsites:
+                        hap_lines.append(''.join(toks))
+                        continue
+
+                # Fallback: if parsing produced very few haplines, attempt to recover
+                # by concatenating all 0/1 characters present in the raw haplotype
+                # region and splitting into fixed-length chunks of `segsites`.
+                if len(hap_lines) < 2:
+                    combined = ''.join(ch for ch in ''.join(raw_hap_lines) if ch in ('0', '1'))
+                    if segsites > 0 and len(combined) >= segsites and (len(combined) % segsites) == 0:
+                        recovered = [combined[i0:i0+segsites] for i0 in range(0, len(combined), segsites)]
+                        if len(recovered) > len(hap_lines):
+                            hap_lines = recovered
+
+                # Recovery: some ms/msms variants emit haplotype lines that are
+                # uniformly shorter than the declared segsites (for example
+                # segsites-1). In that case we can pad each cleaned hap string
+                # with '0' (ancestral) at the end to restore the expected
+                # length and proceed with conversion.
+                if raw_hap_lines and segsites > 0:
+                    cleaned = [''.join(ch for ch in l if ch in ('0', '1')) for l in raw_hap_lines]
+                    # If a large fraction of cleaned lines already match segsites,
+                    # prefer those as the haplotypes (handles cases where only a
+                    # subset matched earlier fast-paths).
+                    matching = [c for c in cleaned if len(c) == segsites]
+                    if len(matching) >= max(2, int(0.5 * len(cleaned))):
+                        hap_lines = matching
+                    else:
+                        # Choose the most common cleaned length and, if it
+                        # represents a majority and is within a small delta of
+                        # segsites, pad those lines to recover haplotypes. Also
+                        # handle the mixed case where most lines are short and a
+                        # few are already the correct length: pad the shorter
+                        # ones and include the correct ones in original order.
+                        from collections import Counter
+                        cnt = Counter(len(c) for c in cleaned)
+                        most_len, most_count = cnt.most_common(1)[0]
+                        # Mixed-length case: some lines already match segsites,
+                        # others are uniformly a bit shorter -> pad the short
+                        # ones and keep the correct ones so total count remains.
+                        correct_count = sum(1 for c in cleaned if len(c) == segsites)
+                        if correct_count >= 1 and most_len < segsites and (segsites - most_len) <= 2 and (most_count + correct_count) == len(cleaned):
+                            # pad short ones and include correct-length ones in original order
+                            hap_lines = [ (c if len(c) == segsites else c + ('0' * (segsites - len(c)))) for c in cleaned ]
+                        elif most_count >= max(2, int(0.5 * len(cleaned))) and segsites - most_len <= 2:
+                            # pad all cleaned lines that have the most common length
+                            hap_lines = [c + ('0' * (segsites - len(c))) for c in cleaned if len(c) == most_len]
+                        else:
+                            # Fallback: if all lines are same length and close to segsites,
+                            # pad them all (handles uniform shortness)
+                            lens = set(len(c) for c in cleaned)
+                            if len(lens) == 1:
+                                only_len = next(iter(lens))
+                                if only_len == segsites:
+                                    hap_lines = cleaned
+                                elif only_len < segsites and segsites - only_len <= 2:
+                                    hap_lines = [c + ('0' * (segsites - len(c))) for c in cleaned]
             break
         i += 1
     if segsites == 0 or not pos_vals or not hap_lines:
@@ -3151,21 +3240,22 @@ def parse_args():
     if engine == 'discoal':
         # Neutral discoal run permitted when all selection params omitted.
         # If the user requests selection we require --sel-s and --sweep-pos
-        # and exactly one of --sweep-time or --fixation-time (mutually exclusive).
+        # and at least one of --sweep-time or --fixation-time.
         user_attempted_selection = (getattr(args, 's', None) is not None) or (args.x is not None) or (args.sweep_time is not None) or (getattr(args, 'fix_time', None) is not None)
         if user_attempted_selection:
             # require sel-s and sweep-pos
             if getattr(args, 's', None) is None or args.x is None:
                 raise SystemExit('ERROR: discoal selection requires --sel-s and --sweep-pos.')
-            # require exactly one of sweep-time or fixation-time
+            # require at least one of sweep-time or fixation-time
             has_sweep_time = args.sweep_time is not None
             has_fix_time = getattr(args, 'fix_time', None) is not None
-            if not (has_sweep_time ^ has_fix_time):
-                raise SystemExit('ERROR: discoal selection requires exactly one of --sweep-time or --fixation-time (they are mutually exclusive).')
+            if not (has_sweep_time or has_fix_time):
+                raise SystemExit('ERROR: discoal selection requires --sweep-time or --fixation-time.')
             # Validate non-negativity of provided time value(s)
-            tt = args.sweep_time if has_sweep_time else getattr(args, 'fix_time', None)
-            if tt is not None and tt < 0:
-                sys.exit('ERROR: --sweep-time/--fixation-time must be >= 0.')
+            if has_sweep_time and getattr(args, 'sweep_time', None) is not None and args.sweep_time < 0:
+                sys.exit('ERROR: --sweep-time must be >= 0.')
+            if has_fix_time and getattr(args, 'fix_time', None) is not None and args.fix_time < 0:
+                sys.exit('ERROR: --fixation-time must be >= 0.')
     elif engine == 'msms':
         # msms selection: if user attempts selection require --sel-s and --sweep-pos
         # and exactly one of --sweep-time or --fixation-time.
@@ -3423,12 +3513,27 @@ def _run_simulation_core(args):
     # sweep flag validation (engine specific)
     if engine == 'discoal':
         # Treat as selection only if user supplied at least one of the sweep arguments.
-        user_attempted_selection = any(getattr(args, n) is not None for n in ('sweep_time','s','x'))
+        # Accept either --sweep-time (origin time) or --fixation-time as a valid time input.
+        user_attempted_selection = (
+            (getattr(args, 's', None) is not None) or
+            (getattr(args, 'x', None) is not None) or
+            (getattr(args, 'sweep_time', None) is not None) or
+            (getattr(args, 'fix_time', None) is not None)
+        )
         if user_attempted_selection:
-            if args.sweep_time is None or getattr(args, 's', None) is None or args.x is None:
-                sys.exit('ERROR: discoal sweep requires --sweep-time, --sel-s, and --sweep-pos.')
-            if args.sweep_time < 0:
+            # require sel-s and sweep-pos
+            if getattr(args, 's', None) is None or args.x is None:
+                sys.exit('ERROR: discoal sweep requires --sel-s and --sweep-pos.')
+            # require at least one of sweep-time or fixation-time
+            has_sweep_time = getattr(args, 'sweep_time', None) is not None
+            has_fix_time = getattr(args, 'fix_time', None) is not None
+            if not (has_sweep_time or has_fix_time):
+                sys.exit('ERROR: discoal sweep requires --sweep-time or --fixation-time.')
+            # validate non-negativity for whichever time was provided
+            if has_sweep_time and getattr(args, 'sweep_time', None) is not None and args.sweep_time < 0:
                 sys.exit('ERROR: --sweep-time must be >= 0.')
+            if has_fix_time and getattr(args, 'fix_time', None) is not None and args.fix_time < 0:
+                sys.exit('ERROR: --fixation-time must be >= 0.')
         else:
             sys.stderr.write('# INFO: No sweep parameters supplied; running neutral discoal simulation.\n')
     elif engine == 'msms':

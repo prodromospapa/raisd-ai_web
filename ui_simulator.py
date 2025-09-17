@@ -12,6 +12,8 @@ import time
 import atexit
 import signal
 import math
+import base64
+import streamlit.components.v1 as components
 try:
     import psutil
 except Exception:
@@ -3064,6 +3066,94 @@ with st.container():
             pass
 
         engine_cmd_key = f"engine_cmd_{model_key}"
+        # Visibility and fingerprint keys for the prepared engine command
+        engine_cmd_visible_key = f"engine_cmd_visible_{model_key}"
+        engine_cmd_fp_key = f"engine_cmd_fp_{model_key}"
+
+        def _make_cmd_fingerprint():
+            """Create a compact fingerprint of inputs that affect the engine command.
+
+            We store this when the engine command is prepared and compare it on
+            subsequent renders to detect changes. If the fingerprint differs we
+            clear the stored engine command so users must re-generate it.
+            """
+            try:
+                keys = [
+                    'engine',
+                    f'seq_length_{model_key}',
+                    f'target_snps_{model_key}',
+                    f'target_snps_tol_choice_{model_key}',
+                    f'target_snps_tol_{model_key}',
+                    f'replicates_{model_key}',
+                    f'output_path_{model_key}',
+                    f'output_format_{model_key}',
+                    f'chrom_length_mode_{model_key}',
+                    f'parallel_{model_key}',
+                    f'sims_per_work_choice_{model_key}',
+                    f'sims_per_work_slider_{model_key}',
+                    f'max_ram_cap_{model_key}',
+                    f'sfs_enable_{model_key}',
+                    f'sfs_output_{model_key}',
+                    f'paired_neutral_{model_key}',
+                    f'paired_neutral_name_{model_key}',
+                    f'neutral_engine_{model_key}',
+                    f'no_en_ladder',
+                    f'growth_max_fold',
+                    f'sweep_enable_{model_key}',
+                    f'sweep_pop_{model_key}_sel',
+                    f'sweep_pop_manual_{model_key}',
+                    f'sel_s_{model_key}',
+                    f'sweep_pos_{model_key}',
+                    f'time_mode_{model_key}',
+                    f'sweep_time_{model_key}',
+                    f'fixation_time_{model_key}',
+                    f'run_sfs_only_{model_key}',
+                    'progress_flag',
+                ]
+                parts = []
+                for k in keys:
+                    try:
+                        v = st.session_state.get(k, None)
+                    except Exception:
+                        v = None
+                    parts.append(str(v))
+                # include pop_order and counts since they are critical
+                try:
+                    parts.append(','.join(pop_order))
+                    parts.append(','.join(str(x) for x in counts))
+                except Exception:
+                    parts.append('')
+                    parts.append('')
+                return '|'.join(parts)
+            except Exception:
+                return ''
+
+        def _maybe_clear_engine_cmd():
+            """Clear the prepared engine command if inputs changed since it was generated."""
+            try:
+                cur = st.session_state.get(engine_cmd_key, None)
+                if not cur:
+                    return
+                prev_fp = st.session_state.get(engine_cmd_fp_key, None) or ''
+                now_fp = _make_cmd_fingerprint() or ''
+                if prev_fp != now_fp:
+                    # clear stored engine command and visibility when fingerprint differs
+                    try:
+                        st.session_state.pop(engine_cmd_key, None)
+                    except Exception:
+                        st.session_state[engine_cmd_key] = ''
+                    try:
+                        st.session_state.pop(engine_cmd_visible_key, None)
+                    except Exception:
+                        st.session_state[engine_cmd_visible_key] = False
+            except Exception:
+                pass
+
+        def _hide_engine_cmd():
+            try:
+                st.session_state[engine_cmd_visible_key] = False
+            except Exception:
+                pass
         # include all validation failures in the effective disabled flag so
         # Prepare/Execute (and Show engine command) are consistently disabled
         # when required inputs or engine-specific checks fail.
@@ -3164,27 +3254,25 @@ with st.container():
         # the copyable CLI available when other inputs are valid.
         show_engine_disabled = btn_disabled_effective or (engine == "msprime")
 
-        if st.button("Show engine command", key=f"show_engine_cmd_btn_{model_key}", disabled=show_engine_disabled):
-            cmd_show = build_cmd()
-            if cmd_show is None:
-                st.error("Complete steps 1–4 (species, model, ordered populations with counts) before showing the engine command.")
-            else:
-                # Ask simulator.py to print the engine command (use --show-command)
-                cmd_proc = cmd_show + ["--show-command"]
+        # Clear stored engine command if parameters changed since it was generated
+        _maybe_clear_engine_cmd()
+
+        # Render Show and Download side-by-side
+        col_show, col_dl = st.columns([1,1])
+        if col_show.button("Show engine command", key=f"show_engine_cmd_btn_{model_key}", disabled=show_engine_disabled):
+            # If we already prepared an engine command earlier, just show it
+            cur_engine = st.session_state.get(engine_cmd_key, None)
+            if cur_engine:
                 try:
-                    proc = subprocess.run(cmd_proc, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    if proc.returncode != 0:
-                        st.error(f"Simulator returned non-zero exit code {proc.returncode} while preparing engine command.")
-                        st.subheader("Stderr")
-                        st.text(proc.stderr)
-                    else:
-                        # Trim whitespace and store the engine command as returned by the simulator
-                        engine_text = proc.stdout.strip()
-                        st.session_state[engine_cmd_key] = engine_text
-                except FileNotFoundError:
-                    st.error("Could not find simulator.py in the working folder.")
-                except Exception as e:
-                    st.error(f"Failed to run simulator to retrieve engine command: {e}")
+                    st.session_state[engine_cmd_visible_key] = True
+                except Exception:
+                    pass
+            else:
+                # Prepare the command and show it (no download mode)
+                ok = prepare_engine_command(download_mode=False)
+                if not ok:
+                    # prepare_engine_command will surface errors
+                    pass
 
         # NOTE: removed 'Include --show-command' checkbox per user request.
 
@@ -3209,7 +3297,8 @@ with st.container():
 
                 # If the engine command was prepared via the Show engine command
                 # button, display it in the same style as the copyable CLI.
-                if st.session_state.get(engine_cmd_key):
+                # Display prepared engine command when available and visible
+                if st.session_state.get(engine_cmd_key) and st.session_state.get(engine_cmd_visible_key, False):
                     st.markdown("**Engine command:**")
                     engine_text = st.session_state.get(engine_cmd_key) or ""
                     # Strip leading python executable if present
@@ -3223,7 +3312,12 @@ with st.container():
                     # Show the engine command as code (same presentation as copyable CLI)
                     st.code(engine_text, language="bash")
 
-                    # (Custom HTML copy button removed — Streamlit's code block provides copy UI.)
+                    # Inline button: Hide (download button is rendered next to Show above)
+                    btn_col1, btn_col2 = st.columns([1,1])
+                    with btn_col1:
+                        st.button("Hide engine command", key=f"hide_engine_cmd_btn_{model_key}", on_click=_hide_engine_cmd)
+                    with btn_col2:
+                        st.write(" ")
             else:
                 # Execution isn't possible right now; avoid showing the copyable CLI.
                 st.info("Execution is disabled; copyable CLI is not available.", icon="ℹ️")
@@ -4006,6 +4100,92 @@ with st.container():
 
                 # Manual delete control removed per user request.
 
-        
+        # Download button next to Show: clicking it will prepare the engine
+        # command if missing and then render a download button. Streamlit does
+        # not support server-initiated single-click downloads; we perform a
+        # prepare->rerun flow so the download appears after preparation.
+        def prepare_engine_command(download_mode=False):
+            """Run simulator.py --show-command and store engine command + filename.
+
+            If download_mode is True, the function will also trigger an immediate
+            browser download via a data URI injected with components.html and
+            will not change the visible flag (so the command won't be displayed).
+            """
+            try:
+                # reuse build_cmd to assemble CLI
+                cmd_show = build_cmd()
+                if cmd_show is None:
+                    st.error("Complete steps 1–4 (species, model, ordered populations with counts) before preparing the engine command.")
+                    return False
+                cmd_proc = cmd_show + ["--show-command"]
+                try:
+                    proc = subprocess.run(cmd_proc, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if proc.returncode != 0:
+                        st.error(f"Simulator returned non-zero exit code {proc.returncode} while preparing engine command.")
+                        st.subheader("Stderr")
+                        st.text(proc.stderr)
+                        return False
+                    engine_text = proc.stdout.strip()
+                    st.session_state[engine_cmd_key] = engine_text
+                    # derive filename like Show logic
+                    outp = st.session_state.get(f"output_path_{model_key}", "") or ""
+                    if outp:
+                        base = os.path.basename(outp)
+                        for e in ['.ms.gz', '.vcf.gz', '.ms', '.vcf', '.bcf', '.sfs']:
+                            if base.endswith(e):
+                                base = base[:-len(e)]
+                                break
+                        filename = f"{base}_engine_cmd.txt"
+                    else:
+                        filename = f"engine_command_{model_key}.txt"
+                    st.session_state[f"engine_cmd_filename_{model_key}"] = filename
+                    # Only show when explicitly requested (not in download_mode)
+                    if not download_mode:
+                        try:
+                            st.session_state[engine_cmd_visible_key] = True
+                        except Exception:
+                            pass
+                    try:
+                        st.session_state[engine_cmd_fp_key] = _make_cmd_fingerprint()
+                    except Exception:
+                        pass
+                    # If download_mode, emit a data-uri download and return
+                    if download_mode:
+                        try:
+                            b64 = base64.b64encode(engine_text.encode('utf-8')).decode('ascii')
+                            dl_name = filename
+                            html = f"<a id='dl' href='data:text/plain;base64,{b64}' download='{dl_name}'></a><script>document.getElementById('dl').click();</script>"
+                            components.html(html)
+                        except Exception:
+                            pass
+                    return True
+                except FileNotFoundError:
+                    st.error("Could not find simulator.py in the working folder.")
+                    return False
+                except Exception as e:
+                    st.error(f"Failed to run simulator to retrieve engine command: {e}")
+                    return False
+            except Exception:
+                return False
+
+        # compute label & current prepared engine text
+        try:
+            dl_label = st.session_state.get(f"engine_cmd_filename_{model_key}") or f"engine_command_{model_key}.txt"
+        except Exception:
+            dl_label = f"engine_command_{model_key}.txt"
+        engine_text_now = st.session_state.get(engine_cmd_key, None)
+
+        if engine_text_now:
+            try:
+                data = engine_text_now.encode('utf-8')
+                col_dl.download_button("Download Engine Command", data=data, file_name=dl_label, mime='text/plain')
+            except Exception:
+                col_dl.button("Download Engine Command", disabled=True)
+        else:
+            # No prepared command: clicking the button will prepare it AND
+            # immediately download the generated engine command without
+            # displaying it in the UI (single-click flow via data URI).
+            if col_dl.button("Download Engine Command"):
+                _ = prepare_engine_command(download_mode=True)
 
 # (Removed tip about progress bar per user request)
