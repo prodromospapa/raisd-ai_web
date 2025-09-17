@@ -116,6 +116,66 @@ def ui_diag(msg: str):
         pass
 
 
+# Controlled diagnostic file logging (opt-in). By default this is disabled so
+# the app will not create or grow `artifacts/ui_simulator_diag.log` unless a
+# developer explicitly enables it. When enabled the writer will rotate the
+# file if it grows beyond UI_DIAG_MAX_BYTES to prevent unbounded growth.
+#
+# You can enable file diagnostics without editing this file by setting the
+# environment variable `UI_SIM_ENABLE_DIAG_FILE=1`. The rotation threshold can
+# be adjusted with `UI_SIM_DIAG_MAX_BYTES` (bytes).
+ENABLE_UI_DIAG_FILE = bool(os.environ.get('UI_SIM_ENABLE_DIAG_FILE', '').strip())
+try:
+    UI_DIAG_MAX_BYTES = int(os.environ.get('UI_SIM_DIAG_MAX_BYTES', str(1 * 1024 * 1024)))
+except Exception:
+    UI_DIAG_MAX_BYTES = 1 * 1024 * 1024
+
+
+def write_diag(artifacts_dir: str, msg: str) -> None:
+    """Append msg to artifacts/ui_simulator_diag.log when file logging enabled.
+
+    This is intentionally conservative: failures are swallowed and the
+    function is safe to call from many locations. If the file exceeds
+    UI_DIAG_MAX_BYTES it is rotated by renaming with a timestamp suffix.
+    """
+    try:
+        if not ENABLE_UI_DIAG_FILE:
+            return
+        if not artifacts_dir:
+            return
+        try:
+            os.makedirs(artifacts_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        diag_path = os.path.join(artifacts_dir, 'ui_simulator_diag.log')
+        try:
+            if os.path.exists(diag_path) and os.path.getsize(diag_path) > UI_DIAG_MAX_BYTES:
+                # rotate by renaming with a timestamp suffix; if rename fails,
+                # attempt to remove the old file as a last resort.
+                ts = str(int(time.time()))
+                bak = diag_path + "." + ts
+                try:
+                    os.replace(diag_path, bak)
+                except Exception:
+                    try:
+                        os.remove(diag_path)
+                    except Exception:
+                        pass
+        except Exception:
+            # if we can't stat/rotate, continue and try appending anyway
+            pass
+
+        try:
+            with open(diag_path, 'a') as dh:
+                dh.write(msg)
+        except Exception:
+            pass
+    except Exception:
+        # swallow everything; diag must never raise in the UI loop
+        pass
+
+
 def _start_cleanup_thread():
     """Start a background thread that periodically deletes expired temp artifacts.
 
@@ -483,35 +543,77 @@ def _set_paired_default(paired_name_key: str, paired_key: str, model_key: str):
         sfs_key = f"sfs_output_{model_key}"
         sfs_val = st.session_state.get(sfs_key, "") or ""
 
+        # Derive a stable paired-neutral base name (WITHOUT extension).
+        # The rest of the UI and the simulator accept a base name; avoid
+        # including engine-specific extensions here to keep behavior consistent.
         default_neutral_name = ""
-        if out_val.strip():
-            base = out_val
-            # detect double extensions like .ms.gz or .vcf.gz
-            ext = ""
-            for e in [".ms.gz", ".vcf.gz"]:
-                if base.endswith(e):
-                    base_noext = base[:-len(e)]
-                    ext = e
-                    break
-            else:
-                base_noext, ext = os.path.splitext(base)[0], os.path.splitext(base)[1]
-
-            if run_sfs_only:
-                default_neutral_name = base_noext + "_neutral"
-            else:
-                default_neutral_name = base_noext + "_neutral" + (ext or "")
-        elif run_sfs_only and sfs_val.strip():
-            base_noext = os.path.splitext(sfs_val)[0]
-            default_neutral_name = base_noext + "_neutral"
+        try:
+            if out_val and out_val.strip():
+                base = out_val.strip()
+                # strip known double extensions first
+                for e in ['.ms.gz', '.vcf.gz']:
+                    if base.endswith(e):
+                        base = base[:-len(e)]
+                        break
+                else:
+                    base = os.path.splitext(base)[0]
+                default_neutral_name = os.path.basename(base) + "_neutral"
+            elif run_sfs_only and sfs_val and sfs_val.strip():
+                b = os.path.splitext(sfs_val.strip())[0]
+                default_neutral_name = os.path.basename(b) + "_neutral"
+        except Exception:
+            default_neutral_name = ""
 
         if default_neutral_name:
-            st.session_state[paired_name_key] = default_neutral_name
-            # Also register an expected paired-neutral name so other UI
-            # components can react immediately to the user's choice.
+            # Overwrite only when the user hasn't provided a custom PN name.
+            # Ensure the UI and command builder see the expected PN base.
+            try:
+                st.session_state[paired_name_key] = default_neutral_name
+            except Exception:
+                pass
             try:
                 st.session_state[f"_expected_pn_{model_key}"] = default_neutral_name
             except Exception:
                 pass
+            # Mark the paired-neutral name as not user-set so subsequent
+            # UI logic may still update it when appropriate.
+            try:
+                st.session_state[f"paired_neutral_name_user_set_{model_key}"] = False
+            except Exception:
+                pass
+            # Try to trigger an immediate UI rerun so the new value populates
+            # the Paired Neutral text_input widget right away. Fall back to
+            # setting a refresh marker when rerun isn't available or fails.
+            try:
+                ui_diag(f"[ui_simulator] _set_paired_default: triggering rerun for model_key={model_key}")
+            except Exception:
+                pass
+            try:
+                # experimental_rerun is preferred in older Streamlit versions
+                if hasattr(st, 'experimental_rerun'):
+                    try:
+                        st.experimental_rerun()
+                    except Exception:
+                        # If experimental_rerun raises (callback context), try st.rerun
+                        if hasattr(st, 'rerun'):
+                            try:
+                                st.rerun()
+                            except Exception:
+                                st.session_state[f"_needs_refresh_{model_key}"] = True
+                        else:
+                            st.session_state[f"_needs_refresh_{model_key}"] = True
+                elif hasattr(st, 'rerun'):
+                    try:
+                        st.rerun()
+                    except Exception:
+                        st.session_state[f"_needs_refresh_{model_key}"] = True
+                else:
+                    st.session_state[f"_needs_refresh_{model_key}"] = True
+            except Exception:
+                try:
+                    st.session_state[f"_needs_refresh_{model_key}"] = True
+                except Exception:
+                    pass
     except Exception:
         # best effort; don't crash the UI
         pass
@@ -1334,6 +1436,47 @@ with st.container():
             # user has explicitly checked 'Run paired neutral'. This avoids
             # clutter and accidental edits when the feature is not active.
             if paired_neutral:
+                # Ensure we have a sensible default now (render-time fallback).
+                # Sometimes the on_change callback may not have populated the
+                # session_state before this render; recompute using current
+                # session values so the text_input shows immediately.
+                try:
+                    cur_val = st.session_state.get(paired_name_key, "") or ""
+                    user_set_key = f"paired_neutral_name_user_set_{model_key}"
+                    user_set = bool(st.session_state.get(user_set_key, False))
+                    if (not cur_val) and (not user_set):
+                        # derive from latest session_state values
+                        try:
+                            out_path_key = f"output_path_{model_key}"
+                            out_val2 = (st.session_state.get(out_path_key, "") or "").strip()
+                            run_sfs_only_key = f"run_sfs_only_{model_key}"
+                            run_sfs_only2 = bool(st.session_state.get(run_sfs_only_key, False))
+                            sfs_key = f"sfs_output_{model_key}"
+                            sfs_val2 = (st.session_state.get(sfs_key, "") or "").strip()
+                            derived = ""
+                            if out_val2:
+                                b = out_val2
+                                for e in ['.ms.gz', '.vcf.gz']:
+                                    if b.endswith(e):
+                                        b = b[:-len(e)]
+                                        break
+                                else:
+                                    b = os.path.splitext(b)[0]
+                                derived = os.path.basename(b) + "_neutral"
+                            elif run_sfs_only2 and sfs_val2:
+                                b = os.path.splitext(sfs_val2)[0]
+                                derived = os.path.basename(b) + "_neutral"
+                            if derived:
+                                st.session_state[paired_name_key] = derived
+                                try:
+                                    st.session_state[f"_expected_pn_{model_key}"] = derived
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 # Text input: when the user edits it, _mark_pn_user_set will mark it as user-set
                 if paired_name_key in st.session_state:
                     paired_neutral_name = st.text_input("Paired Neutral output", key=paired_name_key, on_change=_mark_pn_user_set)
@@ -2175,11 +2318,9 @@ with st.container():
                     st.session_state[pid_key] = int(proc.pid)
                 except Exception:
                     pass
-                # artifact diagnostic: record run start (write to artifacts/ui_simulator_diag.log)
+                # artifact diagnostic: record run start (use write_diag helper)
                 try:
-                    diag_path = os.path.join(artifacts_dir, 'ui_simulator_diag.log')
-                    with open(diag_path, 'a') as dh:
-                        dh.write(f"START {model_key} pid={proc.pid} time={time.time()}\n")
+                    write_diag(artifacts_dir, f"START {model_key} pid={proc.pid} time={time.time()}\n")
                 except Exception:
                     pass
                     try:
@@ -2466,11 +2607,9 @@ with st.container():
                         except Exception:
                             pass
 
-                        # artifact diagnostic: record cancel completion
+                        # artifact diagnostic: record cancel completion (use write_diag helper)
                         try:
-                            diag_path = os.path.join(artifacts_dir, 'ui_simulator_diag.log')
-                            with open(diag_path, 'a') as dh:
-                                dh.write(f"CANCELLED {model_key} pid={proc.pid} time={time.time()}\n")
+                            write_diag(artifacts_dir, f"CANCELLED {model_key} pid={proc.pid} time={time.time()}\n")
                         except Exception:
                             pass
 
@@ -3350,6 +3489,18 @@ with st.container():
         except Exception:
             tol_invalid_missing = False
 
+        # Require paired-neutral name when Paired Neutral is enabled
+        paired_neutral_missing = False
+        try:
+            pn_checked = bool(st.session_state.get(f"paired_neutral_{model_key}", False))
+            if pn_checked:
+                pn_name = (st.session_state.get(f"paired_neutral_name_{model_key}", "") or "").strip()
+                if not pn_name:
+                    paired_neutral_missing = True
+                    st.error("Paired neutral is checked: provide a Paired Neutral output base name before preparing/executing the command.")
+        except Exception:
+            paired_neutral_missing = False
+
         # Require at least one of: explicit Length >0, Target SNPs >0, or Chromosome Length mode
         try:
             chrom_mode = bool(st.session_state.get(f"chrom_length_mode_{model_key}", False))
@@ -3567,6 +3718,13 @@ with st.container():
             or time_value_missing
         )
 
+        # If paired-neutral name is missing while PN is checked, mark overall disabled
+        try:
+            if paired_neutral_missing:
+                btn_disabled_effective = True
+        except Exception:
+            pass
+
         # Surface the time-mode missing message prominently in Build & Run
         try:
             if time_mode_missing:
@@ -3578,6 +3736,11 @@ with st.container():
         # we can disable that button for msprime while leaving execution and
         # the copyable CLI available when other inputs are valid.
         show_engine_disabled = btn_disabled_effective or (engine == "msprime")
+        try:
+            if paired_neutral_missing:
+                show_engine_disabled = True
+        except Exception:
+            pass
 
         # Clear stored engine command if parameters changed since it was generated
         _maybe_clear_engine_cmd()
@@ -4229,9 +4392,41 @@ with st.container():
                     # create a per-run artifacts subfolder so every execution
                     # places its outputs under artifacts/<run_name>/...
                     try:
+                        # Create a per-run artifacts subfolder. Before creating a
+                        # new run folder, attempt to remove the previous one for
+                        # this model_key (if present in session_state) to avoid
+                        # accumulating many run_* folders.
+                        prev_key = f"_last_run_{model_key}"
+                        prev_run = None
+                        try:
+                            prev_run = st.session_state.get(prev_key)
+                        except Exception:
+                            prev_run = None
+                        if prev_run:
+                            try:
+                                prev_path = os.path.join(artifacts_dir, prev_run) if not os.path.isabs(prev_run) else prev_run
+                                # Only remove if it's inside the artifacts dir for safety
+                                try:
+                                    if os.path.commonpath([os.path.abspath(prev_path), os.path.abspath(artifacts_dir)]) == os.path.abspath(artifacts_dir) and os.path.exists(prev_path):
+                                        shutil.rmtree(prev_path)
+                                        ui_diag(f"[ui_simulator] Removed previous run artifacts: {prev_path}")
+                                except Exception:
+                                    # fallback: if prev_path equals artifacts_dir child, try remove
+                                    try:
+                                        if os.path.exists(prev_path):
+                                            shutil.rmtree(prev_path)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+
                         run_name = f"run_{int(time.time())}_{os.getpid()}"
                         run_artifacts_dir = os.path.join(artifacts_dir, run_name)
                         os.makedirs(run_artifacts_dir, exist_ok=True)
+                        try:
+                            st.session_state[prev_key] = run_name
+                        except Exception:
+                            pass
                     except Exception:
                         run_artifacts_dir = artifacts_dir
                     runtime_cmd = []
