@@ -56,7 +56,7 @@ else:
 
 # Load existing failed keys so we can skip them
 if testing:
-    failed_path = "failed_parts.jsonl"
+    failed_path = "testing/failed_parts.jsonl"
 else:
     failed_path = f"data/{species_folder_name}/failed_parts.jsonl"
 failed_keys = set()
