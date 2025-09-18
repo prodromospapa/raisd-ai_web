@@ -431,18 +431,17 @@
       let titleText = data.metric || '';
       const k = normKey(titleText);
       if(MATH_TITLES[k]) titleText = MATH_TITLES[k];
+      // Use Number.isFinite so 0 is treated as a valid numeric bound.
+      const rangeVal = (Number.isFinite(xmin) && Number.isFinite(xmax)) ? [Number(xmin), Number(xmax)] : undefined;
       const layout = {
         title: { text: titleText },
         margin: { t: 40, r: 20, b: 50, l: 60 },
-  xaxis: { title: 'Position', range: (xmin && xmax) ? [xmin, xmax] : undefined },
-  yaxis: { title: { text: '' } },
-
-  paper_bgcolor: getComputedStyle(document.body).getPropertyValue('--card').trim(),
-  plot_bgcolor: getComputedStyle(document.body).getPropertyValue('--card').trim(),
-  font: { color: getComputedStyle(document.body).getPropertyValue('--fg').trim() },
-  xaxis: { title: 'Position', range: (xmin && xmax) ? [xmin, xmax] : undefined, color: getComputedStyle(document.body).getPropertyValue('--fg').trim(), gridcolor: getComputedStyle(document.body).getPropertyValue('--border').trim() },
-  yaxis: { title: { text: '' }, color: getComputedStyle(document.body).getPropertyValue('--fg').trim(), gridcolor: getComputedStyle(document.body).getPropertyValue('--border').trim() },
-	dragmode: 'zoom'
+        paper_bgcolor: getComputedStyle(document.body).getPropertyValue('--card').trim(),
+        plot_bgcolor: getComputedStyle(document.body).getPropertyValue('--card').trim(),
+        font: { color: getComputedStyle(document.body).getPropertyValue('--fg').trim() },
+        xaxis: { title: 'Position', range: rangeVal, color: getComputedStyle(document.body).getPropertyValue('--fg').trim(), gridcolor: getComputedStyle(document.body).getPropertyValue('--border').trim() },
+        yaxis: { title: { text: '' }, color: getComputedStyle(document.body).getPropertyValue('--fg').trim(), gridcolor: getComputedStyle(document.body).getPropertyValue('--border').trim() },
+        dragmode: 'zoom'
       };
       // For sweep_TR metric, fix y-axis to 0..1 instead of autorange
       try {
@@ -744,7 +743,27 @@
   }
 
   // Event handlers
-  if(selMetric){ selMetric.addEventListener('change', ()=>{ tbody.innerHTML=''; zxmin.value=''; zxmax.value=''; renderMetric(selMetric.value); }); }
+  if(selMetric){
+    selMetric.addEventListener('change', ()=>{
+      // Preserve current plot zoom when switching metrics. If the chart has a
+      // current x-axis range, pass it through to renderMetric so the new metric
+      // is drawn with the same zoom. Do not clear the manual zoom inputs so the
+      // user's selection remains visible.
+      tbody.innerHTML = '';
+      let curX0 = null, curX1 = null;
+      try{
+        if(chartDiv && chartDiv._fullLayout && chartDiv._fullLayout.xaxis && Array.isArray(chartDiv._fullLayout.xaxis.range)){
+          const r = chartDiv._fullLayout.xaxis.range;
+          if(r && r.length === 2){ curX0 = Number(r[0]); curX1 = Number(r[1]); }
+        }
+      }catch(_){ /* ignore */ }
+      if(Number.isFinite(curX0) && Number.isFinite(curX1)){
+        renderMetric(selMetric.value, curX0, curX1);
+      } else {
+        renderMetric(selMetric.value);
+      }
+    });
+  }
   if(zoomBtn){ zoomBtn.addEventListener('click', ()=>{ const a=parseFloat(zxmin.value); const b=parseFloat(zxmax.value); if(Number.isFinite(a)&&Number.isFinite(b)&&b>a){ renderMetric(currentMetric,a,b); } else { alert('Provide valid numeric start/end (start < end)'); } }); }
   // When the user changes the Ensembl version, refresh the currently displayed
   // genes (if any window is active) so the new version's TSV is loaded.
