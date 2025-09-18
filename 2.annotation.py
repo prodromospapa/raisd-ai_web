@@ -6,6 +6,7 @@ import concurrent.futures
 from pathlib import Path
 from tqdm import tqdm
 import argparse
+import os
 
 # Hard-code your inputs here
 parser = argparse.ArgumentParser(description="Simulate allele frequency spectra.")
@@ -20,7 +21,10 @@ species = args.species
 
 species_dict = {sp.name: sp.id for sp in stdpopsim.all_species()}
 if species in species_dict.values():
-    species = [sp.name for sp in stdpopsim.all_species() if sp.id == species][0]
+    species_full_name = [sp.name for sp in stdpopsim.all_species() if sp.id == species][0]
+else:
+    species_full_name = species
+    species = species_dict[species]
 
 HOSTS = [
     "http://www.ensembl.org/biomart",   # vertebrates
@@ -87,16 +91,19 @@ if __name__=="__main__":
 
     def fetch_and_write(chrom_id: str):
         try:
+            out = Path(annot_dir) / f"{chrom_id}.tsv"
+            if out.exists():
+                # Skip fetching if file already exists
+                return chrom_id, None
             df = fetch(species_name, chrom_id)
             df = df.drop(columns=["strand"])
             df['biotype'] = df['biotype'].replace('_', ' ')
-            out = Path(annot_dir) / f"{chrom_id}.tsv"
             df.to_csv(out, sep="\t", index=False)
             return chrom_id, None
         except Exception as e:
             return chrom_id, e
 
-    max_workers = min(8, max(1, len(chromosomes)))
+    max_workers = min((os.cpu_count() or 1), max(1, len(chromosomes)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as exe:
         futures = {exe.submit(fetch_and_write, cid): cid for cid in chromosomes}
         for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Fetching annotations"):
