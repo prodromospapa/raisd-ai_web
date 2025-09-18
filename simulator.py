@@ -360,7 +360,7 @@ def _primary_simulation_is_neutral(meta):
 
     Rules (mirrors the inline logic used elsewhere):
     - Engines 'ms', 'scrm', 'msprime' are considered neutral-only.
-    - For other engines, absence of selection metadata (sel_args, sweep_pos, sel_2Ns)
+    - For other engines, absence of selection metadata (sel_args, sweep_pos, sel_s)
       means the primary run is neutral.
     """
     try:
@@ -369,7 +369,7 @@ def _primary_simulation_is_neutral(meta):
         eng0 = meta.get('engine')
         if eng0 in ('ms', 'scrm', 'msprime'):
             return True
-        sel_present = bool(meta.get('sel_args')) or bool(meta.get('sweep_pos')) or bool(meta.get('sel_2Ns'))
+        sel_present = bool(meta.get('sel_args')) or bool(meta.get('sweep_pos')) or bool(meta.get('sel_s'))
         return not sel_present
     except Exception:
         return False
@@ -2402,7 +2402,7 @@ def compute_sfs_stream_mean(ms_text, n_hap_expected, normalized=False, use_temp_
 # ---------- discoal builder ----------
 
 def build_discoal_command(*, species, model_id, user_order, individual_counts, discoal_pop0,
-                          reps, length, max_fold_per_step, sweep_time, x, s=None, min_snps=None, chr_name=None,
+                          reps, length, max_fold_per_step, sweep_time, x, a=None, s=None, min_snps=None, chr_name=None,
                           disable_en_ladder=False, seed=None, time_units='gens'):
     sp = sps.get_species(species)
     model = sp.get_demographic_model(model_id)
@@ -2527,8 +2527,8 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
 
     sel_args = []
     # discoal -ws t x a : t interpreted here as ORIGIN time (when allele became beneficial) per user spec.
-    # If user supplied per-generation s, compute 2Ns using N0
-    if s is not None:
+    # Accept either direct 2Ns via 'a' or per-generation s which we convert to 2Ns using N0.
+    if a is None and s is not None:
         try:
             a = 2.0 * N0 * float(s)
         except Exception:
@@ -2566,7 +2566,7 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
         'ploidy': ploidy, 'sel_args': sel_args, 'length': length,
         'chromosome': chr_name if chr_name else None, 'species_id': species,
         'sweep_pos': x if sel_args else None,
-        'sel_2Ns': a if sel_args else None,
+    'sel_s': s if sel_args else None,
         'sweep_time': sweep_time if sel_args else None,
         'fixation_time': None,
         'growth_discretization': {
@@ -2698,7 +2698,7 @@ def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
         'chromosome': chr_name if chr_name else None,
         'species_id': species,
         'sweep_pos': None,
-        'sel_2Ns': None,
+    'sel_s': None,
         'sweep_time': None,
         'fixation_time': None,
         'growth_discretization': {
@@ -2823,7 +2823,7 @@ def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0
         'chromosome': chr_name if chr_name else None,
         'species_id': species,
         'sweep_pos': None,
-        'sel_2Ns': None,
+    'sel_s': None,
         'sweep_time': None,
         'fixation_time': None,
         'growth_discretization': {
@@ -3047,32 +3047,35 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
     if (a is not None) or (x is not None):
         if a is None:
             # should not happen because we convert s->a earlier, but keep defensive check
-            raise SystemExit('ERROR: engine=msms sweep requested but --sel-2Ns or --sel-s missing.')
+            raise SystemExit('ERROR: engine=msms sweep requested but --sel-s missing.')
         # ensure numeric
         try:
             a = float(a)
         except Exception:
-            raise SystemExit('ERROR: --sel-2Ns/--sel-s could not be interpreted as a number.')
-        # genic (h≈0.5)
-        sel_args += ['-SaA', str(a), '-SAA', str(2.0 * a)]
+            raise SystemExit('ERROR: --sel-s could not be interpreted as a number.')
+
+        # genic (h≈0.5) - SAa is heterozygote effect, SAA is homozygote
+        sel_args += ['-SAa', str(a), '-SAA', str(2.0 * a)]
         # selected site position + mark it in output
         if x is None:
             x = 0.5
         sel_args += ['-Sp', str(x), '-Smark']
-    # Derive origin time (backwards) and handle fixation-time / sweep_time semantics.
-    # Approx fixation duration in coalescent units (duration from origin to fixation):
-    # T_duration ≈ ln(a)/a for a>1 else ln(1+a)/a. (a = 2Ns)
-    # If fixation_time > 0 (meaning the allele was fixed in the past at time "fixation_time"), we will
-    # instruct msms to set the allele frequency to ~1.0 at that time via `-SI <t> ...` and NOT use `-SFC`.
-    # If fixation_time == 0 (fixation at present), we keep the existing behavior: initialize at a small
-    # frequency at tstart and use `-SFC` to condition on fixation at present.
+
+        # Derive origin time (backwards) and handle fixation-time / sweep_time semantics.
+        # Approx fixation duration in coalescent units (duration from origin to fixation):
+        # T_duration ≈ ln(a)/a for a>1 else ln(1+a)/a. (a = 2Ns)
+        # If fixation_time > 0 (meaning the allele was fixed in the past at time "fixation_time"), we will
+        # instruct msms to set the allele frequency to ~1.0 at that time via `-SI <t> ...` and NOT use `-SFC`.
+        # If fixation_time == 0 (fixation at present), we keep the existing behavior: initialize at a small
+        # frequency at tstart and use `-SFC` to condition on fixation at present.
         if a <= 0:
-            raise SystemExit('ERROR: --sel-2Ns/--sel-s must be > 0 for msms selection.')
+            raise SystemExit('ERROR: --sel-s must be > 0 for msms selection.')
         if a > 1.0:
             t_duration = math.log(a) / a
         else:
             t_duration = math.log(1.0 + a) / a
-    # interpret fixation_time or sweep_time according to time_units, convert to 4N units when needed
+
+        # interpret fixation_time or sweep_time according to time_units, convert to 4N units when needed
         fixation_time_gen = None
         fixation_time_4N = 0.0
         if fixation_time is not None:
@@ -3115,11 +3118,11 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
         # t_duration is the approximate time (in 4N units) from origin to fixation
         tstart_duration = t_duration
 
-    # Priority: if sweep_time provided, treat it as origin time where selected allele was at low freq
-    # and will sweep to fixation at present (we initialize at a small freq at sweep_time and use -SFC to
-    # condition on fixation at present). If sweep_time is not provided but fixation_time is provided
-    # and >0, that means the allele was already fixed at that past time; we model this by setting the
-    # allele frequency ~1 at fixation_time via -SI and NOT using -SFC.
+        # Priority: if sweep_time provided, treat it as origin time where selected allele was at low freq
+        # and will sweep to fixation at present (we initialize at a small freq at sweep_time and use -SFC to
+        # condition on fixation at present). If sweep_time is not provided but fixation_time is provided
+        # and >0, that means the allele was already fixed at that past time; we model this by setting the
+        # allele frequency ~1 at fixation_time via -SI and NOT using -SFC.
         # initialize at a small frequency at origin time (t_duration + fixation_time) and use -SFC to
         # condition on fixation at present.
         if fixation_time is None or float(fixation_time) == 0.0:
@@ -3187,9 +3190,8 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
         'sel_args': sel_args, 'length': length,
         'chromosome': chr_name if chr_name else None,
         'species_id': species,
-        'sweep_pos': x if sel_args else None,
-        'sel_2Ns': a if sel_args else None,
-        'sel_s': (s if sel_args else None),
+    'sweep_pos': x if sel_args else None,
+    'sel_s': (s if sel_args else None),
         'sweep_time': None,
         'fixation_time': fixation_time if sel_args else None,
         'growth_discretization': {
@@ -3562,7 +3564,7 @@ def parse_args():
         user_attempted_selection = (getattr(args, 's', None) is not None) or (args.x is not None) or (args.sweep_time is not None) or (getattr(args, 'fix_time', None) is not None)
         if user_attempted_selection:
             # require sel-s and sweep-pos
-            if getattr(args, 's', None) is None or args.x is None:
+            if (getattr(args, 's', None) is None) or args.x is None:
                 raise SystemExit('ERROR: discoal selection requires --sel-s and --sweep-pos.')
             # require at least one of sweep-time or fixation-time
             has_sweep_time = args.sweep_time is not None
@@ -3580,8 +3582,8 @@ def parse_args():
         user_provided_fix = any(a.startswith('--fixation-time') for a in sys.argv[1:])
         user_attempted_selection = (getattr(args, 's', None) is not None) or (args.x is not None) or user_provided_fix
         if user_attempted_selection:
-            if getattr(args, 's', None) is None or args.x is None:
-                sys.exit('ERROR: msms selection requires both --sel-s and --sweep-pos.')
+            if (getattr(args, 's', None) is None) or args.x is None:
+                sys.exit('ERROR: msms selection requires --sel-s and --sweep-pos.')
             has_sweep_time = args.sweep_time is not None
             has_fix_time = getattr(args, 'fix_time', None) is not None
             if not (has_sweep_time ^ has_fix_time):
@@ -3874,7 +3876,7 @@ def _run_simulation_core(args):
                     species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                     discoal_pop0=getattr(args,'discoal_pop0',None), reps=reps_override, length=length_val,
                     max_fold_per_step=args.max_fold_per_step, sweep_time=(getattr(args,'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)),
-                    x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=min_snps_forward, chr_name=args.chromosome,
+                    x=getattr(args,'x',None), a=getattr(args,'a',None), s=getattr(args,'s',None), min_snps=min_snps_forward, chr_name=args.chromosome,
                     disable_en_ladder=False, seed=None, time_units=getattr(args,'time_units','gens'),
                 )
         elif engine_name == 'msms':
@@ -3993,7 +3995,7 @@ def _run_simulation_core(args):
             species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
             discoal_pop0=getattr(args,'discoal_pop0',None), reps=args.reps, length=args.length,
             max_fold_per_step=args.max_fold_per_step, sweep_time=(getattr(args,'sweep_time',None) if getattr(args,'sweep_time',None) is not None else getattr(args,'fix_time', None)),
-            x=getattr(args,'x',None), s=getattr(args,'s',None), min_snps=args.min_snps, chr_name=args.chromosome,
+            x=getattr(args,'x',None), a=getattr(args,'a',None), s=getattr(args,'s',None), min_snps=args.min_snps, chr_name=args.chromosome,
             disable_en_ladder=False, seed=None, time_units=getattr(args,'time_units','gens'),
         )
     elif engine == 'msms':
@@ -4052,7 +4054,7 @@ def _run_simulation_core(args):
                 species=args.species, model_id=args.model, user_order=user_order, individual_counts=individual_counts,
                 discoal_pop0=getattr(args, 'discoal_pop0', None), reps=args.reps, length=length_val,
                 max_fold_per_step=args.max_fold_per_step, sweep_time=(getattr(args, 'sweep_time', None) if getattr(args,'sweep_time', None) is not None else getattr(args,'fix_time', None)),
-                x=getattr(args, 'x', None), s=getattr(args, 's', None), min_snps=args.min_snps, chr_name=args.chromosome,
+                x=getattr(args, 'x', None), a=getattr(args, 'a', None), s=getattr(args, 's', None), min_snps=args.min_snps, chr_name=args.chromosome,
                 disable_en_ladder=False, seed=None,
             )
         elif engine == 'msms':
@@ -6042,8 +6044,8 @@ def _run_simulation_core(args):
                             info_pairs.append(('sweep_bp', sweep_bp))
                     except Exception:
                         pass
-                if meta.get('sel_2Ns') is not None:
-                    info_pairs.append(('sel_2Ns', meta.get('sel_2Ns')))
+                if meta.get('sel_s') is not None:
+                    info_pairs.append(('sel_s', meta.get('sel_s')))
                 if meta.get('sweep_time') is not None:
                     info_pairs.append(('sweep_time', meta.get('sweep_time')))
                 if meta.get('fixation_time') is not None:
@@ -6051,7 +6053,7 @@ def _run_simulation_core(args):
                 kv_dict = {k:v for k,v in info_pairs if v is not None}
                 core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
                 param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
-                sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
+                sel_keys = ['sweep_pos','sweep_bp','sel_s','sweep_time','fixation_time']
                 def build_group_line(prefix, keys):
                     vals = [f"{k}={kv_dict[k]}" for k in keys if k in kv_dict]
                     if not vals:
@@ -6214,8 +6216,8 @@ def _run_simulation_core(args):
                             info_pairs.append(('sweep_bp', sweep_bp))
                     except Exception:
                         pass
-                if meta.get('sel_2Ns') is not None:
-                    info_pairs.append(('sel_2Ns', meta.get('sel_2Ns')))
+                if meta.get('sel_s') is not None:
+                    info_pairs.append(('sel_s', meta.get('sel_s')))
                 if meta.get('sweep_time') is not None:
                     info_pairs.append(('sweep_time', meta.get('sweep_time')))
                 if meta.get('fixation_time') is not None:
@@ -6223,7 +6225,7 @@ def _run_simulation_core(args):
                 kv_dict = {k:v for k,v in info_pairs if v is not None}
                 core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
                 param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
-                sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
+                sel_keys = ['sweep_pos','sweep_bp','sel_s','sweep_time','fixation_time']
                 def build_group_line(prefix, keys):
                     vals = [f"{k}={kv_dict[k]}" for k in keys if k in kv_dict]
                     if not vals:
@@ -6404,8 +6406,8 @@ def _run_simulation_core(args):
                                 sweep_bp = int(round(float(sp) * int(meta.get('length'))))
                                 info_pairs.append(('sweep_bp', sweep_bp))
                         except Exception: pass
-                    if meta.get('sel_2Ns') is not None:
-                        info_pairs.append(('sel_2Ns', meta.get('sel_2Ns')))
+                    if meta.get('sel_s') is not None:
+                        info_pairs.append(('sel_s', meta.get('sel_s')))
                     if meta.get('sweep_time') is not None:
                         info_pairs.append(('sweep_time', meta.get('sweep_time')))
                     if meta.get('fixation_time') is not None:
@@ -6414,7 +6416,7 @@ def _run_simulation_core(args):
                     # Group related keys: core, params, selection (enforcement line removed per user request)
                     core_keys = ['engine','species','model','pop0','order','sample_counts','hap_counts']
                     param_keys = ['theta','rho','length','N0','mu','r','ploidy','chromosome']
-                    sel_keys = ['sweep_pos','sweep_bp','sel_2Ns','sweep_time','fixation_time']
+                    sel_keys = ['sweep_pos','sweep_bp','sel_s','sweep_time','fixation_time']
                     # Enforcement diagnostics retained internally but not emitted.
                     kv_dict = {k:v for k,v in info_pairs if v is not None}
                     # Inject enforcement stats if present
@@ -6598,7 +6600,7 @@ def _run_simulation_core(args):
                 neut_meta = {}
             neut_meta['engine'] = neut_engine
             # Clear selection-specific metadata for the neutral run
-            for k in ('sel_args','sweep_pos','sel_2Ns','sel_s','sweep_time','fixation_time'):
+            for k in ('sel_args','sweep_pos','sel_s','sweep_time','fixation_time'):
                 if k in neut_meta:
                     neut_meta[k] = None if not isinstance(neut_meta[k], list) else []
             # Defer creating the SFS file until the run fully completes (only if available).

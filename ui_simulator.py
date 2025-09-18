@@ -2753,22 +2753,53 @@ with st.container():
                                             # If this candidate is classified as Paired Neutral,
                                             # prefer the paired-neutral base name for the archive
                                             zip_base = pn_base_local or base
-                                            # create the zip inside a workspace 'artifacts' folder
-                                            workspace_dir = os.path.abspath(os.getcwd())
-                                            artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+                                            # Prefer creating the archive directly inside
+                                            # the per-run artifacts folder when available so
+                                            # the run_* directory contains the zip.
+                                            archive_base = None
                                             try:
-                                                os.makedirs(artifacts_dir, exist_ok=True)
+                                                run_dir = globals().get('run_artifacts_dir')
+                                            except Exception:
+                                                run_dir = None
+                                            if run_dir:
+                                                try:
+                                                    os.makedirs(run_dir, exist_ok=True)
+                                                    archive_base = os.path.join(run_dir, zip_base)
+                                                except Exception:
+                                                    archive_base = None
+                                            if not archive_base:
+                                                workspace_dir = os.path.abspath(os.getcwd())
+                                                artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+                                                try:
+                                                    os.makedirs(artifacts_dir, exist_ok=True)
+                                                except Exception:
+                                                    pass
+                                                archive_base = os.path.join(artifacts_dir, zip_base)
+                                            # avoid overwriting an existing archive by appending a timestamp if needed
+                                            try:
+                                                archive_path_candidate = archive_base + '.zip'
+                                                if os.path.exists(archive_path_candidate):
+                                                    archive_base = archive_base + f"_{int(time.time())}"
                                             except Exception:
                                                 pass
-                                            archive_name = f"{zip_base}.zip"
-                                            archive_base = os.path.join(artifacts_dir, zip_base)
-                                            zip_path = os.path.join(artifacts_dir, archive_name)
-                                            # avoid overwriting an existing archive by appending a timestamp if needed
-                                            if os.path.exists(zip_path):
-                                                archive_base = os.path.join(artifacts_dir, f"{zip_base}_{int(time.time())}")
-                                            else:
-                                                archive_base = os.path.join(artifacts_dir, zip_base)
                                             zip_path = shutil.make_archive(archive_base, 'zip', root_dir=candidate)
+                                            # Also copy the created archive into the per-run artifacts
+                                            # folder when it exists (run_artifacts_dir is set
+                                            # before calling run_and_report). This ensures the
+                                            # run_<...> folder contains the zip as well as the
+                                            # top-level artifacts directory.
+                                            try:
+                                                run_dir = globals().get('run_artifacts_dir')
+                                                if run_dir:
+                                                    try:
+                                                        os.makedirs(run_dir, exist_ok=True)
+                                                        dest = os.path.join(run_dir, os.path.basename(zip_path))
+                                                        if not os.path.exists(dest):
+                                                            shutil.copy2(zip_path, dest)
+                                                    except Exception:
+                                                        pass
+                                            except Exception:
+                                                pass
                                             # after creating the archive, remove the original folder
                                             try:
                                                 shutil.rmtree(candidate)
@@ -3028,22 +3059,49 @@ with st.container():
                             if base.endswith(e):
                                 base = base[:-len(e)]
                                 break
-                        # create zips inside workspace 'artifacts' folder
-                        workspace_dir = os.path.abspath(os.getcwd())
-                        artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+                        # Prefer creating the archive directly inside the
+                        # per-run artifacts folder when available.
+                        archive_base = None
                         try:
-                            os.makedirs(artifacts_dir, exist_ok=True)
+                            run_dir = globals().get('run_artifacts_dir')
+                        except Exception:
+                            run_dir = None
+                        if run_dir:
+                            try:
+                                os.makedirs(run_dir, exist_ok=True)
+                                archive_base = os.path.join(run_dir, base)
+                            except Exception:
+                                archive_base = None
+                        if not archive_base:
+                            workspace_dir = os.path.abspath(os.getcwd())
+                            artifacts_dir = os.path.join(workspace_dir, 'artifacts')
+                            try:
+                                os.makedirs(artifacts_dir, exist_ok=True)
+                            except Exception:
+                                pass
+                            archive_base = os.path.join(artifacts_dir, base)
+                        try:
+                            archive_path_candidate = archive_base + '.zip'
+                            if os.path.exists(archive_path_candidate):
+                                archive_base = archive_base + f"_{int(time.time())}"
                         except Exception:
                             pass
-                        archive_name = f"{base}.zip"
-                        archive_base = os.path.join(artifacts_dir, base)
-                        zip_path = os.path.join(artifacts_dir, archive_name)
-                        # avoid overwriting by appending timestamp if needed
-                        if os.path.exists(zip_path):
-                            archive_base = os.path.join(artifacts_dir, f"{base}_{int(time.time())}")
-                        else:
-                            archive_base = os.path.join(artifacts_dir, base)
                         zip_path = shutil.make_archive(archive_base, 'zip', root_dir=path)
+                        # Also copy the created archive into the per-run artifacts
+                        # folder when present so downloads under a specific run
+                        # include the zip.
+                        try:
+                            run_dir = globals().get('run_artifacts_dir')
+                            if run_dir:
+                                try:
+                                    os.makedirs(run_dir, exist_ok=True)
+                                    dest = os.path.join(run_dir, os.path.basename(zip_path))
+                                    if not os.path.exists(dest):
+                                        shutil.copy2(zip_path, dest)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                         # remove the original folder after zipping so artifacts/ contains only archives
                         try:
                             shutil.rmtree(path)
@@ -4424,6 +4482,13 @@ with st.container():
                         run_name = f"run_{int(time.time())}_{os.getpid()}"
                         run_artifacts_dir = os.path.join(artifacts_dir, run_name)
                         os.makedirs(run_artifacts_dir, exist_ok=True)
+                        # expose the current run artifacts dir globally so
+                        # mid-run zip creation code can place archives
+                        # directly into the run folder.
+                        try:
+                            globals()['run_artifacts_dir'] = run_artifacts_dir
+                        except Exception:
+                            pass
                         try:
                             st.session_state[prev_key] = run_name
                         except Exception:
@@ -4508,7 +4573,22 @@ with st.container():
                 except Exception:
                     cmd_exec = cmd
                 # start the run (blocks until finished inside run_and_report)
-                run_and_report(cmd_exec)
+                try:
+                    # ensure zips and discovered artifacts are created inside
+                    # the per-run folder by exposing it via globals for the
+                    # helper code elsewhere.
+                    globals().setdefault('run_artifacts_dir', run_artifacts_dir)
+                except Exception:
+                    pass
+                try:
+                    run_and_report(cmd_exec)
+                finally:
+                    # clear the global to avoid leaking the run folder across
+                    # subsequent runs
+                    try:
+                        globals().pop('run_artifacts_dir', None)
+                    except Exception:
+                        pass
                 try:
                     st.session_state[processed_key] = False
                 except Exception:
