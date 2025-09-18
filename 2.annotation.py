@@ -88,7 +88,7 @@ if __name__=="__main__":
     # ensure base annotation directory exists
     Path(base_annot_dir).mkdir(parents=True, exist_ok=True)
     # Auto-discover Ensembl releases from the public FTP and process each
-    import urllib.request, urllib.error, urllib.parse, re, gzip, shutil, tempfile, json
+    import urllib.request, urllib.error, urllib.parse, re, gzip, shutil, tempfile, json, subprocess, shlex, threading
 
     def discover_releases(base_urls=("https://ftp.ensembl.org/pub/", "http://ftp.ensembl.org/pub/")):
         found = set()
@@ -142,34 +142,18 @@ if __name__=="__main__":
             # No GTF for this release; silently ignore per user request
             return False
 
-        # Print a compact download header for the release (no long URL)
-        print(f"Download ensembl_{release}")
+    # Download progress will be displayed by the tqdm progress bar below
 
-        # stream download to temp file
-        try:
-            with urllib.request.urlopen(gtf_file_url, timeout=120) as r:
-                tmpf = tempfile.NamedTemporaryFile(delete=False)
-                shutil.copyfileobj(r, tmpf)
-                tmpf.close()
-        except Exception as e:
-            print(f"Failed to download {gtf_file_url}: {e}", file=sys.stderr)
-            return False
+        # Try a fast pipeline: curl/wget -> pigz -dc -> parse stream. Fall back to
+        # pure-Python streaming (urllib + gzip.GzipFile) if external tools are
+        # unavailable.
+        p_proc = None
 
-        # Now that we have a GTF, create the version dir and parse
-        try:
-            ver_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-
-        # parse GTF.gz and write per-chromosome TSVs.
-        # Some Ensembl GTFs may not contain explicit 'gene' features. In that
-        # case, aggregate coordinates from other features (exon/transcript/CDS)
-        # keyed by gene_id so we still produce one entry per gene with min/max
-        # coordinates.
-        gene_ranges = {}  # {(chrom, gene_id): {name, biotype, start, end}}
-        handlers = {}
-        try:
-            with gzip.open(tmpf.name, 'rt', encoding='utf-8', errors='ignore') as fh:
+        def parse_fh(fh):
+            # fh: text-mode file-like iterator yielding lines
+            gene_ranges = {}
+            handlers = {}
+            try:
                 for line in fh:
                     line = line.strip()
                     if not line or line.startswith('#'):
@@ -192,7 +176,6 @@ if __name__=="__main__":
                     gene_name = attrd.get('gene_name') or attrd.get('gene_symbol') or attrd.get('Name') or ''
                     biotype = attrd.get('gene_biotype') or attrd.get('gene_type') or attrd.get('gene_biotype') or ''
                     if not gene_id:
-                        # skip entries we can't attribute to a gene
                         continue
                     try:
                         start = int(start_s)
@@ -213,75 +196,201 @@ if __name__=="__main__":
                         if end > gene_ranges[key]['end']:
                             gene_ranges[key]['end'] = end
 
-            # now write per-chromosome TSVs, show tqdm progress while writing
-            # Only create TSVs for chromosomes listed in the species' chromosomes.txt
-            try:
-                # `chromosomes` is loaded earlier from data/<Species>/chromosomes.txt
-                allowed = set([c.strip() for c in chromosomes if c.strip()])
-                allowed_l = set([c.lower() for c in allowed] + [f"chr{c.lower()}" for c in allowed])
-            except Exception:
-                allowed = None
-                allowed_l = None
-
-            # filter items to only those where chrom matches allowed set (case-insensitive, with/without 'chr')
-            items = []
-            for (chrom, gid), info in gene_ranges.items():
-                chrom_l = (chrom or '').lower()
-                if allowed_l is not None:
-                    if chrom_l in allowed_l or chrom_l.lstrip('chr') in allowed_l:
-                        items.append(((chrom, gid), info))
-                else:
-                    items.append(((chrom, gid), info))
-
-            if not items:
-                # No allowed chromosomes found in this GTF -> do not keep an empty version dir
+                # now write per-chromosome TSVs, show tqdm progress while writing
                 try:
-                    if ver_dir.exists():
-                        # attempt to remove empty dir
-                        try:
-                            next(ver_dir.iterdir())
-                            # dir not empty, keep it
-                        except StopIteration:
-                            ver_dir.rmdir()
+                    allowed = set([c.strip() for c in chromosomes if c.strip()])
+                    allowed_l = set([c.lower() for c in allowed] + [f"chr{c.lower()}" for c in allowed])
+                except Exception:
+                    allowed = None
+                    allowed_l = None
+
+                items = []
+                for (chrom, gid), info in gene_ranges.items():
+                    chrom_l = (chrom or '').lower()
+                    if allowed_l is not None:
+                        if chrom_l in allowed_l or chrom_l.lstrip('chr') in allowed_l:
+                            items.append(((chrom, gid), info))
+                    else:
+                        items.append(((chrom, gid), info))
+
+                if not items:
+                    try:
+                        if ver_dir.exists():
+                            try:
+                                next(ver_dir.iterdir())
+                            except StopIteration:
+                                ver_dir.rmdir()
+                    except Exception:
+                        pass
+                    return False
+
+                from tqdm import tqdm as _tqdm
+                for (chrom, gid), info in _tqdm(items, desc=f"Splitting ensembl_{release} to tsv", unit="genes", position=1, leave=True, ascii=True, file=sys.stderr):
+                    out_path = ver_dir / f"{chrom}.tsv"
+                    if chrom not in handlers:
+                        f = open(out_path, 'w', encoding='utf-8')
+                        f.write('\t'.join(["gene_id","transcript_id","gene_name","chromosome","start","end","biotype"]) + '\n')
+                        handlers[chrom] = f
+                    line_out = '\t'.join([gid, '', info.get('gene_name',''), chrom, str(info['start']), str(info['end']), info.get('biotype','')])
+                    handlers[chrom].write(line_out + '\n')
+                return True
+            except Exception as e:
+                print(f"Failed to parse GTF stream: {e}", file=sys.stderr)
+                try:
+                    for h in handlers.values():
+                        h.close()
                 except Exception:
                     pass
                 return False
+            finally:
+                try:
+                    for h in handlers.values():
+                        h.close()
+                except Exception:
+                    pass
 
-            from tqdm import tqdm as _tqdm
-            for (chrom, gid), info in _tqdm(items, desc=f"ensembl_{release} tsv", unit="genes"):
-                out_path = ver_dir / f"{chrom}.tsv"
-                if chrom not in handlers:
-                    f = open(out_path, 'w', encoding='utf-8')
-                    f.write('\t'.join(["gene_id","transcript_id","gene_name","chromosome","start","end","biotype"]) + '\n')
-                    handlers[chrom] = f
-                # transcript_id left blank because GTF gene aggregation may merge multiple transcripts
-                line_out = '\t'.join([gid, '', info.get('gene_name',''), chrom, str(info['start']), str(info['end']), info.get('biotype','')])
-                handlers[chrom].write(line_out + '\n')
+        # create version dir before parsing outputs
+        try:
+            ver_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # attempt pigz pipeline
+        pigz = shutil.which('pigz')
+        curl = shutil.which('curl')
+        wget = shutil.which('wget')
+        if pigz and (curl or wget):
+            # Build downloader command (no shell piping). We'll stream
+            # downloader.stdout -> pigz.stdin while updating a tqdm bar, and
+            # parse pigz.stdout in a background thread.
+            if curl:
+                dl_cmd = [curl, '-L', '-s', gtf_file_url]
+            else:
+                dl_cmd = [wget, '-q', '-O', '-', gtf_file_url]
+            pigz_cmd = [pigz, '-dc']
+
+            # try to get Content-Length for a progress bar
+            total = None
+            try:
+                head_req = urllib.request.Request(gtf_file_url, headers={'User-Agent': 'raisd-ai/1.0 (python urllib)'}, method='HEAD')
+                with urllib.request.urlopen(head_req, timeout=20) as hr:
+                    cl = hr.getheader('Content-Length')
+                    try:
+                        total = int(cl) if cl is not None else None
+                    except Exception:
+                        total = None
+            except Exception:
+                total = None
+
+            try:
+                # Open the HTTP response directly so we control chunk reads and
+                # can reliably update tqdm. Then feed bytes into pigz stdin.
+                req = urllib.request.Request(gtf_file_url, headers={'User-Agent': 'raisd-ai/1.0 (python urllib)'})
+                r = urllib.request.urlopen(req, timeout=120)
+                p2 = subprocess.Popen(pigz_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                if p2.stdin is None or p2.stdout is None:
+                    raise RuntimeError('Failed to create pigz pipes')
+
+                # start parser thread reading pigz stdout
+                parser_result = {'ok': False, 'error': None}
+
+                def _parser():
+                    try:
+                        if p2.stdout is None:
+                            parser_result['error'] = 'pigz produced no stdout'
+                            return
+                        fh = io.TextIOWrapper(p2.stdout, encoding='utf-8', errors='ignore')
+                        parser_result['ok'] = parse_fh(fh)
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        parser_result['error'] = str(e)
+
+                th = threading.Thread(target=_parser, daemon=True)
+                th.start()
+
+                # stream bytes from downloader -> pigz.stdin while updating tqdm
+                chunk_size = 64 * 1024
+                desc = f"Download ensembl_{release}"
+                if total:
+                    pbar = tqdm(total=total, unit='B', unit_scale=True, desc=desc, position=0, leave=True, ascii=True, file=sys.stderr)
+                else:
+                    pbar = tqdm(unit='B', unit_scale=True, desc=desc, position=0, leave=True, ascii=True, file=sys.stderr)
+
+                try:
+                    while True:
+                        chunk = r.read(chunk_size)
+                        if not chunk:
+                            break
+                        p2.stdin.write(chunk)
+                        p2.stdin.flush()
+                        pbar.update(len(chunk))
+                finally:
+                    pbar.close()
+                    try:
+                        p2.stdin.close()
+                    except Exception:
+                        pass
+
+                # wait for parser thread and pigz
+                th.join()
+                p2_stderr = b''
+                try:
+                    p2_stderr = p2.stderr.read() if p2.stderr is not None else b''
+                except Exception:
+                    pass
+                p2.wait()
+                try:
+                    r.close()
+                except Exception:
+                    pass
+
+                if not parser_result.get('ok'):
+                    if parser_result.get('error'):
+                        print(f"pigz parser error: {parser_result['error']}", file=sys.stderr)
+                    if p2_stderr:
+                        try:
+                            print(f"[pigz stderr] {p2_stderr.decode('utf-8','ignore')}", file=sys.stderr)
+                        except Exception:
+                            pass
+                    # no downloader stderr because we read directly via urllib
+                    
+                    # fall back to Python streaming
+                else:
+                    # success
+                    try:
+                        if p2_stderr:
+                            errtxt = p2_stderr.decode('utf-8','ignore')
+                            if errtxt.strip():
+                                print(f"[pigz stderr] {errtxt}", file=sys.stderr)
+                    except Exception:
+                        pass
+                    # parser succeeded
+                    return True
+            except Exception as e:
+                print(f"pigz pipeline failed: {e}", file=sys.stderr)
+                # fall through to Python streaming below
+
+        # fallback: pure-Python streaming via urllib + gzip
+        try:
+            req = urllib.request.Request(gtf_file_url, headers={'User-Agent': 'raisd-ai/1.0 (python urllib)'})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                gz = gzip.GzipFile(fileobj=r)
+                fh = io.TextIOWrapper(gz, encoding='utf-8', errors='ignore')
+                ok = parse_fh(fh)
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                if not ok:
+                    return False
         except Exception as e:
-            print(f"Failed to parse GTF {tmpf.name}: {e}", file=sys.stderr)
-            try:
-                for h in handlers.values():
-                    h.close()
-            except Exception:
-                pass
-            try:
-                os.unlink(tmpf.name)
-            except Exception:
-                pass
+            print(f"Failed to download/stream {gtf_file_url}: {e}", file=sys.stderr)
             return False
-        finally:
-            try:
-                for h in handlers.values():
-                    h.close()
-            except Exception:
-                pass
-            try:
-                if os.path.exists(tmpf.name):
-                    os.unlink(tmpf.name)
-            except Exception:
-                pass
 
-        # completion: return silently (no final printed message requested)
         return True
 
     # Load or create a small local cache of releases we've already checked so
@@ -311,6 +420,17 @@ if __name__=="__main__":
                 ok = process_release(r)
                 if ok:
                     processed.append(r)
+                    # Persist this release as checked immediately so that if the
+                    # user cancels the run later, completed releases are not lost.
+                    try:
+                        checked.add(str(r))
+                        tmp = checked_path.with_suffix('.tmp')
+                        with open(tmp, 'w', encoding='utf-8') as cf:
+                            json.dump({'checked': sorted(list(checked))}, cf, indent=2)
+                        os.replace(str(tmp), str(checked_path))
+                    except Exception:
+                        # non-fatal; we'll still attempt to persist in the loop's finally
+                        pass
             except Exception as e:
                 print(f"Error processing release {r}: {e}", file=sys.stderr)
             finally:

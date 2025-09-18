@@ -60,6 +60,7 @@ dependencies:
   - git      # needed to clone repos (discoal, RAiSD-AI)
   - wget     # used for downloads in scripts
   - curl     # alternative downloader
+  - pigz     # parallel gzip for faster decompression
   - unzip    # to extract zips if needed
   - make  # added to avoid sudo apt-get for build tools
   - gcc_linux-64  # compiler toolchain (no sudo)

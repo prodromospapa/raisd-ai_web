@@ -2666,21 +2666,17 @@ def annotation_versions():
     if not species:
         return json.dumps({'error': 'species required'}), 400, {'Content-Type': 'application/json'}
     base = os.path.join(DATA_DIR, species, 'annotation')
-    manifest = os.path.join(base, 'versions.json')
     versions = []
     try:
-        if os.path.exists(manifest):
-            with open(manifest, 'r', encoding='utf-8') as f:
-                j = json.load(f)
-                versions = j.get('ensembl_versions') or []
-        else:
-            # scan directories — only include purely numeric releases (ensembl_<digits>)
-            if os.path.isdir(base):
-                for name in os.listdir(base):
-                    m = re.match(r'^ensembl_(\d+)$', name)
-                        
-                    if m:
-                        versions.append(m.group(1))
+        # Prefer scanning the annotation directory for subfolders named
+        # `ensembl_<digits>` rather than relying on a manifest file. This
+        # avoids the need to update versions.json and keeps the website in
+        # sync with the filesystem.
+        if os.path.isdir(base):
+            for name in os.listdir(base):
+                m = re.match(r'^ensembl_(\d+)$', name)
+                if m:
+                    versions.append(m.group(1))
         # Sort numerically when possible so the latest release is last
         def _num_key(s):
             try:
