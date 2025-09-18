@@ -3808,7 +3808,8 @@ with st.container():
                         st.write(" ")
             else:
                 # Execution isn't possible right now; avoid showing the copyable CLI.
-                st.info("Execution is disabled; copyable CLI is not available.", icon="ℹ️")
+                # Message removed per user request.
+                pass
 
             # Execute immediately when the Execute button is pressed
             cancel_key_ui = f"_cancel_run_{model_key}"
