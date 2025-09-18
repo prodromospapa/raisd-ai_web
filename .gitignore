@@ -1,6 +1,8 @@
 *
-!static
-!templates
+!static/
+!static/**
+!templates/
+!templates/**
 !website_launcher.py
 !install_dependencies.sh
 !raisd-ai.yml

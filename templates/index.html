@@ -1,0 +1,44 @@
+{% extends 'base.html' %}
+{% block content %}
+  <form id="job-form" class="card" action="{{ url_for('analyze') }}" method="post" enctype="multipart/form-data">
+    <div class="grid">
+      <label>
+        <span>Species</span>
+        <select id="species-select" name="species" required>
+          <option value="" selected hidden>Select a species</option>
+          {% for sp in species_options %}
+            <option value="{{ sp }}">{{ sp | replace('_', ' ') }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+          <span>Chromosome</span>
+          <div class="chromosome-list-wrapper">
+            <select name="chromosome" id="chromosome-select" required>
+              <option value="" selected hidden>Select a chromosome</option>
+            </select>
+          </div>
+      </label>
+      <label>
+        <span>Grid</span>
+        <input type="number" name="grid" value="300" min="1" required />
+      </label>
+    </div>
+
+    <div id="dropzone" class="dropzone">
+      <p>Drag & drop your <strong>.vcf</strong>, <strong>.vcf.gz</strong> or <strong>.bcf</strong> here</p>
+      <p class="muted">or click to browse…</p>
+      <input id="file-input" type="file" name="vcf" accept=".vcf,.gz,.bcf" required style="display:none" />
+    </div>
+    <div id="upload-status" class="upload-status" hidden>
+      <div class="label">
+        <span id="upload-filename"></span>
+        <span id="upload-percent" class="muted" style="float:right">0%</span>
+      </div>
+      <div class="progress"><div id="upload-bar" class="progress-bar" style="width:0%"></div></div>
+      <div class="muted" id="upload-bytes"></div>
+    </div>
+
+    <button id="submit-btn" type="submit">Analyze</button>
+  </form>
+{% endblock %}
