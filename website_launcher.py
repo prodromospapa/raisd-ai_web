@@ -1221,10 +1221,31 @@ def analyze():
         # Ensure minimal meta exists early so the UI can read species/chromosome
         try:
             meta_path = os.path.join(run_dir, 'result_meta.json')
+            # Try to detect single contig now to prefill the first page
+            detected_chr = None
+            detected_contig = None
+            try:
+                if _exe_available(BCFTOOLS):
+                    p1 = subprocess.Popen([BCFTOOLS, 'query', '-f', '%CHROM\n', vcf_path], stdout=subprocess.PIPE, env=_bcftools_env(), text=True)
+                    assert p1.stdout is not None
+                    out = subprocess.check_output(['sort', '-u'], stdin=p1.stdout, text=True)
+                    p1.wait()
+                    qlines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+                    if len(qlines) == 1:
+                        detected_contig = qlines[0]
+                        # set detected_chr only if it's numeric or chr+numeric
+                        m = re.sub(r'^chr', '', detected_contig, flags=re.IGNORECASE)
+                        if m.isdigit():
+                            detected_chr = int(m)
+            except Exception:
+                detected_chr = None
+                detected_contig = None
+
             meta_early = {
                 'run_id': run_id,
                 'species': species,
-                'chromosome': chromosome,
+                'chromosome': detected_chr if detected_chr is not None else chromosome,
+                'using_contig': detected_contig,
                 'grid': grid_str if isinstance(grid_str, str) else str(grid_str),
                 'uploaded_name': filename,
                 'plots_ready': False,
@@ -1247,10 +1268,30 @@ def analyze():
             # Write minimal meta immediately so page loads have metadata available
             try:
                 meta_path = os.path.join(run_dir, 'result_meta.json')
+                # Try to detect single contig now to prefill the first page
+                detected_chr = None
+                detected_contig = None
+                try:
+                    if _exe_available(BCFTOOLS):
+                        p1 = subprocess.Popen([BCFTOOLS, 'query', '-f', '%CHROM\n', vcf_path], stdout=subprocess.PIPE, env=_bcftools_env(), text=True)
+                        assert p1.stdout is not None
+                        out = subprocess.check_output(['sort', '-u'], stdin=p1.stdout, text=True)
+                        p1.wait()
+                        qlines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+                        if len(qlines) == 1:
+                            detected_contig = qlines[0]
+                            m = re.sub(r'^chr', '', detected_contig, flags=re.IGNORECASE)
+                            if m.isdigit():
+                                detected_chr = int(m)
+                except Exception:
+                    detected_chr = None
+                    detected_contig = None
+
                 meta_early = {
                     'run_id': run_id,
                     'species': species,
-                    'chromosome': chromosome,
+                    'chromosome': detected_chr if detected_chr is not None else chromosome,
+                    'using_contig': detected_contig,
                     'grid': grid_str if isinstance(grid_str, str) else str(grid_str),
                     'uploaded_name': filename,
                     'plots_ready': False,
@@ -1274,12 +1315,77 @@ def analyze():
     #  - If cannot reconcile, show an error listing available contigs
     # --------------------------------------------------------------
     try:
+        # Strict detection using bcftools + sort -u only (per request).
         contigs = []
+        single_contig_auto_ok = None
+
+        if not _exe_available(BCFTOOLS):
+            flash(f"Chromosome detection requires 'bcftools' to be installed and available. Please install/activate bcftools and try again.")
+            try:
+                append_log(run_dir, "Removing run directory due to missing bcftools for chromosome detection")
+                shutil.rmtree(run_dir, ignore_errors=True)
+            except Exception:
+                pass
+            return redirect(url_for('index'))
+
+        # Run: bcftools query -f '%CHROM\n' <vcf> | sort -u
         try:
-            vf_tmp = pysam.VariantFile(vcf_path)
-            contigs = [str(k) for k in vf_tmp.header.contigs.keys()]
-        except Exception:
-            contigs = []
+            p1 = subprocess.Popen([BCFTOOLS, 'query', '-f', '%CHROM\n', vcf_path], stdout=subprocess.PIPE, env=_bcftools_env(), text=True)
+            assert p1.stdout is not None
+            out = subprocess.check_output(['sort', '-u'], stdin=p1.stdout, text=True)
+            p1.wait()
+            if p1.returncode not in (0, None):
+                raise RuntimeError('bcftools query failed')
+            qlines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            uniq = qlines
+            if len(uniq) == 0:
+                flash("Uploaded VCF contains no variant records; provide a VCF with variants.")
+                try:
+                    append_log(run_dir, "Removing run directory due to empty VCF (no variants)")
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                return redirect(url_for('index'))
+            if len(uniq) > 1:
+                shown = uniq[:20]
+                flash(f"This tool requires VCF data from a single chromosome. Uploaded VCF contains multiple chromosomes: {', '.join(shown)}{'...' if len(uniq)>20 else ''}")
+                try:
+                    append_log(run_dir, "Removing run directory due to multi-chromosome VCF")
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                return redirect(url_for('index'))
+            # Single contig found via bcftools+sort: use it and continue
+            contigs = [uniq[0]]
+            # Decide whether it's safe to auto-override a user-supplied numeric chromosome.
+            try:
+                c = uniq[0]
+                if re.match(r'^(?:chr)?\d+$', c, flags=re.IGNORECASE) or re.match(r'^(?:chr)?(?:X|Y|MT|M)$', c, flags=re.IGNORECASE):
+                    single_contig_auto_ok = True
+                    # Note detected contig; do NOT overwrite user input here.
+                    append_log(run_dir, f"Detected single contig via bcftools: {c} (will not override user selection here)")
+                else:
+                    single_contig_auto_ok = False
+                    flash(f"Uploaded VCF has a single contig named '{c}', which is non-standard. Please ensure you select the intended chromosome in the form; no auto-selection was performed.")
+            except Exception:
+                single_contig_auto_ok = None
+        except subprocess.TimeoutExpired:
+            flash("Chromosome detection timed out (bcftools). Try again or ensure bcftools is functional.")
+            try:
+                append_log(run_dir, "Removing run directory due to bcftools timeout")
+                shutil.rmtree(run_dir, ignore_errors=True)
+            except Exception:
+                pass
+            return redirect(url_for('index'))
+        except Exception as e:
+            flash(f"Chromosome detection failed: {e}")
+            try:
+                append_log(run_dir, f"Removing run directory due to bcftools detection error: {e}")
+                shutil.rmtree(run_dir, ignore_errors=True)
+            except Exception:
+                pass
+            return redirect(url_for('index'))
+
         if contigs:
             contig_set = set(contigs)
             numeric_str = str(chromosome)
@@ -1290,15 +1396,22 @@ def analyze():
             elif chr_pref in contig_set:
                 chosen_contig = chr_pref
             else:
-                # Attempt to find a single distinct contig if only one present
-                if len(contigs) == 1:
+                # Attempt to find a single distinct contig if only one present and auto-override allowed
+                if len(contigs) == 1 and (single_contig_auto_ok is None or single_contig_auto_ok):
                     chosen_contig = contigs[0]
-                    append_log(run_dir, f"Auto-overriding chromosome {chromosome} -> {chosen_contig} (single contig in VCF)")
+                    # Record that a single contig was detected; do not log an assertion of overriding.
+                    append_log(run_dir, f"Single-contig VCF detected: using_contig={chosen_contig}")
                 else:
                     # Try to strip 'chr' prefixes and compare
                     stripped_map = {c[3:]: c for c in contigs if isinstance(c, str) and c.lower().startswith('chr') and len(c) > 3}
                     if numeric_str in stripped_map:
                         chosen_contig = stripped_map[numeric_str]
+                    # If still unresolved, see if first record CHROM matches any contig entry
+                    if chosen_contig is None and first_record_chrom:
+                        if first_record_chrom in contig_set:
+                            chosen_contig = first_record_chrom
+                        elif first_record_chrom.lower().startswith('chr') and first_record_chrom[3:] in stripped_map:
+                            chosen_contig = stripped_map[first_record_chrom[3:]]
             if chosen_contig is None:
                 # Could not reconcile; present helpful error if mismatch likely
                 # (Only if user selection not among available options and not single contig case already handled)
@@ -1316,9 +1429,39 @@ def analyze():
                 # Normalize chromosome directory name (drop leading 'chr' if present) for model path usage later
                 chosen_contig_str = str(chosen_contig)
                 model_chr = re.sub(r'^chr', '', chosen_contig_str, flags=re.IGNORECASE)
+                # Only override the user's provided chromosome if they left the field empty
                 if model_chr.isdigit():
-                    chromosome = int(model_chr)
+                    if not user_chrom_input:
+                        chromosome = int(model_chr)
+                        append_log(run_dir, f"Auto-filled chromosome from VCF: using_contig={chosen_contig} -> model_dir_component={chromosome}")
+                    else:
+                        # Only log the 'not overriding' decision when the detected contig
+                        # differs from the user's explicit selection; avoid noisy duplicate logs
+                        try:
+                            u_norm = str(user_chrom_input).lower() if user_chrom_input is not None else ''
+                            c_norm = str(chosen_contig).lower() if chosen_contig is not None else ''
+                        except Exception:
+                            u_norm = str(user_chrom_input) if user_chrom_input is not None else ''
+                            c_norm = str(chosen_contig) if chosen_contig is not None else ''
+                        if u_norm != c_norm:
+                            append_log(run_dir, f"Detected contig {chosen_contig}, but user selected {user_chrom_input}; not overriding user choice")
                 append_log(run_dir, f"Chromosome validated/inferred: user={user_chrom_input} -> using_contig={chosen_contig} -> model_dir_component={chromosome}")
+                # Update early metadata so the UI can reflect the detected chromosome
+                try:
+                    meta_path = os.path.join(run_dir, 'result_meta.json')
+                    if os.path.exists(meta_path):
+                        try:
+                            with open(meta_path, 'r', encoding='utf-8') as mf:
+                                meta_json = json.load(mf)
+                        except Exception:
+                            meta_json = {}
+                        meta_json['chromosome'] = chromosome
+                        meta_json['using_contig'] = str(chosen_contig)
+                        with open(meta_path, 'w', encoding='utf-8') as mf:
+                            json.dump(meta_json, mf)
+                except Exception:
+                    pass
+                # Do not flash a user-visible message here; UI will read result_meta.json to show the detected chromosome.
     except Exception as ce:
         append_log(run_dir, f"Chromosome inference warning: {ce}")
 
@@ -2504,35 +2647,55 @@ def upload():
     file.save(vcf_path)
     append_log(run_dir, f"Staged upload saved: {fname} ({os.path.getsize(vcf_path)} bytes)")
     touch_run(run_id)
-    # Inspect VCF header contigs immediately and return them so the UI can react
+    # Inspect VCF chromosomes using the bcftools pipeline the UI expects
+    # Preferred command: bcftools query -f '%CHROM\n' <vcf>  (we enumerate unique values in Python)
     contigs = []
     suggested = None
     try:
-        try:
-            vf = pysam.VariantFile(vcf_path)
-            contigs = [str(k) for k in vf.header.contigs.keys()]
-        except Exception:
-            contigs = []
+        if _exe_available(BCFTOOLS):
+            try:
+                proc = subprocess.run([BCFTOOLS, 'query', '-f', '%CHROM\\n', vcf_path], capture_output=True, text=True, env=_bcftools_env(), timeout=30)
+                if proc.returncode == 0:
+                    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+                    # sort-unique semantics: stable sort of unique set
+                    contigs = sorted(list(dict.fromkeys(lines)))
+                else:
+                    append_log(run_dir, f"bcftools query failed during upload inspection: rc={proc.returncode} stderr={proc.stderr}")
+                    contigs = []
+            except Exception as be:
+                append_log(run_dir, f"bcftools query raised during upload inspection: {be}")
+                contigs = []
+        # Fallback to header contigs via pysam if bcftools unavailable or produced no output
+        if not contigs:
+            try:
+                vf = pysam.VariantFile(vcf_path)
+                contigs = [str(k) for k in vf.header.contigs.keys()]
+            except Exception:
+                contigs = []
+
+        # Decide on a suggested chromosome only when there's exactly one clear contig
         if contigs:
             if len(contigs) == 1:
-                # normalize suggestion to stripped form
-                suggested = contigs[0].replace('chr', '') if isinstance(contigs[0], str) and contigs[0].lower().startswith('chr') else contigs[0]
+                c0 = contigs[0]
+                # Normalize suggested form for UI: strip leading 'chr' if present
+                if isinstance(c0, str) and c0.lower().startswith('chr'):
+                    suggested = c0[3:]
+                else:
+                    suggested = c0
             else:
-                # prefer plain numeric contig '1' over 'chr1' when present
-                # normalize contig list for suggestion checks
-                contig_norm = [c.replace('chr', '') if isinstance(c, str) and c.lower().startswith('chr') else c for c in contigs]
+                # Prefer a plain numeric '1' suggestion if present; otherwise, no automatic suggestion
+                contig_norm = [c[3:] if isinstance(c, str) and c.lower().startswith('chr') else c for c in contigs]
                 if '1' in contig_norm:
                     suggested = '1'
                 else:
-                    # As fallback, pick the first normalized contig
-                    suggested = contig_norm[0] if contig_norm else None
+                    suggested = None
     except Exception as e:
         append_log(run_dir, f"Upload-time contig inspection failed: {e}")
 
-    # Return contigs normalized (strip 'chr') for UI convenience but keep original filename
-    contigs_norm = [c.replace('chr', '') if isinstance(c, str) and c.lower().startswith('chr') else c for c in contigs]
+    # Return contigs normalized (strip leading 'chr') for UI convenience but keep original filename
+    contigs_norm = [c[3:] if isinstance(c, str) and c.lower().startswith('chr') else c for c in contigs]
     payload = {'run_id': run_id, 'filename': fname, 'contigs': contigs_norm}
-    if suggested:
+    if suggested is not None:
         payload['suggested_chromosome'] = suggested
     return json.dumps(payload), 200, {'Content-Type': 'application/json'}
 
