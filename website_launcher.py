@@ -54,6 +54,40 @@ app = Flask(__name__)
 app.config.update(MAX_CONTENT_LENGTH=MAX_CONTENT, SECRET_KEY=os.urandom(16))
 os.makedirs(RUNS_DIR, exist_ok=True)
 
+
+@app.route('/ext_gene_link')
+def ext_gene_link():
+    """Redirect helper: given a gene label and optional gene_id and species,
+    choose a safe external page and redirect the browser there. This centralizes
+    sanitization and avoids exposing problematic query parameters to clients.
+
+    Params: label, gene_id, species
+    """
+    label = (request.args.get('label') or '').strip()
+    gene_id = (request.args.get('gene_id') or '').strip()
+    species = (request.args.get('species') or '').strip()
+    # Sanitize: keep only alnum, whitespace, underscore, hyphen
+    def clean(s):
+        return re.sub(r'[^A-Za-z0-9_\-\s]+', ' ', s or '').strip()
+
+    cleaned = clean(label) or clean(gene_id) or 'gene'
+    q = re.sub(r'\s+', ' ', cleaned)
+    q_enc = q.replace(' ', '+')
+    # Prefer GeneCards search by default
+    target = f'https://www.genecards.org/Search/Keyword?query={q_enc}'
+    # If the gene_id looks like an Ensembl id, prefer Ensembl search/summary
+    if gene_id and re.match(r'^ENS[A-Z0-9]+', gene_id, re.IGNORECASE):
+        sp = species.replace(' ', '_') if species else ''
+        # Ensembl search results URL or direct summary when gene_id known
+        if sp:
+            target = f'https://www.ensembl.org/{sp}/Gene/Summary?g={gene_id}'
+        else:
+            target = f'https://www.ensembl.org/Search/Results?q={gene_id}'
+    # Fallback to NCBI gene search if label was extremely unusual
+    if not re.search(r'[A-Za-z0-9]', cleaned):
+        target = f'https://www.ncbi.nlm.nih.gov/gene/?term={q_enc}'
+    return redirect(target, code=302)
+
 _run_last_seen = {}
 _scheduled_cleanup = {}
 

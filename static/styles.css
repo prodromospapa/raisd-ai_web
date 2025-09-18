@@ -41,13 +41,17 @@ body.dark .plot{ border-color:var(--border); }
 .genes-scroll{ max-height:260px; overflow-y:auto; border:1px solid var(--border); border-radius:10px; margin-top:8px; background:var(--card); }
 .genes-scroll table{ margin:0; width:100%; border-collapse:collapse; }
 .genes-scroll thead th{ position:sticky; top:0; background:color-mix(in srgb, var(--card) 85%, var(--bg) 15%); z-index:1; }
-.genes-scroll tbody tr:hover{ background:color-mix(in srgb, var(--accent) 30%, var(--card) 70%); }
-/* Active gene rows highlighted when hovering plot position */
-.genes-scroll tbody tr.gene-active{ background:color-mix(in srgb, var(--accent) 55%, var(--card) 45%) !important; box-shadow:inset 0 0 0 1px var(--accent); }
+/* Active gene rows highlighted when hovering plot position. The actual
+	colors are driven by CSS variables --accent-hover and --accent-active so
+	JS can set them to exact rgba(...) to match Plotly highlight shapes. */
+.genes-scroll tbody tr:hover{ background: var(--accent-hover, color-mix(in srgb, var(--accent) 30%, var(--card) 70%)); }
+.genes-scroll tbody tr.gene-active{ background: var(--accent-active, color-mix(in srgb, var(--accent) 55%, var(--card) 45%)) !important; box-shadow:inset 0 0 0 1px var(--accent); }
 /* Genes table grid */
 #genesTbl{ border-collapse:separate; border-spacing:0; }
 #genesTbl th, #genesTbl td{ border:1px solid var(--border); }
 #genesTbl th{ font-weight:600; }
+#genesTbl thead th[role="button"]{ outline: none; }
+#genesTbl thead th[role="button"]:focus{ box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent 78%); border-radius:6px; }
 #genesTbl th:first-child, #genesTbl td:first-child{ border-left:0; }
 #genesTbl tr:first-child th{ border-top:0; }
 

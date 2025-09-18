@@ -447,9 +447,15 @@ if __name__=="__main__":
                     pass
 
         # Write manifest
+        # NOTE: per user request, do NOT create or update versions.json files.
+        # The original behaviour wrote a `versions.json` manifest listing
+        # processed Ensembl releases. To avoid creating this file at all,
+        # skip writing it here. If in future you need to enable writing,
+        # reintroduce the write behind an explicit flag.
         try:
-            manifest_path = Path(base_annot_dir) / "versions.json"
-            manifest_path.write_text(json.dumps({"ensembl_versions": processed}, indent=2), encoding='utf-8')
-            print(f"Wrote versions manifest: {manifest_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to write versions manifest: {e}", file=sys.stderr)
+            # Intentionally skip writing versions.json to avoid creating the file.
+            pass
+        except Exception:
+            # keep original behaviour of not failing the whole run if manifest
+            # writing would fail — but since we don't write, nothing to do.
+            pass
