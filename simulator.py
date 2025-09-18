@@ -3056,10 +3056,10 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
 
         # genic (h≈0.5) - SAa is heterozygote effect, SAA is homozygote
         sel_args += ['-SAa', str(a), '-SAA', str(2.0 * a)]
-        # selected site position + mark it in output
+        # selected site position
         if x is None:
             x = 0.5
-        sel_args += ['-Sp', str(x), '-Smark']
+        sel_args += ['-Sp', str(x)]
 
         # Derive origin time (backwards) and handle fixation-time / sweep_time semantics.
         # Approx fixation duration in coalescent units (duration from origin to fixation):
@@ -4123,10 +4123,8 @@ def _run_simulation_core(args):
                 base_spw = 1
             try:
                 rem = total_reps_loc - base_spw * threads_loc
-                if rem > 0:
-                    sys.stderr.write(f"# INFO: --sims-per-work not provided; splitting {total_reps_loc} replicates into {threads_loc} parts (base {base_spw}, remainder {rem} added to last part).\n")
-                else:
-                    sys.stderr.write(f"# INFO: --sims-per-work not provided; splitting {total_reps_loc} replicates into {threads_loc} equal parts of {base_spw}.\n")
+                # Intentionally do not print autosplit info; keep silent.
+                _ = rem
             except Exception:
                 pass
         # If user provided a value, validate and cap it (msprime remains None)
@@ -6648,6 +6646,74 @@ def _run_simulation_core(args):
         if raw_neut is None:
             sys.stderr.write('# ERROR: failed to extract neutral command line; skipping neutral run.\n')
         else:
+            # Sanitize the extracted neutral command to ensure no sweep/selection
+            # arguments are accidentally forwarded to the neutral run. This is a
+            # defensive cleanup: builders normally avoid adding sel flags when
+            # called for neutral runs, but sanitize here to catch any stray
+            # selection tokens (especially when switching engines between
+            # primary and neutral) before tokenizing and executing.
+            def _sanitize_neutral_line(engine_name, line):
+                try:
+                    toks = shlex.split(line)
+                except Exception:
+                    return line
+                # Remove discoal selection flags: -ws <t>, -x <pos>, -a <2Ns>
+                def _strip_discoal_ts(ts):
+                    out = []
+                    i = 0
+                    flags = {'-ws': 1, '-x': 1, '-a': 1}
+                    while i < len(ts):
+                        t = ts[i]
+                        if t in flags:
+                            i += 1 + flags[t]
+                            continue
+                        out.append(t)
+                        i += 1
+                    return out
+
+                # Remove common msms selection flags: -SAa, -SAA, -Sp, -Smark, -SI, -SFC
+                def _strip_msms_ts(ts):
+                    out = []
+                    i = 0
+                    one_arg = {'-SAa', '-SAA', '-Sp'}
+                    while i < len(ts):
+                        t = ts[i]
+                        if t in one_arg:
+                            i += 2
+                            continue
+                        if t == '-Smark' or t == '-SFC':
+                            i += 1
+                            continue
+                        if t == '-SI':
+                            # structure: -SI <tstart> <npop> <f1> ... <fN>
+                            j = i + 1
+                            if j + 1 < len(ts):
+                                j += 2
+                                try:
+                                    npop_val = int(ts[i + 2])
+                                except Exception:
+                                    npop_val = 0
+                                j += max(0, npop_val)
+                            i = j
+                            continue
+                        out.append(t)
+                        i += 1
+                    return out
+
+                if engine_name == 'discoal':
+                    toks = _strip_discoal_ts(toks)
+                elif engine_name == 'msms':
+                    toks = _strip_msms_ts(toks)
+                elif engine_name == 'ms':
+                    # ms is neutral-only but defensively remove selection-like tokens
+                    toks = [t for t in toks if t not in ('-Smark','-SFC','-Sp','-SI','-SAa','-SAA','-ws','-x','-a')]
+                return ' '.join(toks)
+
+            try:
+                raw_neut = _sanitize_neutral_line(neut_engine, raw_neut)
+            except Exception:
+                # If sanitization fails, continue with the original extracted line
+                pass
             # Run neutral simulation with its own progress bar if requested
             try:
                 neut_tokens = shlex.split(raw_neut)

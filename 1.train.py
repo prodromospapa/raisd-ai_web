@@ -6,6 +6,7 @@ import shutil
 import argparse
 import time
 import json
+from datetime import datetime
 
 # default thread count (safe when os.cpu_count() returns None)
 # CLI: accept species as stdpopsim id or full name (e.g. 'HomSap' or 'Homo sapiens')
@@ -28,8 +29,8 @@ parser.add_argument("--epochs", type=int, default=3,
                     help="Training epochs for RAiSD-AI (default 3)")
 parser.add_argument("--gpu", action='store_true', default=False,
                     help="Enable GPU mode for simulator/training when supported")
-parser.add_argument("--parallel", type=int, default=max(1, os.cpu_count() // 2),
-                    help=f"Parallel worker count for simulator runs (default {max(1, os.cpu_count() // 2)})")
+parser.add_argument("--parallel", type=int, default=None,
+                    help="Parallel worker count for simulator runs (default: half of CPUs)")
 parser.add_argument("--engine", type=str, default="msms",
                     help="Simulation engine to use (default: msms)")
 args = parser.parse_args()
@@ -44,12 +45,18 @@ ips = args.ips
 iws = args.iws
 epochs = args.epochs
 gpu = args.gpu
-parallel = args.parallel
+# compute a safe default for parallel if not provided
+if args.parallel is None:
+    parallel = max(1, (os.cpu_count() or 2) // 2)
+else:
+    parallel = args.parallel
 engine = args.engine
 
 
 def run_subprocess(args, cwd, desc):
     """Run a subprocess, capture output, exit script on failure with detailed message."""
+    # Run the subprocess and return CompletedProcess on success.
+    # On CalledProcessError raise the exception to allow callers to decide retry/recording.
     try:
         return subprocess.run(
             args,
@@ -60,15 +67,35 @@ def run_subprocess(args, cwd, desc):
             text=True,
         )
     except subprocess.CalledProcessError as e:
+        # Print a compact error message for immediate visibility, then re-raise
         print(
             f"\n===== SUBPROCESS ERROR: {desc} =====\n"
             f"Command: {' '.join(args)}\n"
-            f"Return code: {e.returncode}\n"
-            f"STDOUT:\n{e.stdout or '(empty)'}\n"
-            f"STDERR:\n{e.stderr or '(empty)'}\n"
+            f"Return code: {getattr(e, 'returncode', 'N/A')}\n"
+            f"STDOUT:\n{getattr(e, 'stdout', '(empty)') or '(empty)'}\n"
+            f"STDERR:\n{getattr(e, 'stderr', '(empty)') or '(empty)'}\n"
             f"===================================\n"
         )
-        raise SystemExit(1)
+        raise
+
+
+def record_failed(key, reason, source="1.train"):
+    """Append a failure record to data/{species_folder_name}/failed_parts.jsonl"""
+    failed_dir = os.path.join("data", species_folder_name)
+    os.makedirs(failed_dir, exist_ok=True)
+    failed_path = os.path.join(failed_dir, "failed_parts.jsonl")
+    record = {
+        "key": key,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": reason,
+        "source": source,
+    }
+    try:
+        with open(failed_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        # If recording fails, at least print to stderr so user can take action
+        print(f"Failed to write failed_parts entry for {key}: {reason}")
 
 
 def run_simulation(engine,species_id,model_id,population,train_sample_individuals,window,ips,iws,chromosome,train_replicates,sel_s):
@@ -98,7 +125,7 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
     # run inside the target directory; if it fails, retry once using discoal and add --sweep-time (in generations)
     try:
         run_subprocess(args, out_dir, f"simulation {model_id}/{population}/{chromosome}")
-    except SystemExit:
+    except subprocess.CalledProcessError:
         # prepare alternative args: switch engine to discoal and add sweep-time arg (only for this run)
         alt_args = args.copy()
         if "--engine" in alt_args:
@@ -114,10 +141,12 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
             # Use 400 generations as a conservative fallback for the retry.
             alt_args.extend(["--sweep-time", "400"])
 
-        #print(f"Engine '{engine}' failed for {model_id}/{population}/{chromosome}; retrying once with 'discoal' and --sweep-time 0.01")
-        run_subprocess(alt_args, out_dir, f"simulation {model_id}/{population}/{chromosome} (discoal retry)")
-        # Report retry success via stdout. Do not write log files.
-        print(f"Engine '{engine}' failed for {model_id}/{population}/{chromosome}; retry succeeded with 'discoal' and --sweep-time.")
+        try:
+            run_subprocess(alt_args, out_dir, f"simulation {model_id}/{population}/{chromosome} (discoal retry)")
+            print(f"Engine '{engine}' failed for {model_id}/{population}/{chromosome}; retry succeeded with 'discoal' and --sweep-time.")
+        except subprocess.CalledProcessError:
+            # Let caller handle recording the failure
+            raise
 
 def get_info(model_id,population,chromosome):
     out_dir = os.path.join(os.getcwd(), "data", species_folder_name, str(model_id), str(population), str(chromosome))
@@ -277,35 +306,83 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                     first = False
                     # already counted in initial; just continue
                     continue
-                try: 
+                try:
                     if first:
                         pass
                     first = False
                     sweep_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep.ms"
                     neutral_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/neutral.ms"
                     if not os.path.exists(sweep_path) or not os.path.exists(neutral_path):
-                        run_simulation(engine, species_id, model_id, population, train_sample_individuals, window, ips, iws, chromosome, train_replicates, sel_s)
-                        
+                        try:
+                            run_simulation(engine, species_id, model_id, population, train_sample_individuals, window, ips, iws, chromosome, train_replicates, sel_s)
+                        except subprocess.CalledProcessError as e:
+                            reason = f"simulation_error {getattr(e, 'returncode', 'N/A')}"
+                            # include a snippet of stderr if available
+                            try:
+                                stderr = getattr(e, 'stderr', '') or ''
+                                if stderr:
+                                    reason += f": {stderr.strip()[:200]}"
+                            except Exception:
+                                pass
+                            # record failure and skip further processing for this key
+                            record_failed(key, reason, source="1.train")
+                            existing_skipped.add(key)
+                            continue
+
                     for type_ in ["sweep", "neutral"]:
-                        if type_ == "sweep":
-                            params, selection = get_info(model_id, population, chromosome)
-                            sweep_bp = selection.get("sweep_bp")
-                            length = params.get("length")
-                            with open(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt", 'w') as f:
-                                f.write(f"sweep_bp: {sweep_bp}\nlength: {length}\n")
-                        else:
-                            with open(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt", 'r') as f:
-                                lines = f.readlines()
-                                sweep_bp = int(lines[0].strip().split(": ")[1])
-                                length = int(lines[1].strip().split(": ")[1])
+                        try:
+                            if type_ == "sweep":
+                                params, selection = get_info(model_id, population, chromosome)
+                                sweep_bp = selection.get("sweep_bp")
+                                length = params.get("length")
+                                with open(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt", 'w') as f:
+                                    f.write(f"sweep_bp: {sweep_bp}\nlength: {length}\n")
+                            else:
+                                with open(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt", 'r') as f:
+                                    lines = f.readlines()
+                                    sweep_bp = int(lines[0].strip().split(": ")[1])
+                                    length = int(lines[1].strip().split(": ")[1])
 
-                        img_info = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Images.bin/{type_}TR"
-                        if not os.path.exists(img_info):
-                            ms2bin(model_id, population, window, ips, iws, chromosome, type_, sweep_bp, length)
-                        if type_ == "neutral":
-                            os.remove(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt")
+                            img_info = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Images.bin/{type_}TR"
+                            if not os.path.exists(img_info):
+                                try:
+                                    ms2bin(model_id, population, window, ips, iws, chromosome, type_, sweep_bp, length)
+                                except subprocess.CalledProcessError as e:
+                                    reason = f"ms2bin_error {getattr(e, 'returncode', 'N/A')}"
+                                    try:
+                                        stderr = getattr(e, 'stderr', '') or ''
+                                        if stderr:
+                                            reason += f": {stderr.strip()[:200]}"
+                                    except Exception:
+                                        pass
+                                    record_failed(key, reason, source="1.train")
+                                    existing_skipped.add(key)
+                                    raise
+                            if type_ == "neutral":
+                                os.remove(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt")
+                        except Exception:
+                            # If any per-type processing fails, ensure we break out to outer loop
+                            break
 
-                    train_model(model_id, population, chromosome, epochs)
+                    # If we reached here without adding the key to skipped, proceed to training
+                    if key in existing_skipped:
+                        # already recorded as failed by earlier step
+                        continue
+
+                    try:
+                        train_model(model_id, population, chromosome, epochs)
+                    except subprocess.CalledProcessError as e:
+                        reason = f"training_error {getattr(e, 'returncode', 'N/A')}"
+                        try:
+                            stderr = getattr(e, 'stderr', '') or ''
+                            if stderr:
+                                reason += f": {stderr.strip()[:200]}"
+                        except Exception:
+                            pass
+                        record_failed(key, reason, source="1.train")
+                        existing_skipped.add(key)
+                        continue
+
                     img_bin = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Images.bin"
                     if os.path.exists(img_bin):
                         shutil.rmtree(img_bin)
