@@ -372,8 +372,8 @@ def sfs_from_bcftools(vcf_path, samples, bcftools=BCFTOOLS):
 # ---------------------- Gene annotation helpers ----------------------
 ANNOTATION_DIR_TMPL = os.path.join(DATA_DIR, "{species}", "annotation", "{chr}.tsv")
 
-@lru_cache(maxsize=64)
-def _load_annotation(species: str, chromosome: str) -> pd.DataFrame:
+@lru_cache(maxsize=256)
+def _load_annotation(species: str, chromosome: str, ensembl_version: Optional[str] = None) -> pd.DataFrame:
     # Accept a few common species folder name variants so callers may pass
     # either 'Homo sapiens' or 'Homo_sapiens'. Try the provided species
     # value first, then fall back to underscore/space variants.
@@ -390,19 +390,33 @@ def _load_annotation(species: str, chromosome: str) -> pd.DataFrame:
     # normalize case-preserving duplicates removed
     seen = set()
     tried_paths = []
+    # If an explicit ensembl_version was requested, prefer files under
+    # annotation/ensembl_<version>/<chr>.tsv, falling back to legacy paths.
+    ver_variants = []
+    if ensembl_version:
+        ver_variants.append(os.path.join('{species}', 'annotation', f'ensembl_{ensembl_version}', '{chr}.tsv'))
+    # Always try the legacy single annotation directory patterns too
+    ver_variants.append(os.path.join('{species}', 'annotation', '{chr}.tsv'))
+
     for cand in candidates:
         if not cand or cand in seen:
             continue
         seen.add(cand)
-        path = ANNOTATION_DIR_TMPL.format(species=cand, chr=str(chromosome))
-        tried_paths.append(path)
-        if os.path.exists(path):
-            try:
-                df = pd.read_csv(path, sep="\t", dtype={"chromosome": str})
-                app.logger.info(f"Loaded annotation file: {_shorten_path(path)}")
-            except Exception as read_e:
-                app.logger.exception(f"Failed to read annotation file {_shorten_path(path)}: {read_e}")
-                raise
+        found = False
+        # Try versioned then legacy variants
+        for vt in ver_variants:
+            path = os.path.join(DATA_DIR, vt.format(species=cand, chr=str(chromosome)))
+            tried_paths.append(path)
+            if os.path.exists(path):
+                try:
+                    df = pd.read_csv(path, sep="\t", dtype={"chromosome": str})
+                    app.logger.info(f"Loaded annotation file: {_shorten_path(path)}")
+                except Exception as read_e:
+                    app.logger.exception(f"Failed to read annotation file {_shorten_path(path)}: {read_e}")
+                    raise
+                found = True
+                break
+        if found:
             break
     else:
         tried_short = [ _shorten_path(p) for p in tried_paths ]
@@ -428,9 +442,13 @@ def _load_annotation(species: str, chromosome: str) -> pd.DataFrame:
     gene_level["end"] = gene_level["end"].astype(int)
     return gene_level
 
-def _genes_in_window(species: str, chromosome: str, start: int, end: int, biotype: Optional[str] = None) -> pd.DataFrame:
+def _genes_in_window(species: str, chromosome: str, start: int, end: int, biotype: Optional[str] = None, ensembl_version: Optional[str] = None) -> pd.DataFrame:
     lo, hi = (int(start), int(end)) if start <= end else (int(end), int(start))
-    genes = _load_annotation(species, str(chromosome))
+    # Default behaviour uses no explicit ensembl version. Callers may pass
+    # species values like 'Homo_sapiens' or include an explicit version as
+    # a suffix (handled upstream). This function remains simple and callers
+    # should request specific versions via the genes endpoint.
+    genes = _load_annotation(species, str(chromosome), ensembl_version=ensembl_version)
     genes_chr = genes[genes["chromosome"].astype(str) == str(chromosome)].copy()
     hits = genes_chr[(genes_chr["start"] <= hi) & (genes_chr["end"] >= lo)].copy()
     if biotype:
@@ -2592,8 +2610,10 @@ def genes_endpoint():
         return json.dumps({'error': 'start and end must be numbers'}), 400, {'Content-Type': 'application/json'}
 
     try:
+        # Optional ensembl_version param to select which annotation set to use
+        ensembl_version = (request.args.get('ensembl_version') or '').strip() or None
         # Load all hits first to derive available biotypes, then filter locally
-        all_hits = _genes_in_window(species, chromosome, start_i, end_i, biotype=None)
+        all_hits = _genes_in_window(species, chromosome, start_i, end_i, biotype=None, ensembl_version=ensembl_version)
         # Available biotypes for UI (as native strings)
         available_biotypes = sorted({str(b) for b in all_hits['biotype'] if pd.notna(b)})
         if biotypes:
@@ -2633,6 +2653,45 @@ def genes_endpoint():
         'genes': hits.to_dict(orient='records'),
     }
     return json.dumps(payload), 200, {'Content-Type': 'application/json'}
+
+
+@app.route('/annotation_versions', methods=['GET'])
+def annotation_versions():
+    """Return available Ensembl versions for a species.
+
+    Looks for data/<species>/annotation/versions.json and returns its contents if present.
+    Otherwise scans subdirectories under data/<species>/annotation/ for folders named ensembl_<v>.
+    """
+    species = (request.args.get('species') or '').strip()
+    if not species:
+        return json.dumps({'error': 'species required'}), 400, {'Content-Type': 'application/json'}
+    base = os.path.join(DATA_DIR, species, 'annotation')
+    manifest = os.path.join(base, 'versions.json')
+    versions = []
+    try:
+        if os.path.exists(manifest):
+            with open(manifest, 'r', encoding='utf-8') as f:
+                j = json.load(f)
+                versions = j.get('ensembl_versions') or []
+        else:
+            # scan directories — only include purely numeric releases (ensembl_<digits>)
+            if os.path.isdir(base):
+                for name in os.listdir(base):
+                    m = re.match(r'^ensembl_(\d+)$', name)
+                        
+                    if m:
+                        versions.append(m.group(1))
+        # Sort numerically when possible so the latest release is last
+        def _num_key(s):
+            try:
+                return int(s)
+            except Exception:
+                return float('inf')
+        versions = sorted([str(v) for v in versions], key=_num_key)
+    except Exception as e:
+        app.logger.exception(f"annotation_versions error for species={species}: {e}")
+        return json.dumps({'error': str(e)}), 500, {'Content-Type': 'application/json'}
+    return json.dumps({'species': species, 'ensembl_versions': versions}), 200, {'Content-Type': 'application/json'}
 
 @app.route('/upload', methods=['POST'])
 def upload():
