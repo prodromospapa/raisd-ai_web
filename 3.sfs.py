@@ -9,12 +9,13 @@ from tqdm import tqdm
 species = "Homo sapiens"
 engine ="msprime"
 chromosome = "1"
-samples = 10_000
 replicates = 10
 main_parallel = 5
 max_ram_percent = 80
 max_sims_per_work = 1 # can be None
 
+samples = 100
+testing = True # Set to True for testing mode
 
 
 species_dict = {sp.name: sp.id for sp in stdpopsim.all_species()}
@@ -33,15 +34,31 @@ demographic_models = {
     for m in species_std.demographic_models
 }
 
-if os.path.exists(f"data/{species_folder_name}/sfs.csv"):
-    sfs_csv = pd.read_csv(f"data/{species_folder_name}/sfs.csv",index_col=0)
+# Ensure 'testing' is defined (default to False)
+if "testing" not in globals():
+    testing = False
+if testing: 
+    print(f"Running in testing mode with sample size {samples}")
+    file_name = f"testing/{species}_{samples}.csv"
+else:
+    print(f"Running in training mode with sample size {samples}")
+    file_name = f"data/{species_folder_name}/sfs.csv"
+
+if os.path.exists(file_name):
+    sfs_csv = pd.read_csv(file_name,index_col=0)
     samples = (sfs_csv.shape[1] // ploidy)+1
 else:
-    os.makedirs(f"data/{species_folder_name}", exist_ok=True)
+    if testing:
+        os.makedirs("testing", exist_ok=True)
+    else:
+        os.makedirs(f"data/{species_folder_name}", exist_ok=True)
     sfs_csv = pd.DataFrame(columns= range(1,ploidy*(samples)))
 
 # Load existing failed keys so we can skip them
-failed_path = f"data/{species_folder_name}/failed_parts.jsonl"
+if testing:
+    failed_path = "failed_parts.jsonl"
+else:
+    failed_path = f"data/{species_folder_name}/failed_parts.jsonl"
 failed_keys = set()
 if os.path.exists(failed_path):
     try:
@@ -95,6 +112,7 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
                 "--sfs-normalized",
                 "--max-ram-percent", str(max_ram_percent),
             ]
+
             if max_sims_per_work is not None:
                 base_args += ["--sims-per-work", str(max_sims_per_work)]
             first = True
@@ -170,7 +188,7 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
                         reason = "all_zero_sfs"
                         break
                     sfs_csv.loc[f"{model_id}={population}"] = values
-                    sfs_csv.to_csv(f"data/{species_folder_name}/sfs.csv")
+                    sfs_csv.to_csv(file_name)
                     done = True
                     break
 
@@ -238,7 +256,10 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
 
             if not done:
                 # Record failure for this model/population
-                failed_dir = f"data/{species_folder_name}"
+                if testing:
+                    failed_dir = "."
+                else:
+                    failed_dir = f"data/{species_folder_name}"
                 os.makedirs(failed_dir, exist_ok=True)
                 failed_path = os.path.join(failed_dir, "failed_parts.jsonl")
                 record = {
