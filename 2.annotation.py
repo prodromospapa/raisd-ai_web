@@ -128,7 +128,7 @@ if __name__=="__main__":
                 with urllib.request.urlopen(url, timeout=20) as r:
                     html = r.read().decode('utf-8', 'ignore')
                 # find first .gtf.gz file link
-                m = re.search(r'href=["\']([^"\']+\.gtf\.gz)["\']', html, flags=re.IGNORECASE)
+                m = re.search(fr'href=["\']([^"\']+\.{re.escape(release)}\.gtf\.gz)["\']', html, flags=re.IGNORECASE)
                 if m:
                     filepart = m.group(1)
                     if filepart.startswith('http'):
@@ -281,8 +281,7 @@ if __name__=="__main__":
             except Exception:
                 pass
 
-        # concise completion
-        print(f"Downloaded ensembl_{release}")
+        # completion: return silently (no final printed message requested)
         return True
 
     # Load or create a small local cache of releases we've already checked so

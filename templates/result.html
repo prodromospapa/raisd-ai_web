@@ -162,7 +162,7 @@
   <h3>Genes in selected window <button id="genesResetBtn" type="button" style="display:none; margin-left:8px; font-size:12px; padding:4px 10px;">Reset</button></h3>
       <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
         <label for="ensemblVersionSelect" style="margin:0; font-size:13px;">Ensembl version:</label>
-        <select id="ensemblVersionSelect"><option value="">(default)</option></select>
+        <select id="ensemblVersionSelect"></select>
       </div>
       <div class="genes-scroll">
         <table id="genesTbl" border="0" cellpadding="4" cellspacing="0">
@@ -238,9 +238,9 @@
         if(!r.ok) return;
         return r.json().then(j => {
           if(!j || !Array.isArray(j.ensembl_versions)) return;
-          // Clear extras but keep default option
+          // Clear extras; selector will be repopulated with versions only
           const cur = sel.value;
-          sel.innerHTML = '<option value="">(default)</option>';
+          sel.innerHTML = '';
           j.ensembl_versions.forEach(v => {
             const opt = document.createElement('option'); opt.value = v; opt.textContent = v; sel.appendChild(opt);
           });
@@ -539,6 +539,18 @@
     // Helper to render a structured error message in the genes table
     function renderGenesError(msg){ tbody.innerHTML = `<tr><td colspan="5">${String(msg).replace(/</g,'&lt;')}</td></tr>`; }
 
+    function showLoadingRow(){
+      tbody.innerHTML = '<tr id="genes-loading"><td colspan="5" style="text-align:center; padding:12px;"><span class="spinner" style="display:inline-block; width:18px; height:18px; border:3px solid rgba(0,0,0,0.12); border-top-color:var(--fg); border-radius:50%; animation:spin 0.9s linear infinite; vertical-align:middle; margin-right:8px;"></span>Loading genes...</td></tr>';
+    }
+
+    // Minimal spinner animation CSS injection (scoped inline so no global stylesheet edits needed)
+    (function(){
+      const styleId = 'genes-spinner-style';
+      if(!document.getElementById(styleId)){
+        const s = document.createElement('style'); s.id = styleId; s.textContent = '@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}'; document.head.appendChild(s);
+      }
+    })();
+
     // Try primary form first, then an alternate with/without 'chr' prefix if 404 or not found.
     const tryChromVariants = [chromosome];
     if (!(String(chromosome||'').toLowerCase().startsWith('chr'))) tryChromVariants.push('chr' + chromosome);
@@ -552,13 +564,17 @@
   const ensemblVal = ensemblEl ? ensemblEl.value : '';
   const verParam = ensemblVal ? `&ensembl_version=${encodeURIComponent(ensemblVal)}` : '';
   const url = `/genes?species=${encodeURIComponent(species)}&chromosome=${encodeURIComponent(chr)}&start=${Math.floor(start)}&end=${Math.floor(end)}${btParam}${verParam}`;
+      // show loading row while we wait for the server
+      try{ showLoadingRow(); }catch(e){}
       fetch(url).then(r => {
         if(!r.ok){
           // Try next variant if 404 (not found) or show server message otherwise
+          try{ document.getElementById('genes-loading')?.remove(); }catch(e){}
           if(r.status === 404){ return attemptNext(); }
           return r.text().then(t => { renderGenesError(`Server error: ${t || r.statusText}`); });
         }
         return r.json().then(data => {
+          try{ document.getElementById('genes-loading')?.remove(); }catch(e){}
           tbody.innerHTML='';
           if(data.available_biotypes){ ensureBiotypeCheckboxes(data.available_biotypes); }
           const UCSC_ASSEMBLY = {
@@ -585,7 +601,7 @@
           if((data.genes||[]).length===0){ tbody.innerHTML='<tr><td colspan="5">No genes</td></tr>'; }
           attachGeneHoverHandlers();
         });
-      }).catch(e => { renderGenesError('Gene fetch error: ' + (e && e.message ? e.message : String(e))); });
+  }).catch(e => { try{ document.getElementById('genes-loading')?.remove(); }catch(_){}; renderGenesError('Gene fetch error: ' + (e && e.message ? e.message : String(e))); });
     }
 
     attemptNext();
@@ -594,6 +610,17 @@
   // Event handlers
   if(selMetric){ selMetric.addEventListener('change', ()=>{ tbody.innerHTML=''; zxmin.value=''; zxmax.value=''; renderMetric(selMetric.value); }); }
   if(zoomBtn){ zoomBtn.addEventListener('click', ()=>{ const a=parseFloat(zxmin.value); const b=parseFloat(zxmax.value); if(Number.isFinite(a)&&Number.isFinite(b)&&b>a){ renderMetric(currentMetric,a,b); } else { alert('Provide valid numeric start/end (start < end)'); } }); }
+  // When the user changes the Ensembl version, refresh the currently displayed
+  // genes (if any window is active) so the new version's TSV is loaded.
+  const ensemblSelectGlobal = document.getElementById('ensemblVersionSelect');
+  if(ensemblSelectGlobal){
+    ensemblSelectGlobal.addEventListener('change', ()=>{
+      if(lastGenesWindow && Number.isFinite(lastGenesWindow.start) && Number.isFinite(lastGenesWindow.end)){
+        // Re-query genes using the newly-selected ensembl version
+        try{ showGenesWindow(lastGenesWindow.start, lastGenesWindow.end); }catch(e){ /* noop */ }
+      }
+    });
+  }
   function clearFilters(refetch=true){
     zxmin.value='';
     zxmax.value='';
