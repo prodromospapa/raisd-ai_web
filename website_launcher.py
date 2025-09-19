@@ -849,12 +849,45 @@ def runs_report_csv(run_id):
     if not os.path.isdir(run_dir):
         return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
     touch_run(run_id)
-    # Prefer persisted per-(dm,pop) report so CSV reflects the selected model/population
-    report_path = _choose_persisted_report(run_dir) or os.path.join(run_dir, RAISD_REPORT)
-    if not os.path.exists(report_path):
-        found = _find_and_normalize_report(run_dir, prefix='results')
-        if found:
-            report_path = found
+    # Allow clients to request a specific persisted report via query params
+    # (report=<basename>) or via dm/pop shorthand (dm=..., pop=...). If the
+    # requested persisted report is missing, fall back to the best available
+    # persisted or generic report instead of returning 404 to avoid broken
+    # links when the UI selects a model that hasn't been rescanned yet.
+    req_report = (request.args.get('report') or '').strip()
+    req_dm = (request.args.get('dm') or '').strip()
+    req_pop = (request.args.get('pop') or '').strip()
+
+    report_path = None
+    # 1) honor explicit `report=` (basename only)
+    if req_report:
+        # Normalize to avoid directory traversal
+        rp = os.path.basename(req_report)
+        cand = os.path.join(run_dir, rp)
+        if os.path.exists(cand):
+            report_path = cand
+        else:
+            app.logger.debug(f"Requested report {rp} not found for run {run_id}; will fallback")
+
+    # 2) honor dm/pop pair -> RAiSD_Report.<dm>__<pop>
+    if report_path is None and req_dm and req_pop:
+        safe_dm = re.sub(r'[^A-Za-z0-9_\-]+', '_', req_dm).strip('_')
+        safe_pop = re.sub(r'[^A-Za-z0-9_\-]+', '_', req_pop).strip('_')
+        persisted_name = f"RAiSD_Report.{safe_dm}__{safe_pop}"
+        cand = os.path.join(run_dir, persisted_name)
+        if os.path.exists(cand):
+            report_path = cand
+        else:
+            app.logger.debug(f"Requested dm/pop persisted report {persisted_name} not found; will fallback")
+
+    # 3) prefer any persisted report (best match) or generic alias
+    if report_path is None:
+        report_path = _choose_persisted_report(run_dir) or os.path.join(run_dir, RAISD_REPORT)
+        if not os.path.exists(report_path):
+            found = _find_and_normalize_report(run_dir, prefix='results')
+            if found:
+                report_path = found
+    # If still missing, return a friendly error (avoid raw 404 HTML)
     if not os.path.exists(report_path):
         return json.dumps({'error': 'report not found'}), 404, {'Content-Type': 'application/json'}
     try:

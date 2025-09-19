@@ -120,6 +120,8 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
         "--target-snps-tol", "10",
     "--paired-neutral", "neutral.ms",
         ]
+    print(subprocess.list2cmdline(args))
+    exit()
     if gpu:
         args.append("--gpu")
     # run inside the target directory; if it fails, retry once using discoal and add --sweep-time (in generations)

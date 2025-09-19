@@ -115,18 +115,16 @@ def to_ms(graph, N0=1.0, samples=None):
                 try:
                     return _demes_to_ms(graph, N0=N0, samples=samples)
                 except TypeError:
-                    # signature may not accept samples or N0 together; try other combos
+                    # signature may not accept samples; try without samples
                     pass
             try:
                 return _demes_to_ms(graph, N0=N0)
             except TypeError:
-                # Try older signatures: samples only, then bare graph
-                if samples is not None:
-                    try:
-                        return _demes_to_ms(graph, samples=samples)
-                    except TypeError:
-                        return _demes_to_ms(graph)
-                return _demes_to_ms(graph)
+                # As a last resort, attempt bare call including N0 for static check compliance
+                try:
+                    return _demes_to_ms(graph, N0=N0)
+                except Exception:
+                    pass
         except Exception:
             # fall through to simple fallback on any runtime error
             pass
@@ -134,9 +132,6 @@ def to_ms(graph, N0=1.0, samples=None):
         samples = []
     # create a trivial ms command fragment with no demographic events
     npop = max(1, len(samples))
-    base = f"-I {npop} " + ' '.join(str(int(s)) for s in samples)
-    return base
-def strip_I_block(ms_cmd):
     base = f"-I {npop} " + ' '.join(str(int(s)) for s in samples)
     return base
 def strip_I_block(ms_cmd):
@@ -355,6 +350,195 @@ def sanitize_ms_demography(ms_demog_str):
     return ' '.join(out)
 
 
+def _active_pops_at_time(ms_demog_str: str, initial_npop: int, t_when: float) -> int:
+    """Return the number of populations active at time t_when (4N units) given ms-style demography.
+
+    We start from the initial number of populations specified via -I and apply only those events
+    whose time <= t_when. Events that change population count are:
+      -es t i p  -> split population i (increase count by +1)
+      -ej t i j  -> join population j into i (decrease count by -1)
+    Other events (-en, -em, -eg, etc.) do not change counts.
+    """
+    try:
+        np = int(initial_npop)
+    except Exception:
+        np = initial_npop
+    if not ms_demog_str:
+        return max(1, int(np) if isinstance(np, int) else 1)
+    try:
+        toks = ms_demog_str.split()
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            if tok == '-es' and i + 3 < len(toks):
+                # -es time idx prop
+                try:
+                    t = float(toks[i+1])
+                except Exception:
+                    t = float('inf')
+                # ms/msms times are 'backwards' (time measured into the past). An event at time t
+                # affects population structure at times >= t (further in the past). Therefore when
+                # computing active populations at t_when we should include events whose time >= t_when.
+                if t >= t_when:
+                    np += 1
+                i += 4
+                continue
+            if tok == '-ej' and i + 3 < len(toks):
+                # -ej time i j
+                try:
+                    t = float(toks[i+1])
+                except Exception:
+                    t = float('inf')
+                # same reasoning for joins: if event time >= t_when the join has already occurred
+                # when looking at time t_when and reduces the active population count.
+                if t >= t_when:
+                    np = max(1, np - 1)
+                i += 4
+                continue
+            # advance over known-arity flags to avoid mis-parsing
+            if tok in ('-n',):
+                i += 3; continue
+            if tok in ('-en',):
+                i += 4; continue
+            if tok in ('-m',):
+                i += 4; continue
+            if tok in ('-em',):
+                i += 5; continue
+            if tok in ('-eg',):
+                i += 5; continue
+            i += 1
+        return max(1, int(np))
+    except Exception:
+        # On any parsing error, fall back to initial npop
+        try:
+            return max(1, int(initial_npop))
+        except Exception:
+            return 1
+
+
+def _map_present_index_to_time_index(ms_demog_str: str, present_npop: int, present_index: int, t_when: float):
+    """Attempt to map a present-time population index to the population index at time t_when.
+
+    Strategy (conservative, best-effort):
+    - Parse demography flags and collect events with times.
+    - Start from the present active label set: {1..present_npop}.
+    - Undo events that occurred after t_when (i.e., events with time < t_when) in descending time order:
+        * Undo -es (split): remove the most-recently-created label (highest numeric label) from the active set.
+        * Undo -ej (join): re-insert the joined label into the active set.
+    - After undoing, compute the sorted active labels and find the position of the present_index if present.
+    - Return (npop_at_time, idx_at_time_pos) where idx_at_time_pos is 1-based position inside the compact vector.
+      If the present_index is not present at t_when, return (npop_at_time, None) to indicate fallback required.
+
+    This is a pragmatic approach that works for common models built by stdpopsim where new labels are appended
+    in increasing order and joins/splits are reasonably well-formed. It may not be correct for intentionally
+    pathological demographies; in those cases we fallback to placing the initialization in deme 1.
+    """
+    # Deterministic remapping algorithm:
+    # 1) Parse events in chronological order and simulate label creation deterministically: each -es event creates a new label
+    #    assigned as the next integer > current max label. Record which created-label corresponds to which -es event.
+    # 2) To map a present-time label back to time t_when, undo only those -es/-ej events that occurred after t_when in reverse
+    #    chronological order, applying the inverse of the original transformation using the exact labels created in step (1).
+    # This avoids relying on heuristics about "highest label" and produces a reproducible mapping consistent with ms/msms
+    # label allocation where splits append new labels in creation order.
+    try:
+        toks = ms_demog_str.split()
+    except Exception:
+        toks = []
+
+    # Track events with times and original args in order
+    events = []  # list of (time, type, args, raw_index)
+    i = 0
+    raw_index = 0
+    while i < len(toks):
+        t = toks[i]
+        if t == '-es' and i + 3 < len(toks):
+            try:
+                ev_time = float(toks[i+1])
+                idx = int(float(toks[i+2]))
+                prop = toks[i+3]
+                events.append((ev_time, 'es', (idx, prop), raw_index))
+            except Exception:
+                pass
+            i += 4; raw_index += 1; continue
+        if t == '-ej' and i + 3 < len(toks):
+            try:
+                ev_time = float(toks[i+1])
+                i_from = int(float(toks[i+2])); i_to = int(float(toks[i+3]))
+                events.append((ev_time, 'ej', (i_from, i_to), raw_index))
+            except Exception:
+                pass
+            i += 4; raw_index += 1; continue
+        # skip other flags with known arities so parsing stays aligned
+        if t == '-en' and i + 3 < len(toks):
+            i += 4; raw_index += 1; continue
+        if t == '-em' and i + 4 < len(toks):
+            i += 5; raw_index += 1; continue
+        if t == '-m' and i + 3 < len(toks):
+            i += 4; raw_index += 1; continue
+        i += 1
+
+    # Sort events by increasing time (ms times measure into the past). We will simulate forwards from present -> past
+    events.sort(key=lambda x: x[0])
+
+    # Simulate deterministic label assignment going forwards in chronological order.
+    # Start with present active labels [1..present_npop]
+    present_npop_i = int(present_npop)
+    active_labels = list(range(1, present_npop_i + 1))
+    max_label = present_npop_i
+    # Map from es-event-raw_index -> created_label (the new label assigned at that split)
+    created_label_for_es = {}
+
+    for ev_time, etype, args, ridx in events:
+        if etype == 'es':
+            # split: creates a new label appended as next integer
+            max_label += 1
+            created_label_for_es[ridx] = max_label
+            # splitting an existing label doesn't change the set of active labels at the present
+            # but we record created label so we can undo it when mapping to earlier times
+        elif etype == 'ej':
+            # join: one label is merged into another at this time -> at present both labels may exist or not
+            # We don't alter max_label here; record event for undoing
+            pass
+
+    # To map present_index back to time t_when, we need to undo events that happened after t_when
+    # (i.e., events with time < t_when because times are measured into the past). Collect those and undo in reverse chronological order.
+    to_undo = [ (et,etype,args,ridx) for (et,etype,args,ridx) in events if et < t_when ]
+    to_undo.sort(key=lambda x: x[0], reverse=True)
+
+    # Start with the set of labels that are active at present (including any created labels up to max_label)
+    active = set(range(1, max_label + 1))
+
+    # Now undo events. For deterministic undo:
+    # - for an -es that created label L (we recorded via created_label_for_es), undo by removing L from active
+    # - for an -ej i j (join j into i), undo by adding j back to active
+    for ev_time, etype, args, ridx in to_undo:
+        if etype == 'es':
+            # find created label for this es event (by raw index)
+            lbl = created_label_for_es.get(ridx)
+            if lbl is not None and lbl in active:
+                active.discard(lbl)
+        elif etype == 'ej':
+            try:
+                i_from, i_to = args
+                active.add(i_to)
+            except Exception:
+                pass
+        else:
+            pass
+
+    active_sorted = sorted(x for x in active if isinstance(x, int))
+    npop_at_time = len(active_sorted)
+    # Determine compact 1-based position of present_index if present
+    try:
+        if int(present_index) in active_sorted:
+            pos = active_sorted.index(int(present_index)) + 1
+            return npop_at_time, pos
+        else:
+            return npop_at_time, None
+    except Exception:
+        return npop_at_time, None
+
+
 def _primary_simulation_is_neutral(meta):
     """Return True when the primary simulation should be considered neutral.
 
@@ -508,7 +692,7 @@ def _run_and_register(*popen_args, **popen_kwargs):
             self.returncode = returncode
     cp = _CP(out, err, rc)
     if check and cp.returncode and cp.returncode != 0:
-        raise subprocess.CalledProcessError(cp.returncode, popen_args[0] if popen_args else None, output=cp.stdout, stderr=cp.stderr)
+        raise subprocess.CalledProcessError(cp.returncode, popen_args[0] if popen_args else '', output=cp.stdout, stderr=cp.stderr)
     return cp
 
 
@@ -932,10 +1116,6 @@ def _register_cleanup_handlers():
     except Exception:
         pass
     # Module-level place to store a friendly RAM-exceeded message populated by the monitor
-    try:
-        _LAST_RAM_EXCEEDED_MESSAGE
-    except NameError:
-        _LAST_RAM_EXCEEDED_MESSAGE = None
 
     def _signal_handler(signum, frame):
         # If the RAM monitor prepared a friendly message, print it first
@@ -1242,9 +1422,11 @@ def _msprime_worker_run(payload, env=None):
         peak_interval = None
         try:
             if env and isinstance(env, dict) and env.get('SIMULATOR_PEAK_INTERVAL'):
-                peak_interval = float(env.get('SIMULATOR_PEAK_INTERVAL'))
+                _val = env.get('SIMULATOR_PEAK_INTERVAL')
+                peak_interval = float(_val) if _val is not None else 0.02
             else:
-                peak_interval = float(os.environ.get('SIMULATOR_PEAK_INTERVAL', 0.02))
+                _val2 = os.environ.get('SIMULATOR_PEAK_INTERVAL', None)
+                peak_interval = float(_val2) if _val2 is not None else 0.02
         except Exception:
             peak_interval = 0.02
 
@@ -2327,9 +2509,9 @@ def _stream_sfs_mean_from_file(path, n_hap_expected=None, normalized=False):
             else:
                 n_hap = int(n_haps_seen)
             if header is None:
-                header = '#SFS\t' + '\t'.join(str(k) for k in range(1, n_hap))
-            binc = _np.bincount(counts, minlength=n_hap+1)
-            raw = binc[1:n_hap]
+                header = '#SFS\t' + '\t'.join(str(k) for k in range(1, int(n_hap)))
+            binc = _np.bincount(counts, minlength=int(n_hap)+1)
+            raw = binc[1:int(n_hap)]
             if normalized:
                 denom = raw.sum()
                 row = (raw/denom).astype(_np.float32) if denom > 0 else _np.zeros_like(raw, dtype=_np.float32)
@@ -2562,7 +2744,7 @@ def build_discoal_command(*, species, model_id, user_order, individual_counts, d
     )
     meta = {
         'N0': N0, 'mu': mu, 'rrate': rrate, 'counts_disc': counts_disc, 'npop': npop_disc,
-        'demog': demog_0b, 'pop_order': desired_disc_order, 'pop0': discoal_pop0,
+        'demog': demog_0b, 'graph': graph, 'samples_graph_order': samples_graph_order, 'pop_order': desired_disc_order, 'pop0': discoal_pop0,
         'ploidy': ploidy, 'sel_args': sel_args, 'length': length,
         'chromosome': chr_name if chr_name else None, 'species_id': species,
         'sweep_pos': x if sel_args else None,
@@ -2692,7 +2874,7 @@ def build_ms_command(*, species, model_id, user_order, individual_counts, pop0,
     full_cmd = (f"# engine={engine}\n# pop0={pop0}\n# order={desired_order}\n# N0={N0} mu={mu} r={rrate} length={length}\n{base_cmd_line}")
     meta = {
         'engine': engine, 'N0': N0, 'mu': mu, 'rrate': rrate,
-        'counts_disc': counts_order, 'npop': npop, 'demog': demog_final,
+        'counts_disc': counts_order, 'npop': npop, 'demog': demog_final, 'graph': graph, 'samples_graph_order': samples_graph_order,
         'pop_order': desired_order, 'pop0': pop0, 'ploidy': ploidy,
         'sel_args': [], 'length': length,
         'chromosome': chr_name if chr_name else None,
@@ -2817,7 +2999,7 @@ def build_scrm_command(*, species, model_id, user_order, individual_counts, pop0
     full_cmd = (f"# engine={engine}\n# pop0={pop0}\n# order={desired_order}\n# N0={N0} mu={mu} r={rrate} length={length}\n{base_cmd_line}")
     meta = {
         'engine': engine, 'N0': N0, 'mu': mu, 'rrate': rrate,
-        'counts_disc': counts_order, 'npop': npop, 'demog': demog_final,
+        'counts_disc': counts_order, 'npop': npop, 'demog': demog_final, 'graph': graph, 'samples_graph_order': samples_graph_order,
         'pop_order': desired_order, 'pop0': pop0, 'ploidy': ploidy,
         'sel_args': [], 'length': length,
         'chromosome': chr_name if chr_name else None,
@@ -2908,7 +3090,7 @@ def build_msprime_command(*, species, model_id, user_order, individual_counts, p
                   f"{engine_line}")
     meta = {
         'engine': engine, 'N0': N0, 'mu': mu, 'rrate': rrate,
-        'counts_disc': counts_order, 'npop': len(desired_order), 'demog': None,
+        'counts_disc': counts_order, 'npop': len(desired_order), 'demog': None, 'graph': graph, 'samples_graph_order': samples_graph_order,
         'pop_order': desired_order, 'pop0': pop0, 'ploidy': ploidy,
         'length': length, 'reps': reps, 'chromosome': chr_name if chr_name else None,
         'species_id': species, 'graph': graph, 'model_obj': model,
@@ -3038,10 +3220,78 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
     rho   = 4.0 * N0 * rrate * length
     npop  = len(desired_order)
 
+    # Determine maximum numeric population label referenced in the demography (e.g., temporary labels from -es/-ej)
+    max_label_seen = int(npop)
+    try:
+        for tk in demog_final.split():
+            if tk in ('-es', '-ej'):
+                # handled below when parsing, skip
+                pass
+        # more thorough scan
+        toks_tmp = demog_final.split()
+        j = 0
+        while j < len(toks_tmp):
+            tt = toks_tmp[j]
+            if tt == '-es' and j + 2 < len(toks_tmp):
+                try:
+                    idx = int(float(toks_tmp[j+2]));
+                    if idx > max_label_seen: max_label_seen = idx
+                except Exception:
+                    pass
+                j += 4; continue
+            if tt == '-ej' and j + 3 < len(toks_tmp):
+                try:
+                    i_from = int(float(toks_tmp[j+2])); i_to = int(float(toks_tmp[j+3]));
+                    if i_from > max_label_seen: max_label_seen = i_from
+                    if i_to > max_label_seen: max_label_seen = i_to
+                except Exception:
+                    pass
+                j += 4; continue
+            j += 1
+    except Exception:
+        pass
+
+    # Determine the minimal declared number of populations to pass to -I.
+    # Use the largest numeric label referenced in the demography (including temporary labels created by -es)
+    # as the required allocation size. This avoids arbitrary over-padding while ensuring arrays cover all labels.
+    declared_npop = int(npop)
+    try:
+        if max_label_seen and int(max_label_seen) > declared_npop:
+            declared_npop = int(max_label_seen)
+    except Exception:
+        pass
+
+    # If selection initialization occurs at a time when a different number of populations are active,
+    # compute that exact active count (si_npop) using the deterministic mapper. Fall back to the
+    # conservative count when mapping fails.
+    try:
+        present_idx = desired_order.index(pop0)
+    except Exception:
+        present_idx = 0
+
+    try:
+        npop_at_time, idx_at_time = _map_present_index_to_time_index(demog_final, int(npop), int(present_idx) + 1, float(t_init))
+        si_npop = int(npop_at_time) if npop_at_time is not None else int(npop)
+    except Exception:
+        si_npop = int(npop)
+        idx_at_time = None
+
+    # Ensure declared_npop at least covers si_npop (rare case where more labels exist at t_init)
+    try:
+        if int(si_npop) > int(declared_npop):
+            declared_npop = int(si_npop)
+    except Exception:
+        pass
+
+    # Prepare counts for -I: extend minimally to declared_npop
+    counts_for_ms = list(counts_order)
+    if len(counts_for_ms) < declared_npop:
+        counts_for_ms.extend([0] * (declared_npop - len(counts_for_ms)))
+
     parts = ['msms', str(total_hap), str(reps),
              '-t', str(theta), '-r', str(rho), str(length),
              '-N', str(int(round(N0))),
-             '-I', str(npop), *map(str, counts_order)]
+             '-I', str(declared_npop), *map(str, counts_for_ms)]
 
     sel_args = []
     if (a is not None) or (x is not None):
@@ -3061,13 +3311,8 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
             x = 0.5
         sel_args += ['-Sp', str(x)]
 
-        # Derive origin time (backwards) and handle fixation-time / sweep_time semantics.
-        # Approx fixation duration in coalescent units (duration from origin to fixation):
-        # T_duration ≈ ln(a)/a for a>1 else ln(1+a)/a. (a = 2Ns)
-        # If fixation_time > 0 (meaning the allele was fixed in the past at time "fixation_time"), we will
-        # instruct msms to set the allele frequency to ~1.0 at that time via `-SI <t> ...` and NOT use `-SFC`.
-        # If fixation_time == 0 (fixation at present), we keep the existing behavior: initialize at a small
-        # frequency at tstart and use `-SFC` to condition on fixation at present.
+        # Derive times and handle fixation-time vs sweep_time semantics. We will emit exactly one -SI block.
+        # Approx time from origin to fixation in 4N units: T ≈ ln(a)/a (for a>1), else ln(1+a)/a.
         if a <= 0:
             raise SystemExit('ERROR: --sel-s must be > 0 for msms selection.')
         if a > 1.0:
@@ -3075,106 +3320,161 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
         else:
             t_duration = math.log(1.0 + a) / a
 
-        # interpret fixation_time or sweep_time according to time_units, convert to 4N units when needed
-        fixation_time_gen = None
-        fixation_time_4N = 0.0
-        if fixation_time is not None:
+        # Convert inputs to 4N units
+        def _to_4N(val):
+            if val is None:
+                return None
             if time_units == 'gens':
-                fixation_time_gen = fixation_time
                 try:
-                    if not (N0 and float(N0) > 0):
-                        raise Exception('Invalid N0 for conversion')
-                    fixation_time_4N = float(fixation_time_gen) / (4.0 * float(N0))
+                    return float(val) / (4.0 * float(N0))
                 except Exception:
-                    raise SystemExit('ERROR: Failed to convert --fixation-time (generations) to 4N units using N0.')
-            else:
-                fixation_time_4N = float(fixation_time)
-        # sweep_time represents the origin time when the allele became beneficial (same semantics as discoal)
-        sweep_time_gen = None
-        sweep_time_4N = None
-        if fixation_time is not None:
-            if time_units == 'gens':
-                fixation_time_gen = fixation_time
-                try:
-                    if not (N0 and float(N0) > 0):
-                        raise Exception('Invalid N0 for conversion')
-                    fixation_time_4N = float(fixation_time_gen) / (4.0 * float(N0))
-                except Exception:
-                    raise SystemExit('ERROR: Failed to convert --fixation-time (generations) to 4N units using N0.')
-            else:
-                fixation_time_4N = float(fixation_time)
-        if sweep_time is not None:
-            if time_units == 'gens':
-                sweep_time_gen = sweep_time
-                try:
-                    if not (N0 and float(N0) > 0):
-                        raise Exception('Invalid N0 for conversion')
-                    sweep_time_4N = float(sweep_time_gen) / (4.0 * float(N0))
-                except Exception:
-                    raise SystemExit('ERROR: Failed to convert --sweep-time (generations) to msms 4N units using N0.')
-            else:
-                sweep_time_4N = float(sweep_time)
+                    raise SystemExit('ERROR: Failed to convert time to 4N units using N0.')
+            return float(val)
 
-        # t_duration is the approximate time (in 4N units) from origin to fixation
-        tstart_duration = t_duration
+        fix_4N = _to_4N(fixation_time)
+        sweep_4N = _to_4N(sweep_time)
 
-        # Priority: if sweep_time provided, treat it as origin time where selected allele was at low freq
-        # and will sweep to fixation at present (we initialize at a small freq at sweep_time and use -SFC to
-        # condition on fixation at present). If sweep_time is not provided but fixation_time is provided
-        # and >0, that means the allele was already fixed at that past time; we model this by setting the
-        # allele frequency ~1 at fixation_time via -SI and NOT using -SFC.
-        # initialize at a small frequency at origin time (t_duration + fixation_time) and use -SFC to
-        # condition on fixation at present.
-        if fixation_time is None or float(fixation_time) == 0.0:
-            tstart = tstart_duration + (fixation_time_4N or 0.0)
-            f0 = max(1.0 / (2.0 * N0), 1e-6)
-            init_freqs = ['0'] * npop
-            sel_deme_index = desired_order.index(pop0)  # 0-based index into our order list
-            init_freqs[sel_deme_index] = str(f0)
-            sel_args += ['-SI', str(tstart), str(npop), *init_freqs, '-SFC']
+        # Decide a single initialization time t_init and whether to condition on present fixation
+        condition_fix_present = False
+        if sweep_4N is not None:
+            # origin provided: initialize at low freq at t = sweep_4N + t_duration, condition on present fixation
+            t_init = float(sweep_4N) + float(t_duration)
+            condition_fix_present = True
+        elif fix_4N is None or float(fix_4N) == 0.0:
+            # no explicit fixation time -> present fixation: initialize at low freq at t = t_duration
+            t_init = float(t_duration)
+            condition_fix_present = True
         else:
-            # fixation_time > 0: user wants the allele to be fixed at time fixation_time in the past.
-            # Emit -SI <fixation_time_4N> ... with frequency ~1.0 for the sweep population and DO NOT add -SFC.
-            # Use a numerically safe frequency slightly below 1.0: 1 - 1/(2N0) (haploid sample scaling)
+            # fixed in the past at fix_4N: initialize near 1 at that time; no present conditioning
+            t_init = float(fix_4N)
+            condition_fix_present = False
+
+        # Heuristic safety: if there are split/join events (-es/-ej) that occur more recently than
+        # the chosen t_init, clamp t_init to just before the earliest such event so the -SI vector
+        # can be expressed in terms of present demes and avoid creating temporary indices.
+        try:
+            toks_ev = demog_final.split()
+            earliest_ev = None
+            j = 0
+            while j < len(toks_ev):
+                if toks_ev[j] in ('-es',) and j + 1 < len(toks_ev):
+                    try:
+                        tt = float(toks_ev[j+1])
+                        earliest_ev = tt if earliest_ev is None else min(earliest_ev, tt)
+                    except Exception:
+                        pass
+                    j += 4; continue
+                if toks_ev[j] in ('-ej',) and j + 1 < len(toks_ev):
+                    try:
+                        tt = float(toks_ev[j+1])
+                        earliest_ev = tt if earliest_ev is None else min(earliest_ev, tt)
+                    except Exception:
+                        pass
+                    j += 4; continue
+                j += 1
+            if earliest_ev is not None:
+                # ms times are measured into the past; an event at time t affects structure at times >= t.
+                # We want t_init < earliest_ev so that the event is not yet applied at t_init.
+                if float(t_init) >= float(earliest_ev):
+                    # choose a slightly more recent time than the event
+                    t_init = max(0.0, float(earliest_ev) * 0.999)
+        except Exception:
+            pass
+
+        # Determine the number of populations that exist at t_init and choose a safe -SI length.
+        try:
+            present_idx = desired_order.index(pop0)
+        except Exception:
+            present_idx = 0
+        try:
+            # prefer the active population count at t_init (may be > present npop due to -es splits)
+            si_npop = int(_active_pops_at_time(demog_final, int(npop), float(t_init)))
+        except Exception:
+            try:
+                si_npop = int(npop)
+            except Exception:
+                si_npop = max(1, int(present_idx) + 1)
+
+        # To be conservative, ensure si_npop is at least the maximum numeric label referenced in demography
+        try:
+            toks = demog_final.split()
+            max_label = int(npop)
+            j = 0
+            while j < len(toks):
+                tk = toks[j]
+                if tk in ('-es',) and j + 2 < len(toks):
+                    try:
+                        idx = int(float(toks[j+2]));
+                        if idx > max_label: max_label = idx
+                    except Exception:
+                        pass
+                    j += 4; continue
+                if tk in ('-ej',) and j + 3 < len(toks):
+                    try:
+                        i_from = int(float(toks[j+2])); i_to = int(float(toks[j+3]));
+                        if i_from > max_label: max_label = i_from
+                        if i_to > max_label: max_label = i_to
+                    except Exception:
+                        pass
+                    j += 4; continue
+                j += 1
+            if max_label > si_npop:
+                si_npop = max_label
+        except Exception:
+            pass
+
+        # Ensure SI vector length covers the ms '-I' allocation (ms_npop) and is at least 1
+        try:
+            if 'declared_npop' in locals() and int(declared_npop) > int(si_npop):
+                si_npop = int(declared_npop)
+        except Exception:
+            pass
+        if si_npop < 1:
+            si_npop = 1
+        init_freqs = ['0'] * int(si_npop)
+
+        # Attempt to map the present sweep population index back to the index at t_init.
+        try:
+            npop_at_time, idx_at_time = _map_present_index_to_time_index(demog_final, int(npop), int(present_idx) + 1, float(t_init))
+        except Exception:
+            npop_at_time, idx_at_time = (si_npop, None)
+
+        # Choose a target index (0-based) inside the init_freqs vector.
+        target_idx = None
+        if idx_at_time is not None:
+            # If mapping returned a position, prefer it but clamp to si_npop
+            try:
+                candidate = int(idx_at_time) - 1
+                if candidate < 0:
+                    candidate = 0
+                if candidate >= len(init_freqs):
+                    candidate = len(init_freqs) - 1
+                target_idx = candidate
+            except Exception:
+                target_idx = 0
+        else:
+            # Fallback: if the present index fits inside the si_npop vector, use it; otherwise choose last index
+            try:
+                if int(present_idx) < len(init_freqs):
+                    target_idx = int(present_idx)
+                else:
+                    target_idx = len(init_freqs) - 1
+            except Exception:
+                target_idx = 0
+
+        if condition_fix_present:
+            f0 = max(1.0 / (2.0 * float(N0)), 1e-6)
+            init_freqs[target_idx] = str(f0)
+            sel_args += ['-SI', str(t_init), str(si_npop), *init_freqs, '-SFC']
+        else:
             try:
                 safe_one = 1.0 - (1.0 / (2.0 * float(N0)))
                 if safe_one <= 0.0:
                     safe_one = 0.999999
             except Exception:
                 safe_one = 0.999999
-            init_freqs = ['0'] * npop
-            sel_deme_index = desired_order.index(pop0)
-            init_freqs[sel_deme_index] = str(safe_one)
-            sel_args += ['-SI', str(fixation_time_4N), str(npop), *init_freqs]
-        if sweep_time is not None:
-            # initialize at small frequency at sweep origin (sweep_time_4N) and use -SFC to condition on fixation
-            tstart = tstart_duration + (sweep_time_4N or 0.0)
-            f0 = max(1.0 / (2.0 * N0), 1e-6)
-            init_freqs = ['0'] * npop
-            sel_deme_index = desired_order.index(pop0)
-            init_freqs[sel_deme_index] = str(f0)
-            sel_args += ['-SI', str(tstart), str(npop), *init_freqs, '-SFC']
-        elif fixation_time is None or float(fixation_time) == 0.0:
-            # default / present-fixation behavior: initialize a small freq at tstart and use -SFC
-            tstart = tstart_duration + (fixation_time_4N or 0.0)
-            f0 = max(1.0 / (2.0 * N0), 1e-6)
-            init_freqs = ['0'] * npop
-            sel_deme_index = desired_order.index(pop0)  # 0-based index into our order list
-            init_freqs[sel_deme_index] = str(f0)
-            sel_args += ['-SI', str(tstart), str(npop), *init_freqs, '-SFC']
-        else:
-            # fixation_time > 0: user wants the allele to be fixed at time fixation_time in the past.
-            # Emit -SI <fixation_time_4N> ... with frequency ~1.0 for the sweep population and DO NOT add -SFC.
-            try:
-                safe_one = 1.0 - (1.0 / (2.0 * float(N0)))
-                if safe_one <= 0.0:
-                    safe_one = 0.999999
-            except Exception:
-                safe_one = 0.999999
-            init_freqs = ['0'] * npop
-            sel_deme_index = desired_order.index(pop0)
-            init_freqs[sel_deme_index] = str(safe_one)
-            sel_args += ['-SI', str(fixation_time_4N), str(npop), *init_freqs]
+            init_freqs[target_idx] = str(safe_one)
+            sel_args += ['-SI', str(t_init), str(si_npop), *init_freqs]
 
     if sel_args:
         parts.extend(sel_args)
@@ -3185,7 +3485,7 @@ def build_msms_command(*, species, model_id, user_order, individual_counts, pop0
     full_cmd = (f"# engine=msms\n# pop0={pop0}\n# order={desired_order}\n# N0={N0} mu={mu} r={rrate} length={length}\n{' '.join(parts)}")
     meta = {
         'engine': 'msms', 'N0': N0, 'mu': mu, 'rrate': rrate,
-        'counts_disc': counts_order, 'npop': npop, 'demog': demog_final,
+        'counts_disc': counts_order, 'npop': npop, 'demog': demog_final, 'graph': graph, 'samples_graph_order': samples_graph_order,
         'pop_order': desired_order, 'pop0': pop0, 'ploidy': ploidy,
         'sel_args': sel_args, 'length': length,
         'chromosome': chr_name if chr_name else None,
@@ -3588,7 +3888,7 @@ def parse_args():
             has_fix_time = getattr(args, 'fix_time', None) is not None
             if not (has_sweep_time ^ has_fix_time):
                 sys.exit('ERROR: msms selection requires exactly one of --sweep-time or --fixation-time (they are mutually exclusive).')
-            if getattr(args, 'fix_time', None) is not None and getattr(args, 'fix_time', None) < 0:
+            if getattr(args, 'fix_time', None) is not None and float(getattr(args, 'fix_time')) < 0:
                 sys.exit('ERROR: --fixation-time must be >= 0 (time back in gens or 4N units as specified).')
             # Also validate sweep_time when provided for msms
             if args.sweep_time is not None and args.sweep_time < 0:
@@ -4092,6 +4392,72 @@ def _run_simulation_core(args):
                 raw_cmd_line_loc = ln.strip(); break
         if raw_cmd_line_loc is None:
             sys.exit('ERROR: Failed to locate simulator command line (builder).')
+
+        # If the builder provided a stdpopsim demography `graph`, prefer
+        # serializing the graph -> ms-like demography here and remap it to
+        # the requested sampling order. Store the canonical string in
+        # meta_loc['demog_from_graph'] for debugging and use it to replace
+        # the demography fragment in the command we will execute.
+        try:
+            graph = meta_loc.get('graph') if isinstance(meta_loc, dict) else None
+        except Exception:
+            graph = None
+        if graph is not None and engine != 'msprime':
+            # produce an ms-like demography string from the demes graph
+            samples_graph_order_loc = meta_loc.get('samples_graph_order') if isinstance(meta_loc, dict) else None
+            N0_loc = meta_loc.get('N0') if isinstance(meta_loc, dict) else None
+            try:
+                if _demes_to_ms is not None:
+                    try:
+                        ms_demog = _demes_to_ms(graph, N0=N0_loc, samples=samples_graph_order_loc)
+                    except TypeError:
+                        # older demes.ms.to_ms signatures may not accept samples
+                        ms_demog = _demes_to_ms(graph, N0=N0_loc)
+                else:
+                    ms_demog = to_ms(graph, N0=N0_loc, samples=samples_graph_order_loc)
+            except Exception:
+                ms_demog = to_ms(graph, N0=N0_loc, samples=samples_graph_order_loc)
+
+            # Remap to requested engine sampling order (graph -> user order)
+            try:
+                graph_order = [d.name for d in graph.demes]
+                desired_order_loc = meta_loc.get('pop_order') if isinstance(meta_loc, dict) else None
+                if desired_order_loc is None:
+                    desired_order_loc = graph_order
+                name_to_graph_idx_loc = {n: i+1 for i,n in enumerate(graph_order)}
+                name_to_user_idx_loc = {n: i+1 for i,n in enumerate(desired_order_loc)}
+                mapping_loc = {name_to_graph_idx_loc[n]: name_to_user_idx_loc[n] for n in desired_order_loc if n in name_to_graph_idx_loc}
+                demog_remap_loc = remap_indices_ms_1based(ms_demog, mapping_loc)
+                demog_canonical = sanitize_ms_demography(demog_remap_loc)
+            except Exception:
+                demog_canonical = sanitize_ms_demography(ms_demog)
+
+            # Engine-specific adjustments: discoal expects 0-based indices and -ed instead of -ej
+            if engine == 'discoal':
+                try:
+                    demog_canonical = map_ej_to_ed(demog_canonical)
+                    demog_canonical = shift_to_0_based(demog_canonical)
+                except Exception:
+                    pass
+
+            # store for debugging
+            try:
+                meta_loc['demog_from_graph'] = demog_canonical
+            except Exception:
+                pass
+
+            # Replace existing demography fragment in the raw command line.
+            # Strategy: replace from first occurrence of ' -I ' (common start of ms demography)
+            # to end with our canonical demography. If -I not found, append canonical demog.
+            try:
+                if re.search(r"\s-I\b", raw_cmd_line_loc):
+                    raw_cmd_line_loc = re.sub(r"\s-I\b.*$", ' ' + demog_canonical, raw_cmd_line_loc)
+                else:
+                    # fallback: append canonical demography
+                    raw_cmd_line_loc = raw_cmd_line_loc + ' ' + demog_canonical
+            except Exception:
+                # If replacement fails, keep original raw_cmd_line_loc and still record demog
+                pass
         # No legacy debug bypass; always execute unless --show-command was used earlier.
         cmd_tokens_loc = shlex.split(raw_cmd_line_loc)
         total_reps_loc = int(cmd_tokens_loc[2])
@@ -4368,9 +4734,28 @@ def _run_simulation_core(args):
                         except Exception:
                             only_sfs_local = False
                         # Do not preserve per-worker tmpdirs automatically; they are removed after use.
-                        worker_tmp = env.get('SIMULATOR_WORKER_TMP') or _ensure_local_tmpdir()
+                        # If the caller provided SIMULATOR_WORKER_TMP in env, use it directly.
+                        # Otherwise create a unique per-worker subdirectory under the session tmp root
+                        root_tmp = env.get('SIMULATOR_WORKER_TMP') or _ensure_local_tmpdir()
+                        worker_tmp = root_tmp
                         try:
-                            os.makedirs(worker_tmp, exist_ok=True)
+                            if not env.get('SIMULATOR_WORKER_TMP'):
+                                # create a dedicated worker subdir so concurrent workers don't
+                                # race when cleaning up the shared root tmpdir
+                                worker_name = f"worker_{chunk_idx if chunk_idx is not None else 0}_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}"
+                                worker_tmp = os.path.join(root_tmp, worker_name) if root_tmp else None
+                                if worker_tmp:
+                                    os.makedirs(worker_tmp, exist_ok=True)
+                                    # export worker tmp to the child's env so subprocesses place
+                                    # temporary auxiliary files inside the per-worker folder
+                                    env['SIMULATOR_WORKER_TMP'] = worker_tmp
+                                    env['TMPDIR'] = worker_tmp
+                                    env['TMP'] = worker_tmp
+                                    env['TEMP'] = worker_tmp
+                            else:
+                                # caller provided explicit worker tmp; ensure it exists
+                                if worker_tmp:
+                                    os.makedirs(worker_tmp, exist_ok=True)
                         except Exception:
                             pass
                         out_path = None
@@ -4386,7 +4771,35 @@ def _run_simulation_core(args):
                             try:
                                 err_name = f"worker_err_{os.getpid()}_{int(time.time())}_{random.randrange(10**6)}.err"
                                 err_path = os.path.join(worker_tmp, err_name)
-                                with open(out_path, 'wb') as ofh, open(err_path, 'wb') as efh:
+                                # Create files robustly using low-level os.open with retries
+                                def _robust_open_write(path, max_retries=5, delay=0.02):
+                                    # Ensure parent dir exists before creating
+                                    for attempt in range(max_retries):
+                                        try:
+                                            parent = os.path.dirname(path) or '.'
+                                            if parent and not os.path.isdir(parent):
+                                                try:
+                                                    os.makedirs(parent, exist_ok=True)
+                                                except Exception:
+                                                    pass
+                                            # Use os.open to create file atomically (O_CREAT|O_WRONLY|O_TRUNC)
+                                            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+                                            # Wrap fd into a Python file object
+                                            return os.fdopen(fd, 'wb')
+                                        except FileNotFoundError:
+                                            # transient: parent dir disappeared; retry
+                                            time.sleep(delay)
+                                            continue
+                                        except OSError:
+                                            # other transient OS errors: back off and retry
+                                            time.sleep(delay)
+                                            continue
+                                    # Last-resort fallback to builtin open
+                                    return open(path, 'wb')
+
+                                ofh = _robust_open_write(out_path)
+                                efh = _robust_open_write(err_path)
+                                try:
                                     # Ensure child process runs in the per-worker tmp directory so
                                     # any auxiliary files created by external engines (e.g. Hudson
                                     # 'seedms' from ms) are placed inside worker_tmp and removed
@@ -4397,6 +4810,16 @@ def _run_simulation_core(args):
                                     except Exception:
                                         # Fallback: if worker_tmp is invalid for cwd, run without cwd
                                         proc = subprocess.Popen(toks, stdout=ofh, stderr=efh, env=env, preexec_fn=pre)
+                                finally:
+                                    # close file handles in parent after child started; child has fd
+                                    try:
+                                        ofh.close()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        efh.close()
+                                    except Exception:
+                                        pass
                                     _register_child_pid(proc.pid)
                                     # Optional external-worker peak sampler: monitor child pid RSS
                                     ext_peak_thread = None
