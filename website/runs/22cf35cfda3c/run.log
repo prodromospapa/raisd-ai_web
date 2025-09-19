@@ -1,0 +1,10 @@
+[2025-09-19 21:19:50] Staged upload saved: CEU_LCT_chr2_132-142Mb.vcf.gz (7343363 bytes)
+[2025-09-19 21:19:52] Using staged upload: CEU_LCT_chr2_132-142Mb.vcf.gz
+[2025-09-19 21:19:53] Detected single contig via bcftools: 2 (will not override user selection here)
+[2025-09-19 21:19:53] Chromosome validated/inferred: user=2 -> using_contig=2 -> model_dir_component=2
+[2025-09-19 21:19:53] Input not BCF; no conversion needed
+[2025-09-19 21:19:53] Selected RAiSD executable: <REDACTED>/bin/RAiSD-AI-ZLIB
+[2025-09-19 21:19:53] Checking/creating index for uploaded file if needed...
+[2025-09-19 21:19:54] Index present at: <REDACTED>/22cf35cfda3c/CEU_LCT_chr2_132-142Mb.vcf.gz.csi
+[2025-09-19 21:20:30] Best match -> model: OutOfAfrica_4J17, population: CEU, JSD: 0.018204, target chromosomes: 198, ploidy: 2, mixed_ploidy: False
+[2025-09-19 21:20:30] Error: Model file missing: <REDACTED>/2/RAiSD_Model.model

@@ -1,0 +1,1610 @@
+{% extends 'base.html' %}
+{% block content %}
+  <style>
+    .sfs-compare-btn{
+      display:inline-flex; align-items:center; gap:6px; border:1px solid var(--border); background:linear-gradient(180deg,var(--card) 0%, rgba(0,0,0,0.02) 100%); padding:6px 10px; border-radius:8px; font-size:13px; color:var(--fg); cursor:pointer;
+      transition:transform .08s ease, box-shadow .12s ease, background .12s ease;
+    }
+    .sfs-compare-btn:hover{ transform:translateY(-1px); box-shadow:0 6px 18px rgba(2,6,23,0.06); }
+    .sfs-compare-btn:active{ transform:translateY(0); }
+    .sfs-compare-btn svg{ color:var(--muted); }
+  </style>
+  <div class="card">
+    <h2>Best Match</h2>
+    <ul class="kv">
+    {% if summary_fields %}
+        {# Derive a species code from the species full name when possible.
+           Strategy: normalize incoming species by replacing '_' with ' ', then
+           split into words and take the first 3 letters of genus + first 3 of species
+           (lowercased) -> e.g. "Homo sapiens" -> "homsap". Fall back to the
+           original lowercased species string if parsing fails. #}
+        {% set norm_species = (species or '')|replace('_', ' ') %}
+        {% set parts = norm_species.split(' ') %}
+        {% if parts|length >= 2 and parts[0] and parts[1] %}
+          {% set g = parts[0][:3]|lower %}
+          {% set s = parts[1][:3]|lower %}
+          {% set spec_code = (g ~ s) %}
+        {% else %}
+          {% set spec_code = (species or '')|replace('_', '')|lower %}
+        {% endif %}
+  {% for label, value in summary_fields %}
+          {% if label|lower in ['target copies','grid'] %}
+            {# skip target copies and grid per user request #}
+      {% elif label|lower == 'demographic model' and value %}
+            {% set model_anchor = value|lower %}
+            {% set doc_url = 'https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html#sec_catalog_' ~ spec_code ~ '_models_' ~ model_anchor %}
+            <li><span>{{ label }}</span><strong><a href="{{ doc_url }}" target="_blank" rel="noopener">{{ value }}</a></strong></li>
+          {% elif label|lower == 'jsd' %}
+            <li><span>{{ label }}</span><strong>{{ value }}</strong>
+              <button class="sfs-compare-btn inline-hover-trigger" id="sfsCompareTrigger" aria-label="Compare SFS distributions" title="Compare SFS distributions">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false" style="vertical-align:middle; margin-right:6px;">
+                  <path d="M3 17h4v4H3v-4zM10 10h4v11h-4V10zM17 3h4v18h-4V3z" fill="currentColor" opacity="0.9"/>
+                </svg>
+                <span style="vertical-align:middle;">SFS distribution comparison</span>
+              </button>
+              <button id="allMatchesToggle" class="inline-toggle" aria-expanded="false" aria-controls="allMatchesPanel">All distances ▾</button>
+            </li>
+          {% else %}
+            <li><span>{{ label }}</span><strong>{{ value }}</strong></li>
+          {% endif %}
+        {% endfor %}
+      {% else %}
+        <li><span>Species</span><strong>{{ species|default('n/a')|replace('_', ' ') }}</strong></li>
+        <li><span>Chromosome</span><strong>{{ chromosome|default('n/a') }}</strong></li>
+  {# Grid removed per user request #}
+        <li><span>Ploidy</span><strong>{{ match.ploidy|default('n/a') }}</strong>{% if match.mixed_ploidy %}<em class="warn"> (mixed)</em>{% endif %}</li>
+        {# Derive spec_code as above for documentation links #}
+        {% set norm_species = (species or '')|replace('_', ' ') %}
+        {% set parts = norm_species.split(' ') %}
+        {% if parts|length >= 2 and parts[0] and parts[1] %}
+          {% set g = parts[0][:3]|lower %}
+          {% set s = parts[1][:3]|lower %}
+          {% set spec_code = (g ~ s) %}
+        {% else %}
+          {% set spec_code = (species or '')|replace('_', '')|lower %}
+        {% endif %}
+        {% if match.demographic_model %}
+          {% set model_anchor = match.demographic_model|lower %}
+          {% set doc_url = 'https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html#sec_catalog_' ~ spec_code ~ '_models_' ~ model_anchor %}
+            <li><span>Demographic model</span><strong><a id="model-used-link" class="best-match-action" href="{{ doc_url if dm_used else '#' }}" target="_blank" rel="noopener"><span id="model-used-text">{{ dm_used or 'n/a' }}</span></a></strong></li>
+        {% else %}
+          <li><span>Demographic model</span><strong>n/a</strong></li>
+        {% endif %}
+  <li><span>Population</span><strong><span id="best-match-pop" class="best-match-action">{{ match.population if match.population else '' }}</span></strong></li>
+  <li><span>JSD</span><strong>{% if match.best_jsd is not none %}{{ '%.6f'|format(match.best_jsd) }}{% else %}{% endif %}</strong>
+    <button class="sfs-compare-btn inline-hover-trigger" id="sfsCompareTrigger" aria-label="Compare SFS distributions" title="Compare SFS distributions">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false" style="vertical-align:middle; margin-right:6px;">
+        <path d="M3 17h4v4H3v-4zM10 10h4v11h-4V10zM17 3h4v18h-4V3z" fill="currentColor" opacity="0.9"/>
+      </svg>
+      <span style="vertical-align:middle;">SFS distribution comparison</span>
+    </button>
+    <button id="allMatchesToggle" class="inline-toggle" aria-expanded="false" aria-controls="allMatchesPanel">All distances ▾</button>
+  </li>
+      {% endif %}
+  {# Ploidy and model file intentionally removed per user request #}
+    </ul>
+  </div>
+  <div id="allMatchesPanel" class="all-matches-panel" style="display:none; margin-top:8px; max-height:360px; overflow:hidden; border:1px solid var(--border); background:var(--card); padding:8px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+      <strong>All calculated distances</strong>
+        <input id="allMatchesFilter" placeholder="Filter model/population" style="font-size:12px; padding:4px;" />
+    </div>
+    <div class="all-matches-scroll" style="max-height:280px; overflow:auto;">
+      <table id="allMatchesTable" class="mini-table" style="width:100%; border-collapse:collapse; font-size:13px;">
+        <thead><tr><th style="text-align:left; padding:6px;">#</th><th style="text-align:left; padding:6px;">Demographic Model</th><th style="text-align:left; padding:6px;">Population</th><th style="text-align:right; padding:6px;">JSD</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    {# Beautiful badge showing which demographic model/population was used #}
+    {% set dm_used = '' %}
+    {% if match and match.demographic_model %}
+      {% set dm_used = match.demographic_model %}
+    {% elif summary_fields is defined %}
+      {% for lab, val in summary_fields %}
+        {% if lab == 'Demographic model' and dm_used == '' %}
+          {% set dm_used = val %}
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+
+    {% set pop_used = '' %}
+    {% if match and match.population %}
+      {% set pop_used = match.population %}
+    {% elif summary_fields is defined %}
+      {% for lab, val in summary_fields %}
+        {% if lab == 'Population' and pop_used == '' %}
+          {% set pop_used = val %}
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+    <h2>RAiSD-AI Report</h2>
+    {# Build stdpopsim docs URL for the displayed model (mirror Best Match logic) #}
+    {# Derive spec_code once more for the model/doc URL. #}
+    {% set norm_species = (species or '')|replace('_', ' ') %}
+    {% set parts = norm_species.split(' ') %}
+    {% if parts|length >= 2 and parts[0] and parts[1] %}
+      {% set g = parts[0][:3]|lower %}
+      {% set s = parts[1][:3]|lower %}
+      {% set spec_code = (g ~ s) %}
+    {% else %}
+      {% set spec_code = (species or '')|replace('_', '')|lower %}
+    {% endif %}
+    {% set model_anchor = (dm_used or '')|lower %}
+    {% set doc_url = 'https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html#sec_catalog_' ~ spec_code ~ '_models_' ~ model_anchor %}
+    <ul class="kv" style="margin-top:8px; margin-bottom:10px;">
+      <li><span>Model</span><strong><a id="model-used-link" class="best-match-action" href="{{ doc_url if dm_used else '#' }}" target="_blank" rel="noopener"><span id="model-used-text">{{ dm_used or 'n/a' }}</span></a></strong></li>
+  <li><span>Population</span><strong id="pop-used-text">{{ pop_used or 'n/a' }}</strong></li>
+    </ul>
+    {% if uploaded_url %}
+      <p>Uploaded file: <a href="{{ uploaded_url }}" target="_blank" rel="noopener">{{ uploaded_name }}</a></p>
+    {% endif %}
+  <p><a href="{{ url_for('runs_report_csv', run_id=run_id) }}" target="_blank" rel="noopener">Download RAiSD_Report.csv</a></p>
+    {% if plots and plots|length > 0 %}
+      <label for="plot-select">Metric:</label>
+      <select id="plot-select">
+        {% for p in plots %}
+          {% set raw = p.metric or '' %}
+          {% set disp = p.display if p.display is defined else (raw|replace('plot_', '')) %}
+          <option value="{{ raw|e }}" {% if loop.first %}selected{% endif %}>{{ disp }}</option>
+        {% endfor %}
+      </select>
+      <div style="margin-top:0.75rem;">
+        <span id="biotypeFilter" style="display:none;">
+          <label style="vertical-align:top;">Biotypes:</label>
+          <span id="biotypeBox" style="display:inline-block; max-width:260px; vertical-align:top;"></span>
+        </span>
+        <span style="margin-left:1rem;">Manual range: <input id="zoom-xmin" style="width:120px;" placeholder="start"> - <input id="zoom-xmax" style="width:120px;" placeholder="end"> <button id="zoomBtn">Go</button> <button id="resetZoom">Full</button></span>
+      </div>
+  <div id="plotlyChart" style="width:100%; max-width:100%; height:540px; margin-top:10px;"></div>
+  <h3>Genes in selected window <button id="genesResetBtn" type="button" style="display:none; margin-left:8px; font-size:12px; padding:4px 10px;">Reset</button></h3>
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px; flex-wrap:wrap;">
+        <label for="ensemblVersionSelect" style="margin:0; font-size:13px;">Ensembl version:</label>
+        <select id="ensemblVersionSelect"></select>
+        <!-- Gene search: searches only genes currently loaded for the file (within its min/max) -->
+        <div style="display:inline-flex; gap:6px; margin-left:auto; position:relative;">
+          <input id="geneSearchInput" placeholder="Search" style="min-width:220px; max-width:360px; padding:6px; font-size:13px;" autocomplete="off" />
+          <div id="geneSuggestBox" role="listbox" aria-label="Gene suggestions" style="position: absolute; right: 0; top: calc(100% + 6px); background:var(--card); border:1px solid var(--border); box-shadow:0 8px 30px rgba(2,6,23,0.06); max-height:260px; overflow:auto; min-width:260px; z-index:1500; display:none;"></div>
+        </div>
+        <!-- Sorting handled by clicking table headers (file-manager style) -->
+      </div>
+      <div class="genes-scroll">
+        <table id="genesTbl" border="0" cellpadding="4" cellspacing="0">
+          <thead><tr>
+            <th data-key="label" class="sortable">Label <span class="sort-indicator"></span></th>
+            <th data-key="start" class="sortable">Start <span class="sort-indicator"></span></th>
+            <th data-key="end" class="sortable">End <span class="sort-indicator"></span></th>
+            <th data-key="biotype" class="sortable">Biotype <span class="sort-indicator"></span></th>
+            <th data-key="overlap_bp" class="sortable">Overlap (bp) <span class="sort-indicator"></span></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    {% else %}
+      <p>No plots available.</p>
+    {% endif %}
+  </div>
+
+  <p><a class="back" href="{{ url_for('index') }}">← Run another</a></p>
+  <span id="run-meta" data-run-id="{{ run_id }}" data-species="{{ species }}" data-chromosome="{{ chromosome }}" hidden></span>
+  <script id="match-data" type="application/json">{{ match | tojson }}</script>
+  <div id="hoverTooltip" class="hover-tooltip" hidden><div id="hoverContent"></div></div>
+  <!-- Full-screen SFS modal -->
+  <div id="sfsModal" style="display:none; position:fixed; inset:0; z-index:1400; background:rgba(2,6,23,0.75); backdrop-filter: blur(2px);">
+    <div id="sfsModalBox" role="dialog" aria-modal="true" aria-labelledby="sfsModalTitle" style="position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); width:min(96vw, 1100px); height:min(90vh, 800px); background:var(--card); border:1px solid var(--border); border-radius:10px; box-shadow:0 20px 60px rgba(0,0,0,0.4); display:flex; flex-direction:column;">
+      <div style="display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:1px solid var(--border);">
+        <strong id="sfsModalTitle">SFS distribution</strong>
+        <button id="sfsModalClose" aria-label="Close" style="font-size:18px; line-height:1; padding:4px 10px;">×</button>
+      </div>
+      <div style="flex:1; min-height:0; padding:6px;">
+        <div id="sfsFullPlot" style="width:100%; height:100%;"></div>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+
+<script id="plotly-cdn" src="https://cdn.jsdelivr.net/npm/plotly.js-dist@2.32.0/plotly.min.js" crossorigin="anonymous"></script>
+<script>
+// Interactive Plotly-based metric viewer with accurate coordinate → genome mapping, with CDN fallback & delayed init.
+(function(){
+  const metaEl = document.getElementById('run-meta');
+  const runId = metaEl ? metaEl.getAttribute('data-run-id') : null;
+  const speciesConst = metaEl ? metaEl.getAttribute('data-species') : null;
+  const chromosomeConst = metaEl ? metaEl.getAttribute('data-chromosome') : null;
+  const selMetric = document.getElementById('plot-select');
+  // Removed mode selector; always use drag zoom
+  const chartDiv = document.getElementById('plotlyChart');
+  const tbody = document.querySelector('#genesTbl tbody');
+  const genesScroll = document.querySelector('.genes-scroll');
+  const biotypeBox = document.getElementById('biotypeBox');
+  const zxmin = document.getElementById('zoom-xmin');
+  const zxmax = document.getElementById('zoom-xmax');
+  const zoomBtn = document.getElementById('zoomBtn');
+  const resetBtn = document.getElementById('resetZoom');
+  // Clear genes button removed per request
+
+  let globalRange = { xmin: null, xmax: null };
+  let currentMetric = selMetric ? selMetric.value : null;
+  let lastGenesWindow = null;
+  let fullGenes = [];
+  let pinned = false;
+  let pinnedGenes = [];
+  // Sorting preferences for genes table
+  let geneSortKey = 'start'; // default column
+  let geneSortDir = 'asc';   // 'asc' or 'desc'
+  let lastHoverPos = null;
+
+  // Compute accent color from CSS variable and provide helper to build rgba strings.
+  function _hexToRgb(hex){
+    if(!hex) return [37,99,235];
+    hex = hex.trim();
+    if(hex[0]==='#') hex = hex.slice(1);
+    if(hex.length===3) hex = hex.split('').map(c=>c+c).join('');
+    if(hex.length!==6) return [37,99,235];
+    const r = parseInt(hex.slice(0,2),16), g = parseInt(hex.slice(2,4),16), b = parseInt(hex.slice(4,6),16);
+    return [r,g,b];
+  }
+  const _accentCss = getComputedStyle(document.body).getPropertyValue('--accent').trim() || '#2563eb';
+  const _accentRgb = _hexToRgb(_accentCss.replace(/\s/g,''));
+  function ACCENT_RGBA(a){ return `rgba(${_accentRgb[0]},${_accentRgb[1]},${_accentRgb[2]},${a})`; }
+
+  // Expose CSS variables so stylesheet hover/active colors match Plotly shapes exactly
+  (function syncAccentCssVars(){
+    try{
+      const root = document.documentElement;
+      root.style.setProperty('--accent-hover', ACCENT_RGBA(0.30));
+      root.style.setProperty('--accent-active', ACCENT_RGBA(0.55));
+    }catch(e){ /* noop */ }
+  })();
+
+  function sanitizeMetric(m){ return (m||'').trim(); }
+
+  // Fetch available Ensembl versions for this species and populate selector
+  function populateEnsemblSelector(){
+    try{
+      const sel = document.getElementById('ensemblVersionSelect');
+      if(!sel) return;
+      const species = metaEl ? metaEl.getAttribute('data-species') : null;
+      if(!species) return;
+      fetch(`/annotation_versions?species=${encodeURIComponent(species)}`).then(r => {
+        if(!r.ok) return;
+        return r.json().then(j => {
+          if(!j || !Array.isArray(j.ensembl_versions)) return;
+          // Clear extras; selector will be repopulated with versions only
+          const cur = sel.value;
+          sel.innerHTML = '';
+          j.ensembl_versions.forEach(v => {
+            const opt = document.createElement('option'); opt.value = v; opt.textContent = v; sel.appendChild(opt);
+          });
+          // Default to the latest (numerically largest) if user hasn't already selected one
+          if(!cur && j.ensembl_versions.length){
+            sel.value = j.ensembl_versions[j.ensembl_versions.length - 1];
+          } else if(cur){ sel.value = cur; }
+        }).catch(()=>{});
+      }).catch(()=>{});
+    }catch(e){/* noop */}
+  }
+  // Kick off population (best-effort)
+  populateEnsemblSelector();
+
+  function fetchMetric(metric, xmin=null, xmax=null){
+    if(!metric) return Promise.reject('metric missing');
+    const params = new URLSearchParams({ metric: metric });
+    if (xmin != null && xmin !== '') params.append('xmin', xmin);
+    if (xmax != null && xmax !== '') params.append('xmax', xmax);
+    // Ensure RAiSD report is ready before requesting metric_data. If RAiSD is still
+    // processing, poll the run's final endpoint for readiness to avoid partial reads
+    // and spurious parse errors.
+    function checkReportReady(){
+      return fetch(`/runs/${encodeURIComponent(runId)}/final?nowait=1`).then(r => {
+        if(!r.ok) return Promise.reject(new Error('failed to check report readiness'));
+        return r.json().then(j => j && (j.status === 'ready'));
+      }).catch(_ => false);
+    }
+
+    function waitForReady(timeoutMs = 3 * 60 * 1000, intervalMs = 2500){
+      const start = Date.now();
+      return new Promise((resolve, reject) => {
+        (function poll(){
+          checkReportReady().then(ready => {
+            if(ready) return resolve(true);
+            if(Date.now() - start > timeoutMs) return reject(new Error('timeout waiting for RAiSD report')); 
+            setTimeout(poll, intervalMs);
+          }).catch(() => {
+            if(Date.now() - start > timeoutMs) return reject(new Error('timeout waiting for RAiSD report'));
+            setTimeout(poll, intervalMs);
+          });
+        })();
+      });
+    }
+
+    return waitForReady().then(()=>{
+      return fetch(`/runs/${encodeURIComponent(runId)}/metric_data?` + params.toString())
+        .then(r => {
+          if(!r.ok) return r.text().then(t => { throw new Error(t || r.statusText); });
+          return r.json();
+        })
+        .then(data => {
+          if(data.error) throw new Error(data.error);
+          if(globalRange.xmin === null){ globalRange.xmin = data.global_xmin; globalRange.xmax = data.global_xmax; }
+          return data;
+        });
+    }).catch(err => {
+      // Bubble up an explicit error so callers show friendly message
+      throw new Error(err && err.message ? err.message : 'report not ready');
+    });
+  }
+
+  function bindInteractions(){
+    if(!(chartDiv && chartDiv.on)) return; // Plot not ready
+    // Remove previous handlers by re-creating noop clone (Plotly lacks off helper); simplest is to rely on newPlot clearing old ones.
+    chartDiv.on('plotly_relayout', (d) => {
+      if(!d) return;
+      const xr0 = d['xaxis.range[0]'];
+      const xr1 = d['xaxis.range[1]'];
+      if(Number.isFinite(xr0)&&Number.isFinite(xr1)&&xr1>xr0){
+        zxmin.value = Math.floor(xr0);
+        zxmax.value = Math.floor(xr1);
+        showGenesWindow(xr0, xr1);
+        // If user zoomed back to near-full range (>=99% coverage) clear filters
+        if(globalRange.xmin!=null && globalRange.xmax!=null){
+          const fullSpan = globalRange.xmax - globalRange.xmin;
+          const curSpan = xr1 - xr0;
+            if(fullSpan>0 && curSpan/fullSpan >= 0.99){
+                  // If the user previously selected a window, keep that gene list visible
+                  // even when the plot is zoomed back out to the full range. If no
+                  // selection exists, fall back to the previous behavior of clearing
+                  // filters for a full view.
+                  if(lastGenesWindow){
+                    // Leave lastGenesWindow and displayed gene rows intact.
+                    // Ensure biotype filter visibility reflects that we have an active selection.
+                    showBiotypeFilter();
+                  } else {
+                    clearFilters(false); // false => don't refetch metric (already full)
+                    hideBiotypeFilter();
+                  }
+                } else {
+                  showBiotypeFilter();
+                }
+        }
+      }
+      if(d['xaxis.autorange']){
+        // When autorange (e.g. double-click/full reset) occurs, prefer to keep
+        // the user's selected-window genes visible if one exists. Only clear if
+        // there is no lastGenesWindow stored.
+        if(lastGenesWindow){
+          // keep existing selection displayed
+        } else {
+          clearFilters();
+          hideBiotypeFilter();
+        }
+      }
+    });
+    chartDiv.on('plotly_doubleclick', ()=>{ clearFilters(); });
+    // Hover events: filter genes list to overlapping genes (unless pinned)
+    chartDiv.on('plotly_hover', (eventData) => {
+      if(!eventData || !eventData.points || !eventData.points.length) return;
+      const pos = eventData.points[0].x;
+      lastHoverPos = pos;
+      if(!pinned) handlePlotHoverPosition(pos);
+    });
+    chartDiv.on('plotly_unhover', () => {
+      if(pinned) return; // keep subset if pinned
+      clearHoverGeneShapes();
+      if(fullGenes.length) renderGeneRows(fullGenes);
+    });
+    // Click: pin current subset
+    chartDiv.on('plotly_click', (eventData) => {
+      if(!eventData || !eventData.points || !eventData.points.length) return;
+      const pos = eventData.points[0].x;
+      lastHoverPos = pos;
+      const subset = genesAtPosition(pos);
+      if(subset.length){
+        pinned = true; pinnedGenes = subset.slice();
+        const btn = document.getElementById('genesResetBtn'); if(btn) btn.style.display='inline-block';
+        applyHoverGeneShapes(subset);
+        renderGeneRows(subset, true);
+      }
+    });
+  }
+
+  function renderMetric(metric, xmin=null, xmax=null){
+    currentMetric = metric;
+    fetchMetric(metric, xmin, xmax).then(data => {
+  const trace = { x: data.positions, y: data.values, mode: 'lines', name: data.metric, opacity: 0.8,
+          // Provide a concise hover template so programmatic hover shows useful info
+          hovertemplate: 'Position: %{x}<br>Value: %{y:.6f}<extra></extra>' };
+      // Convert metric name to math formatting if recognized
+      function normKey(s){ return (s||'').replace(/[^0-9A-Za-z]+/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'').toLowerCase(); }
+      const MATH_TITLES = {
+        'mu_var': 'μVar',
+        'mu_sfs': 'μSFS',
+        'mu_ld': 'μLD',
+        'mu': 'μ',
+        'sweep_tr': 'sweepTR',
+        'mu_var_sweep_tr': 'μVar (sweepTR)'
+      };
+      let titleText = data.metric || '';
+      const k = normKey(titleText);
+      if(MATH_TITLES[k]) titleText = MATH_TITLES[k];
+      // Use Number.isFinite so 0 is treated as a valid numeric bound.
+      const rangeVal = (Number.isFinite(xmin) && Number.isFinite(xmax)) ? [Number(xmin), Number(xmax)] : undefined;
+      const layout = {
+        title: { text: titleText },
+        margin: { t: 40, r: 20, b: 50, l: 60 },
+        paper_bgcolor: getComputedStyle(document.body).getPropertyValue('--card').trim(),
+        plot_bgcolor: getComputedStyle(document.body).getPropertyValue('--card').trim(),
+        font: { color: getComputedStyle(document.body).getPropertyValue('--fg').trim() },
+        xaxis: { title: 'Position', range: rangeVal, color: getComputedStyle(document.body).getPropertyValue('--fg').trim(), gridcolor: getComputedStyle(document.body).getPropertyValue('--border').trim() },
+        yaxis: { title: { text: '' }, color: getComputedStyle(document.body).getPropertyValue('--fg').trim(), gridcolor: getComputedStyle(document.body).getPropertyValue('--border').trim() },
+        dragmode: 'zoom'
+      };
+      // For sweep_TR metric, fix y-axis to 0..1 instead of autorange
+      try {
+        if (k === 'sweep_tr') {
+          layout.yaxis.range = [0, 1];
+          layout.yaxis.autorange = false;
+        }
+      } catch (e) {
+        // ignore
+      }
+      // Keep the positions on the chart element so mouse handlers can access them
+      chartDiv._positions = data.positions || [];
+
+      return Plotly.newPlot(chartDiv, [trace], layout, {
+        displaylogo:false,
+        responsive:true,
+        modeBarButtonsToRemove:['select2d','lasso2d']
+      });
+    }).then(()=>{
+      bindInteractions();
+      // Attach a mousemove handler that converts cursor X -> data X, finds
+      // the nearest point index and triggers Plotly.Fx.hover so the tooltip
+      // appears when hovering anywhere over the line (not only over markers).
+      try{
+        // Remove old handler if present (re-plotting happens on metric change)
+        if(chartDiv._mouseHoverHandler){ chartDiv.removeEventListener('mousemove', chartDiv._mouseHoverHandler); chartDiv._mouseHoverHandler = null; }
+
+        const nearestIndex = (arr, x) => {
+          if(!arr || !arr.length) return -1;
+          let lo = 0, hi = arr.length - 1;
+          if(x <= arr[0]) return 0;
+          if(x >= arr[hi]) return hi;
+          while(lo < hi){
+            const mid = Math.floor((lo + hi) / 2);
+            if(arr[mid] === x) return mid;
+            if(arr[mid] < x) lo = mid + 1; else hi = mid;
+          }
+          // lo is first index with arr[lo] >= x, compare lo and lo-1
+          const a = arr[lo], b = arr[lo-1];
+          return (Math.abs(a - x) < Math.abs(b - x)) ? lo : (lo-1);
+        };
+
+        let raf = null;
+        const handler = (ev) => {
+          // Throttle with rAF for smoother behaviour
+          const clientX = ev.clientX;
+          if(raf) { raf.clientX = clientX; return; }
+          raf = requestAnimationFrame(() => {
+            try{
+              const fullLayout = chartDiv._fullLayout;
+              if(!fullLayout) { raf = null; return; }
+              const margin = fullLayout.margin || {l:0, r:0};
+              const rect = chartDiv.getBoundingClientRect();
+              const plotWidth = (fullLayout.width || rect.width) - (margin.l || 0) - (margin.r || 0);
+              const relX = (raf.clientX || clientX) - rect.left - (margin.l || 0);
+              if(relX < 0 || relX > plotWidth){ Plotly.Fx.unhover(chartDiv); raf = null; return; }
+              const xrange = (fullLayout.xaxis && fullLayout.xaxis.range) ? fullLayout.xaxis.range : null;
+              if(!xrange) { Plotly.Fx.unhover(chartDiv); raf = null; return; }
+              const xval = xrange[0] + (relX / plotWidth) * (xrange[1] - xrange[0]);
+              const idx = nearestIndex(chartDiv._positions || [], xval);
+              if(idx >= 0){
+                // Trigger hover on the nearest point (curveNumber 0 for the main trace)
+                Plotly.Fx.hover(chartDiv, [{ curveNumber: 0, pointNumber: idx }]);
+              } else {
+                Plotly.Fx.unhover(chartDiv);
+              }
+            }catch(e){}
+            raf = null;
+          });
+        };
+
+        chartDiv._mouseHoverHandler = handler;
+        chartDiv.addEventListener('mousemove', handler);
+        chartDiv.addEventListener('mouseleave', () => { try{ Plotly.Fx.unhover(chartDiv); }catch(e){} });
+      }catch(e){ /* non-fatal */ }
+      // If a manual numeric range was provided, refresh genes table for that range.
+      if(Number.isFinite(parseFloat(zxmin.value)) && Number.isFinite(parseFloat(zxmax.value)) && parseFloat(zxmax.value) > parseFloat(zxmin.value)){
+        showGenesWindow(parseFloat(zxmin.value), parseFloat(zxmax.value));
+      } else {
+        // No manual zoom: automatically show genes for the full global range so annotations are visible by default
+        if (globalRange.xmin != null && globalRange.xmax != null) {
+          try {
+            showGenesWindow(globalRange.xmin, globalRange.xmax);
+          } catch (e) {
+            tbody.innerHTML='';
+          }
+        } else {
+          tbody.innerHTML='';
+        }
+      }
+    }).catch(err => {
+      const msg = (err && err.message) ? err.message : String(err || '');
+      // Network/fetch errors -> show immediately
+      if (/failed to fetch|networkerror|offline/i.test(msg)) {
+        chartDiv.innerHTML = '<div style="color:#b00;">Network error while loading metric: ' + msg + '</div>';
+        return;
+      }
+
+  // For other errors (parsing, 500 responses, partial writes), show a lightweight message
+  chartDiv.innerHTML = '<div style="color:#b00;">Error while loading metric. Please reload the page or try again later.</div>';
+    });
+  }
+
+  function selectedBiotypes(){
+    if(!biotypeBox) return [];
+    return Array.from(biotypeBox.querySelectorAll('input[type=checkbox]:checked')).map(cb=>cb.value);
+  }
+
+  function ensureBiotypeCheckboxes(list){
+    if(!biotypeBox) return;
+    const existing = new Set(Array.from(biotypeBox.querySelectorAll('input[type=checkbox]')).map(cb=>cb.value));
+    let changed = false;
+    list.forEach(bt => { if(!existing.has(bt)){ changed=true; } });
+    if(!changed && existing.size === list.length) return; // no update needed
+    biotypeBox.innerHTML = '';
+    if(list.length === 0){ biotypeBox.textContent='(none)'; return; }
+    list.forEach(bt => {
+      const id = 'bt_' + bt.replace(/[^A-Za-z0-9_\-]+/g,'_');
+      const lbl = document.createElement('label');
+      lbl.style.display='inline-flex';
+      lbl.style.alignItems='center';
+      lbl.style.margin='0 6px 4px 0';
+      lbl.style.fontSize='12px';
+      lbl.innerHTML = `<input type="checkbox" value="${bt}" id="${id}" style="margin-right:4px;">${bt}`;
+      biotypeBox.appendChild(lbl);
+    });
+    biotypeBox.addEventListener('change', () => { if(lastGenesWindow){ showGenesWindow(lastGenesWindow.start, lastGenesWindow.end); } });
+  }
+
+  function showGenesWindow(start, end){
+    if(!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+  // Prefer the in-scope constants, but fall back to the hidden run-meta dataset if missing.
+  const metaEl = document.getElementById('run-meta');
+  const species = speciesConst || (metaEl ? metaEl.getAttribute('data-species') : '') || '';
+  const rawChrom = (chromosomeConst || (metaEl ? metaEl.getAttribute('data-chromosome') : '') || '');
+  // Validate required params before calling server. If missing, try to scrape them
+  // from the visible summary fields (fallback for cases where data-* attrs are not set).
+  function scrapeSummaryField(label){
+    try{
+      const items = Array.from(document.querySelectorAll('.card ul.kv li'));
+      for(const li of items){
+        const span = li.querySelector('span');
+        const strong = li.querySelector('strong');
+        if(!span || !strong) continue;
+        if(span.textContent.trim().toLowerCase() === label.toLowerCase()){
+          return strong.textContent.trim();
+        }
+      }
+    }catch(_){ }
+    return '';
+  }
+
+  if(!species){
+    const scraped = scrapeSummaryField('Species');
+    if(scraped) {
+      // template displays species with underscores replaced by space; prefer original folder name
+      species = scraped.replace(/\s+/g, '_');
+    }
+  }
+  if(!rawChrom){
+    const scrapedChr = scrapeSummaryField('Chromosome');
+    if(scrapedChr){ rawChrom = scrapedChr; }
+  }
+  if(!species || !rawChrom){
+    // Provide detailed diagnostic info in the genes table so debugging is easier
+    const metaDataset = {};
+    try { if(metaEl){ metaDataset.runId = metaEl.getAttribute('data-run-id'); metaDataset.species = metaEl.getAttribute('data-species'); metaDataset.chromosome = metaEl.getAttribute('data-chromosome'); } } catch(_){}
+    const diag = [];
+    diag.push(['speciesConst', String(speciesConst)]);
+    diag.push(['chromosomeConst', String(chromosomeConst)]);
+    diag.push(['meta.dataset.species', String(metaDataset.species)]);
+    diag.push(['meta.dataset.chromosome', String(metaDataset.chromosome)]);
+    const scrapedSpecies = (species && species!==speciesConst) ? species : '';
+    const scrapedChrom = (rawChrom && rawChrom!==String(chromosomeConst)) ? rawChrom : '';
+    diag.push(['scraped_species', String(scrapedSpecies)]);
+    diag.push(['scraped_chromosome', String(scrapedChrom)]);
+    let html = '<tr><td colspan="5"><strong>Missing metadata — diagnostics</strong><br><table style="width:100%;font-size:12px;border-collapse:collapse;">';
+    diag.forEach(r => { html += `<tr><td style="padding:4px;border-top:1px solid #eee;">${r[0]}</td><td style="padding:4px;border-top:1px solid #eee;">${r[1] || '<em>(empty)</em>'}</td></tr>`; });
+    html += '</table></td></tr>';
+    tbody.innerHTML = html;
+    console.warn('showGenesWindow: missing metadata', {speciesConst, chromosomeConst, metaDataset, scrapedSpecies, scrapedChrom});
+    return;
+  }
+  // Normalize chromosome to match annotation filenames (strip leading 'chr' if present)
+  const chromosome = (String(rawChrom || '')).replace(/^chr/i, '');
+    const selBts = selectedBiotypes();
+    const btParam = selBts.length ? `&biotypes=${encodeURIComponent(selBts.join(','))}` : '';
+    lastGenesWindow = {start, end};
+
+    // Helper to render a structured error message in the genes table
+    function renderGenesError(msg){ tbody.innerHTML = `<tr><td colspan="5">${String(msg).replace(/</g,'&lt;')}</td></tr>`; }
+
+    function showLoadingRow(){
+      tbody.innerHTML = '<tr id="genes-loading"><td colspan="5" style="text-align:center; padding:12px;"><span class="spinner" style="display:inline-block; width:18px; height:18px; border:3px solid rgba(0,0,0,0.12); border-top-color:var(--fg); border-radius:50%; animation:spin 0.9s linear infinite; vertical-align:middle; margin-right:8px;"></span>Loading genes...</td></tr>';
+    }
+
+    // Minimal spinner animation CSS injection (scoped inline so no global stylesheet edits needed)
+    (function(){
+      const styleId = 'genes-spinner-style';
+      if(!document.getElementById(styleId)){
+        const s = document.createElement('style'); s.id = styleId; s.textContent = '@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}'; document.head.appendChild(s);
+      }
+    })();
+
+    // Try primary form first, then an alternate with/without 'chr' prefix if 404 or not found.
+    const tryChromVariants = [chromosome];
+    if (!(String(chromosome||'').toLowerCase().startsWith('chr'))) tryChromVariants.push('chr' + chromosome);
+    else tryChromVariants.push(String(chromosome).replace(/^chr/i, ''));
+
+    let tried = 0;
+    function attemptNext(){
+      if(tried >= tryChromVariants.length){ renderGenesError('No annotation file found for chromosome variants attempted.'); return; }
+      const chr = tryChromVariants[tried++];
+  const ensemblEl = document.getElementById('ensemblVersionSelect');
+  const ensemblVal = ensemblEl ? ensemblEl.value : '';
+  const verParam = ensemblVal ? `&ensembl_version=${encodeURIComponent(ensemblVal)}` : '';
+  const url = `/genes?species=${encodeURIComponent(species)}&chromosome=${encodeURIComponent(chr)}&start=${Math.floor(start)}&end=${Math.floor(end)}${btParam}${verParam}`;
+      // show loading row while we wait for the server
+      try{ showLoadingRow(); }catch(e){}
+      fetch(url).then(r => {
+        if(!r.ok){
+          // Try next variant if 404 (not found) or show server message otherwise
+          try{ document.getElementById('genes-loading')?.remove(); }catch(e){}
+          if(r.status === 404){ return attemptNext(); }
+          return r.text().then(t => { renderGenesError(`Server error: ${t || r.statusText}`); });
+        }
+        return r.json().then(data => {
+          try{ document.getElementById('genes-loading')?.remove(); }catch(e){}
+          tbody.innerHTML='';
+          if(data.available_biotypes){ ensureBiotypeCheckboxes(data.available_biotypes); }
+          const UCSC_ASSEMBLY = {
+            'Homo_sapiens': 'hg38',
+            'Mus_musculus': 'mm39',
+            'Arabidopsis_thaliana': 'araTha1'
+          };
+          const assembly = UCSC_ASSEMBLY[species];
+          const chrName = (String(chr||'')).startsWith('chr') ? chr : `chr${chr}`;
+          fullGenes = data.genes || [];
+          if(pinned){ pinned=false; pinnedGenes=[]; const btn=document.getElementById('genesResetBtn'); if(btn) btn.style.display='none'; }
+          (fullGenes).forEach(g => {
+            const tr = document.createElement('tr');
+            // Prefer to make every gene label a useful clickable entry. Some genes
+            // do not have a dedicated GeneCards card (direct page), so use the
+            // GeneCards search page which always returns a results/search view.
+            // If an Ensembl stable id is available, also add an Ensembl link.
+            let link = g.label || g.gene_id || '';
+            if (link) {
+              // Sanitize the query we send to GeneCards. GeneCards can return
+              // "Invalid Query Parameters" for queries with certain punctuation
+              // or empty values, so remove dangerous characters and collapse
+              // whitespace. If empty, prefer the Ensembl id or a safe fallback.
+              let rawSym = String(link || '');
+              // Strip problematic punctuation, keep alnum/underscore/hyphen for a safe query
+              let sanitizedSym = rawSym.replace(/[^A-Za-z0-9_\-]+/g, ' ').replace(/\s+/g, ' ').trim();
+              if(!sanitizedSym && g.gene_id) sanitizedSym = String(g.gene_id).trim();
+              if(!sanitizedSym) sanitizedSym = 'gene';
+              const sym = encodeURIComponent(sanitizedSym);
+              // If the cleaned symbol differs from the original raw symbol then the
+              // original likely contained characters that some search endpoints
+              // reject. Prefer Ensembl (if ENS id) or NCBI Gene search in that case.
+              let geneSearchUrl = `https://www.genecards.org/Search/Keyword?query=${sym}`;
+              if(sanitizedSym !== rawSym.trim()){
+                if(g.gene_id && /^ENS[A-Z0-9]*/i.test(g.gene_id)){
+                  const ensemblSpecies = (species || '').replace(/\s+/g,'_') || '';
+                  geneSearchUrl = `https://www.ensembl.org/${ensemblSpecies}/Search/Results?q=${sym}`;
+                } else {
+                  geneSearchUrl = `https://www.ncbi.nlm.nih.gov/gene/?term=${sym}`;
+                }
+              }
+              // When coordinates are available, include them as data attrs so hover
+              // highlighting still works. Use the search URL (robust) as the href.
+              const dataStart = Number.isFinite(g.start) ? ` data-start="${g.start}"` : '';
+              const dataEnd = Number.isFinite(g.end) ? ` data-end="${g.end}"` : '';
+              // Prefer direct Ensembl links: if we have an Ensembl stable id, link
+              // to the Ensembl gene summary. Otherwise use Ensembl search with
+              // species context for best results.
+              // Force Ensembl summary URL for Homo_sapiens as requested. Use gene_id
+              // when available; otherwise use sanitized symbol as the 'g' parameter.
+              const ensemblIdOrSymbol = g.gene_id ? String(g.gene_id) : sanitizedSym;
+              const ensemblHref = `https://www.ensembl.org/Homo_sapiens/Gene/Summary?g=${encodeURIComponent(ensemblIdOrSymbol)}`;
+              link = `<a class="gene-link"${dataStart}${dataEnd} href="${ensemblHref}" target="_blank" rel="noopener" title="Open Ensembl for ${g.label || g.gene_id}">${g.label || g.gene_id}</a>`;
+              // If we have an Ensembl-like id, append a small Ensembl link next to the label
+              if (g.gene_id && /^ENS[A-Z0-9]*/i.test(g.gene_id)){
+                const ensemblSpecies = (species || '').replace(/\s+/g,'_') || '';
+                const ensemblUrl = `https://www.ensembl.org/${ensemblSpecies}/Gene/Summary?g=${encodeURIComponent(g.gene_id)}`;
+                link += ` <a class="gene-external" href="${ensemblUrl}" target="_blank" rel="noopener" title="Open Ensembl entry for ${g.gene_id}">${g.gene_id}</a>`;
+              }
+            }
+            tr.innerHTML = `<td>${link}</td><td>${g.start}</td><td>${g.end}</td><td>${g.biotype||''}</td><td>${g.overlap_bp}</td>`;
+            tbody.appendChild(tr);
+          });
+          if((data.genes||[]).length===0){ tbody.innerHTML='<tr><td colspan="5">No genes</td></tr>'; }
+          attachGeneHoverHandlers();
+        });
+  }).catch(e => { try{ document.getElementById('genes-loading')?.remove(); }catch(_){}; renderGenesError('Gene fetch error: ' + (e && e.message ? e.message : String(e))); });
+    }
+
+    attemptNext();
+  }
+
+  // Event handlers
+  if(selMetric){
+    selMetric.addEventListener('change', ()=>{
+      // Preserve current plot zoom when switching metrics. If the chart has a
+      // current x-axis range, pass it through to renderMetric so the new metric
+      // is drawn with the same zoom. Do not clear the manual zoom inputs so the
+      // user's selection remains visible.
+      tbody.innerHTML = '';
+      let curX0 = null, curX1 = null;
+      try{
+        if(chartDiv && chartDiv._fullLayout && chartDiv._fullLayout.xaxis && Array.isArray(chartDiv._fullLayout.xaxis.range)){
+          const r = chartDiv._fullLayout.xaxis.range;
+          if(r && r.length === 2){ curX0 = Number(r[0]); curX1 = Number(r[1]); }
+        }
+      }catch(_){ /* ignore */ }
+      if(Number.isFinite(curX0) && Number.isFinite(curX1)){
+        renderMetric(selMetric.value, curX0, curX1);
+      } else {
+        renderMetric(selMetric.value);
+      }
+    });
+  }
+  if(zoomBtn){ zoomBtn.addEventListener('click', ()=>{ const a=parseFloat(zxmin.value); const b=parseFloat(zxmax.value); if(Number.isFinite(a)&&Number.isFinite(b)&&b>a){ renderMetric(currentMetric,a,b); } else { alert('Provide valid numeric start/end (start < end)'); } }); }
+  // When the user changes the Ensembl version, refresh the currently displayed
+  // genes (if any window is active) so the new version's TSV is loaded.
+  const ensemblSelectGlobal = document.getElementById('ensemblVersionSelect');
+  if(ensemblSelectGlobal){
+    ensemblSelectGlobal.addEventListener('change', ()=>{
+      if(lastGenesWindow && Number.isFinite(lastGenesWindow.start) && Number.isFinite(lastGenesWindow.end)){
+        // Re-query genes using the newly-selected ensembl version
+        try{ showGenesWindow(lastGenesWindow.start, lastGenesWindow.end); }catch(e){ /* noop */ }
+      }
+    });
+  }
+
+  // Header-click sorting (single-column like Windows file manager)
+  (function setupHeaderSorting(){
+    const headers = Array.from(document.querySelectorAll('#genesTbl thead th.sortable'));
+    headers.forEach(th => {
+      th.setAttribute('tabindex', '0');
+      th.setAttribute('role', 'button');
+      th.style.cursor = 'pointer';
+      th.addEventListener('click', (evt)=>{
+        const key = th.getAttribute('data-key');
+        if(!key) return;
+        if(geneSortKey === key){
+          geneSortDir = (geneSortDir === 'asc') ? 'desc' : 'asc';
+        } else {
+          geneSortKey = key; geneSortDir = 'asc';
+        }
+        // update indicators and re-render
+        updateHeaderIndicators();
+        if(pinned && pinnedGenes.length) renderGeneRows(pinnedGenes, true); else renderGeneRows(fullGenes || []);
+      });
+      th.addEventListener('keydown', (evt)=>{ if(evt.key === 'Enter' || evt.key === ' '){ evt.preventDefault(); th.click(); } });
+    });
+    function updateHeaderIndicators(){
+      headers.forEach(h => {
+        const k = h.getAttribute('data-key');
+        const span = h.querySelector('.sort-indicator');
+        if(!span) return;
+        if(k === geneSortKey) span.textContent = geneSortDir === 'asc' ? ' ▲' : ' ▼'; else span.textContent = '';
+      });
+    }
+    window._updateGeneHeaderIndicators = updateHeaderIndicators;
+    updateHeaderIndicators();
+  })();
+  function clearFilters(refetch=true){
+    zxmin.value='';
+    zxmax.value='';
+    if(biotypeBox){ biotypeBox.querySelectorAll('input[type=checkbox]').forEach(cb=>cb.checked=false); }
+    lastGenesWindow=null;
+    tbody.innerHTML='';
+    if(refetch && currentMetric){ renderMetric(currentMetric, globalRange.xmin, globalRange.xmax); }
+  hideBiotypeFilter();
+  }
+  if(resetBtn){ resetBtn.addEventListener('click', ()=>{ clearFilters(); }); }
+  function hideBiotypeFilter(){ const f = document.getElementById('biotypeFilter'); if(f) f.style.display='none'; }
+  function showBiotypeFilter(){ const f = document.getElementById('biotypeFilter'); if(f) f.style.display='inline-block'; }
+  // Removed clear genes button handler
+
+  function attachGeneHoverHandlers(){
+    const links = tbody.querySelectorAll('a.gene-link[data-start][data-end]');
+    links.forEach(a => {
+      a.addEventListener('mouseenter', () => {
+  if(pinned) return; // don't redraw highlight when pinned
+        const s = parseFloat(a.getAttribute('data-start'));
+        const e = parseFloat(a.getAttribute('data-end'));
+        if(!Number.isFinite(s)||!Number.isFinite(e)||e<=s) return;
+        highlightRange(s,e,a.textContent);
+      });
+      a.addEventListener('mouseleave', () => { clearHighlight(); });
+  // Do not bind focus/blur handlers here — forcing focus can trigger scrolling in some browsers.
+    });
+  }
+
+  function highlightRange(start,end,label){
+    if(!chartDiv || !window.Plotly) return;
+    const shape = {
+      type: 'rect',
+      xref: 'x', yref: 'paper',
+      x0: start, x1: end,
+      y0: 0, y1: 1,
+      fillcolor: ACCENT_RGBA(0.18),
+      line: {color: ACCENT_RGBA(0.9), width: 1},
+      layer: 'below'
+    };
+    const ann = {
+      x: (start+end)/2, y: 1, xref: 'x', yref: 'paper',
+      text: label || '',
+      showarrow: false,
+      yanchor: 'bottom',
+      font: {size: 10, color: '#d2691e'}
+    };
+    // Replace shapes/annotations arrays with single highlight
+    Plotly.relayout(chartDiv, { shapes: [shape], annotations: (chartDiv.layout.annotations||[]).filter(a=>!a._geneTmp).concat([{...ann,_geneTmp:true}]) });
+  }
+
+  function clearHighlight(){
+  if(pinned) return; // keep pinned region shapes intact
+    if(!chartDiv || !window.Plotly) return;
+    const anns = (chartDiv.layout.annotations||[]).filter(a=>!a._geneTmp);
+    Plotly.relayout(chartDiv, { shapes: [], annotations: anns });
+  }
+
+  // --- Plot hover gene highlighting ---
+  let hoverGeneShapeIds = 0;
+  function clearHoverGeneShapes(){
+    if(!chartDiv || !window.Plotly) return;
+    const anns = (chartDiv.layout.annotations||[]).filter(a=>!a._hoverGene);
+    const shapes = (chartDiv.layout.shapes||[]).filter(s=>!s._hoverGene);
+    Plotly.relayout(chartDiv, { shapes, annotations: anns });
+  }
+  function applyHoverGeneShapes(regions){
+    if(!chartDiv || !window.Plotly) return;
+    clearHoverGeneShapes();
+    const existingShapes = chartDiv.layout.shapes||[];
+    const existingAnns = chartDiv.layout.annotations||[];
+    const newShapes = regions.map(r=>({
+      type:'rect', xref:'x', yref:'paper', x0:r.start, x1:r.end, y0:0, y1:1,
+      fillcolor: ACCENT_RGBA(0.15), line:{color: ACCENT_RGBA(0.7), width:1}, layer:'below', _hoverGene:true, _id:++hoverGeneShapeIds
+    }));
+    // Stack annotation labels vertically (no overlap) near top of plot area.
+    const maxAnn = 8;
+    const yTop = 0.995; const yStep = 0.035; // stays within plot (downwards)
+    const limited = regions.slice(0, maxAnn).sort((a,b)=>a.start - b.start);
+    const newAnns = limited.map((r,i)=>({
+      x:(r.start+r.end)/2,
+      y: yTop - i*yStep,
+      xref:'x', yref:'paper',
+      text:r.label||'',
+      showarrow:false,
+      font:{size:10},
+      yanchor:'bottom',
+      _hoverGene:true
+    }));
+    Plotly.relayout(chartDiv, { shapes: existingShapes.concat(newShapes), annotations: existingAnns.concat(newAnns) });
+  }
+  function clearGeneRowHighlights(){
+    tbody.querySelectorAll('tr.gene-active').forEach(tr=>tr.classList.remove('gene-active'));
+  }
+  // Zoom helper: zoom the plot to [start, end] with a padding fraction (0..0.5)
+  function zoomToGene(start, end, padFrac){
+    if(!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+    if(!globalRange || globalRange.xmin==null || globalRange.xmax==null){
+      try{ Plotly.relayout(chartDiv, { 'xaxis.range': [start, end] }); }catch(_){ }
+      return;
+    }
+    const fullMin = globalRange.xmin; const fullMax = globalRange.xmax;
+    const span = Math.max(1, end - start);
+    const pad = Math.max(1, Math.floor(span * (Number.isFinite(padFrac) ? padFrac : 0.15)));
+    const left = Math.max(fullMin, start - pad);
+    const right = Math.min(fullMax, end + pad);
+    try{ Plotly.relayout(chartDiv, { 'xaxis.range': [left, right] }); }catch(_){ }
+  }
+  function renderGeneRows(genes, activate=false){
+    tbody.innerHTML='';
+    if(!genes.length){ tbody.innerHTML='<tr><td colspan="5">No genes</td></tr>'; return; }
+    // Sort according to user's preference before rendering
+    try{
+      genes = genes.slice(); // copy
+      const k = geneSortKey;
+      genes.sort((a,b)=>{
+        let va = a[k]; let vb = b[k];
+        if(va === null || va === undefined) va = '';
+        if(vb === null || vb === undefined) vb = '';
+        if(k === 'start' || k === 'end' || k === 'overlap_bp'){
+          va = Number(va); vb = Number(vb);
+          if(isNaN(va)) va = 0; if(isNaN(vb)) vb = 0;
+          return geneSortDir === 'asc' ? va - vb : vb - va;
+        }
+        va = String(va).toLowerCase(); vb = String(vb).toLowerCase();
+        if(va < vb) return geneSortDir === 'asc' ? -1 : 1;
+        if(va > vb) return geneSortDir === 'asc' ? 1 : -1;
+        return 0;
+      });
+    }catch(e){ /* ignore sorting errors and render unsorted */ }
+    // Map species to UCSC assembly (same as earlier) so pinned/subset rows keep working links.
+    const UCSC_ASSEMBLY = { 'Homo_sapiens': 'hg38', 'Mus_musculus': 'mm39', 'Arabidopsis_thaliana': 'araTha1' };
+    const species = speciesConst;
+    const assembly = UCSC_ASSEMBLY[species];
+    const chrName = (chromosomeConst||'').startsWith('chr') ? chromosomeConst : `chr${chromosomeConst}`;
+    genes.forEach(g => {
+      const tr = document.createElement('tr');
+      let linkHtml = g.label || g.gene_id || '';
+      if (linkHtml) {
+        // Sanitize and choose a safe search endpoint. Prefer GeneCards but if the
+        // cleaned query differs from the raw label use NCBI or Ensembl search.
+        let rawSym = String(linkHtml || '');
+        let sanitizedSym = rawSym.replace(/[^A-Za-z0-9_\-]+/g, ' ').replace(/\s+/g, ' ').trim();
+        if(!sanitizedSym && g.gene_id) sanitizedSym = String(g.gene_id).trim();
+        if(!sanitizedSym) sanitizedSym = 'gene';
+        const sym = encodeURIComponent(sanitizedSym);
+        let geneSearchUrl = `https://www.genecards.org/Search/Keyword?query=${sym}`;
+        if(sanitizedSym !== rawSym.trim()){
+          if(g.gene_id && /^ENS[A-Z0-9]*/i.test(g.gene_id)){
+            const ensemblSpecies = (species || '').replace(/\s+/g,'_') || '';
+            geneSearchUrl = `https://www.ensembl.org/${ensemblSpecies}/Search/Results?q=${sym}`;
+          } else {
+            geneSearchUrl = `https://www.ncbi.nlm.nih.gov/gene/?term=${sym}`;
+          }
+        }
+        const dataStart = Number.isFinite(g.start) ? ` data-start="${g.start}"` : '';
+        const dataEnd = Number.isFinite(g.end) ? ` data-end="${g.end}"` : '';
+        // Prefer Ensembl links for all genes.
+        const ensemblIdOrSymbol = g.gene_id ? String(g.gene_id) : sanitizedSym;
+        linkHtml = `<a class="gene-link"${dataStart}${dataEnd} href="https://www.ensembl.org/Homo_sapiens/Gene/Summary?g=${encodeURIComponent(ensemblIdOrSymbol)}" target="_blank" rel="noopener">${g.label || g.gene_id}</a>`;
+      }
+      tr.innerHTML = `<td>${linkHtml}</td><td>${g.start}</td><td>${g.end}</td><td>${g.biotype||''}</td><td>${g.overlap_bp}</td>`;
+      if(activate) tr.classList.add('gene-active');
+      tbody.appendChild(tr);
+    });
+    attachGeneHoverHandlers();
+    try{ if(window._updateGeneHeaderIndicators) window._updateGeneHeaderIndicators(); }catch(e){}
+  }
+  function genesAtPosition(pos){
+    return fullGenes.filter(g => Number.isFinite(g.start) && Number.isFinite(g.end) && pos >= g.start && pos <= g.end);
+  }
+  function handlePlotHoverPosition(pos){
+    if(!Number.isFinite(pos)) return;
+    if(lastGenesWindow && pos>=lastGenesWindow.start && pos<=lastGenesWindow.end){
+      const subset = genesAtPosition(pos);
+      if(subset.length){ applyHoverGeneShapes(subset); renderGeneRows(subset, true); }
+      else { clearHoverGeneShapes(); renderGeneRows([]); }
+      return;
+    }
+  // Outside current window: do NOT auto-change window (prevents random window jumps). Simply ignore.
+  // If desired we could show a subtle indicator; for now we no-op.
+  }
+
+  function start(){
+    if(!window.Plotly){ return; }
+  if(currentMetric) renderMetric(currentMetric);
+  }
+
+  // Gene search + suggestion box: operate only on genes that are within the file's available global range
+  (function bindGeneSearch(){
+    const input = document.getElementById('geneSearchInput');
+    const suggestBox = document.getElementById('geneSuggestBox');
+    if(!input || !suggestBox) return;
+
+    let suggestions = [];
+    let selIndex = -1;
+    const MAX_SUGGEST = 35;
+
+    function poolGenes(){
+      // Prefer current window genes (lastGenesWindow) if set, else fullGenes; both are populated by showGenesWindow
+      let pool = [];
+      if(Array.isArray(fullGenes) && fullGenes.length) pool = fullGenes.slice();
+      // Filter to genes that overlap the file's global range (defensive)
+      if(globalRange.xmin!=null && globalRange.xmax!=null){
+        pool = pool.filter(g => Number.isFinite(g.start) && Number.isFinite(g.end) && !(g.end < globalRange.xmin || g.start > globalRange.xmax));
+      }
+      return pool;
+    }
+
+    function updateSuggestions(){
+      const q = (input.value||'').trim().toLowerCase();
+      if(!q){ suggestions = []; renderSuggestBox(); return; }
+      let pool = poolGenes();
+      // If pool empty but we know file bounds, fetch annotations for full file range and retry shortly
+      if((!pool || pool.length===0) && globalRange.xmin!=null && globalRange.xmax!=null){
+        showGenesWindow(globalRange.xmin, globalRange.xmax);
+        setTimeout(()=>{ suggestions = poolGenes().filter(matcher).slice(0, MAX_SUGGEST); renderSuggestBox(); }, 500);
+        return;
+      }
+
+      function matcher(g){
+        const lab = (g.label||'').toLowerCase();
+        const gid = (g.gene_id||'').toLowerCase();
+        return lab.indexOf(q) !== -1 || gid.indexOf(q) !== -1;
+      }
+      suggestions = (pool||[]).filter(matcher).slice(0, MAX_SUGGEST);
+      selIndex = -1;
+      renderSuggestBox();
+    }
+
+    function renderSuggestBox(){
+      suggestBox.innerHTML = '';
+      if(!suggestions || suggestions.length === 0){ suggestBox.style.display = 'none'; return; }
+      suggestions.forEach((g,i) => {
+        const el = document.createElement('div');
+        el.setAttribute('role','option');
+        el.className = 'gene-suggest-item';
+        el.style.padding = '6px 10px';
+        el.style.cursor = 'pointer';
+        el.style.borderBottom = '1px solid rgba(0,0,0,0.04)';
+        el.style.fontSize = '13px';
+        // highlight matched substring in label
+        const q = (input.value||'').trim();
+        let labelHtml = (g.label||'');
+        if(q){
+          try{
+            const idx = labelHtml.toLowerCase().indexOf(q.toLowerCase());
+            if(idx >= 0){ labelHtml = labelHtml.substring(0, idx) + '<strong>' + labelHtml.substring(idx, idx+q.length) + '</strong>' + labelHtml.substring(idx+q.length); }
+          }catch(_){ }
+        }
+        el.innerHTML = `<div><div style="font-weight:600;">${labelHtml}</div><div style="font-size:12px;color:var(--muted)">${g.start} - ${g.end} ${g.biotype?(' | ' + g.biotype):''}</div></div>`;
+        el.addEventListener('mousedown', (ev)=>{ ev.preventDefault(); selectSuggestion(i); });
+        el.addEventListener('mouseenter', ()=>{ selIndex = i; updateSuggestHighlight(); });
+        suggestBox.appendChild(el);
+      });
+      suggestBox.style.display = 'block';
+      updateSuggestHighlight();
+    }
+
+    function updateSuggestHighlight(){
+      const items = Array.from(suggestBox.children);
+      items.forEach((it, idx) => { if(idx === selIndex) it.style.background = 'rgba(0,0,0,0.04)'; else it.style.background = 'transparent'; });
+    }
+
+    function selectSuggestion(i){
+      if(!suggestions || !suggestions[i]) return;
+      const g = suggestions[i];
+      input.value = g.label || g.gene_id || '';
+      suggestions = [];
+      renderSuggestBox();
+      // Zoom & highlight gene (clamped to globalRange)
+      const s = Math.max(globalRange.xmin != null ? globalRange.xmin : g.start, g.start);
+      const e = Math.min(globalRange.xmax != null ? globalRange.xmax : g.end, g.end);
+      renderGeneRows([g], true);
+      applyHoverGeneShapes([g]);
+      // Use same behavior as before (15% padding)
+      zoomToGene(s, e, 0.15);
+      input.blur();
+    }
+
+    // Keyboard navigation
+    input.addEventListener('keydown', (e)=>{
+      // Arrow navigation only when suggestions are visible
+      if(suggestBox.style.display !== 'none'){
+        if(e.key === 'ArrowDown'){ e.preventDefault(); selIndex = Math.min((suggestions.length - 1), selIndex + 1); updateSuggestHighlight(); return; }
+        if(e.key === 'ArrowUp'){ e.preventDefault(); selIndex = Math.max(0, selIndex - 1); updateSuggestHighlight(); return; }
+      }
+      if(e.key === 'Enter'){ e.preventDefault(); if(selIndex >= 0) return selectSuggestion(selIndex); performSearch(); return; }
+      if(e.key === 'Escape'){ suggestions = []; renderSuggestBox(); input.value=''; if(fullGenes && fullGenes.length) renderGeneRows(fullGenes); clearHoverGeneShapes(); try{ Plotly.relayout(chartDiv, { 'xaxis.range': [globalRange.xmin, globalRange.xmax] }); }catch(_){ } return; }
+    });
+
+    // Wire input events
+    input.addEventListener('input', ()=>{ updateSuggestions(); });
+    input.addEventListener('blur', ()=>{ setTimeout(()=>{ suggestions = []; renderSuggestBox(); }, 200); });
+
+    function performSearch(){
+      // If a suggestion is selected, pick it
+      if(selIndex >= 0 && suggestions && suggestions[selIndex]){ selectSuggestion(selIndex); return; }
+      // fallback to previous direct-search behavior (pick first match)
+      const q = (input.value||'').trim().toLowerCase(); if(!q) return;
+      let pool = poolGenes();
+      const matches = (pool||[]).filter(g => { const lab=(g.label||'').toLowerCase(); const gid=(g.gene_id||'').toLowerCase(); return lab.indexOf(q) !== -1 || gid.indexOf(q) !== -1; });
+      if(!matches || matches.length===0){ alert('No matching genes found within the file range.'); return; }
+      selectSuggestion(0);
+    }
+
+    // Enter and Escape are handled on keydown; explicit Go/Clear buttons removed.
+  })();
+
+  // Double-click a gene row to zoom to the gene with a smaller padding.
+  // Use event delegation on tbody so we don't need per-row handlers.
+  (function bindGeneRowDblClick(){
+    if(!tbody) return;
+    tbody.addEventListener('dblclick', (ev) => {
+      // Ignore dblclicks on the link itself to avoid navigating or opening the gene URL
+      const target = ev.target;
+      const tr = target.closest && target.closest('tr');
+      if(!tr || !tbody.contains(tr)) return;
+      if(target.closest && target.closest('a.gene-link')) return; // clicked on link
+      // Parse start/end from row cells (assumes table columns order is label,start,end,...)
+      try{
+        const cells = tr.children;
+        if(!cells || cells.length < 3) return;
+        const s = parseFloat(cells[1].textContent.trim());
+        const e = parseFloat(cells[2].textContent.trim());
+        if(Number.isFinite(s) && Number.isFinite(e) && e > s){
+          // Use a smaller padding fraction for dblclick (7%)
+          zoomToGene(s, e, 0.07);
+          // Highlight the row and show shapes similar to selectSuggestion
+          const gene = { start: s, end: e, label: (cells[0].textContent||'').trim(), biotype: cells[3] ? cells[3].textContent.trim() : '' };
+          renderGeneRows([gene], true);
+          applyHoverGeneShapes([gene]);
+        }
+      }catch(_){ }
+    });
+  })();
+
+  // Reset button restores full gene list and unpins
+  (function(){ const btn = document.getElementById('genesResetBtn'); if(!btn) return; btn.addEventListener('click', ()=>{ pinned=false; pinnedGenes=[]; btn.style.display='none'; clearHoverGeneShapes(); if(fullGenes.length) renderGeneRows(fullGenes); }); })();
+
+  // Wait for Plotly (in case CDN blocked, retry a few times)
+  let attempts = 0;
+  (function waitForPlotly(){
+    if(window.Plotly){ start(); return; }
+    attempts += 1;
+    if(attempts === 3){
+      // attempt manual load fallback by injecting alt CDN
+      if(!document.getElementById('plotly-fallback')){
+        const s = document.createElement('script');
+        s.id='plotly-fallback';
+        s.src='https://cdn.plot.ly/plotly-2.32.0.min.js';
+        s.onload = start;
+        document.head.appendChild(s);
+      }
+    }
+    if(attempts > 10){
+      chartDiv.innerHTML = '<div style="color:#b00;">Plotly failed to load (offline?). Falling back to static images is recommended.</div>';
+      return;
+    }
+    setTimeout(waitForPlotly, 400);
+  })();
+})();
+// Hover tooltips for JSD supplementary info (SFS comparison & top matches)
+(function(){
+  const matchDataTag = document.getElementById('match-data');
+  let matchData = {};
+  try { matchData = JSON.parse(matchDataTag?.textContent || '{}'); } catch(_){ matchData = {}; }
+  const tooltip = document.getElementById('hoverTooltip');
+  const content = document.getElementById('hoverContent');
+  // collect SFS compare triggers (support both new .sfs-compare-btn and legacy #sfsCompareTrigger)
+  const sfsTrigs = Array.from(document.querySelectorAll('.sfs-compare-btn'))
+                    .concat(Array.from(document.querySelectorAll('#sfsCompareTrigger')));
+  const topTrigs = Array.from(document.querySelectorAll('#topMatchesTrigger'));
+  if(!tooltip || !content) return;
+  function posTooltip(ev){
+    const pad = 8;
+    const vw = window.innerWidth; const vh = window.innerHeight;
+    let x = ev.clientX + pad; let y = ev.clientY + pad;
+    const rect = tooltip.getBoundingClientRect();
+    if(x + rect.width > vw - 10) x = vw - rect.width - 10;
+    if(y + rect.height > vh - 10) y = vh - rect.height - 10;
+    tooltip.style.left = x + 'px';
+    tooltip.style.top = y + 'px';
+  }
+  function openSfsModal(){
+    const modal = document.getElementById('sfsModal');
+    const closeBtn = document.getElementById('sfsModalClose');
+    if(!modal) return;
+    modal.style.display = 'block';
+    function close(){ modal.style.display = 'none'; try{ Plotly.purge('sfsFullPlot'); }catch(_){ } document.removeEventListener('keydown', esc); }
+    function esc(e){ if(e.key==='Escape') close(); }
+    if(closeBtn){ closeBtn.onclick = close; }
+    modal.addEventListener('click', (e)=>{ if(e.target === modal) close(); });
+    document.addEventListener('keydown', esc);
+    // build the full plot
+    try{
+      const inp = matchData.input_sfs || matchData.observed_sfs || [];
+      const expBest = matchData.best_expected_sfs || [];
+      if(!(inp.length && expBest.length && window.Plotly)) return;
+      const x = inp.map((_,i)=>i+1);
+      const mainPlot = document.getElementById('plotlyChart');
+      let metricColor = '#60a5fa';
+      try{ if(mainPlot && mainPlot.data && mainPlot.data[0] && mainPlot.data[0].line && mainPlot.data[0].line.color){ metricColor = mainPlot.data[0].line.color; } }catch(_){ }
+      // read picked
+      let pickedDM = '', pickedPop = '';
+      try{ pickedDM = (document.getElementById('model-used-text')?.textContent||'').trim(); pickedPop = (document.getElementById('pop-used-text')?.textContent||'').trim(); }catch(_){ }
+      const bestDM = matchData.demographic_model || '';
+      const bestPop = matchData.population || '';
+      const norm = (s) => String(s||'').replace(/\s+/g,'').replace(/_/g,'').toLowerCase();
+      const sameAsBest = pickedDM && pickedPop && (norm(pickedDM)===norm(bestDM)) && (norm(pickedPop)===norm(bestPop));
+      // Plot user's data + best-match first, then add the picked model trace on top
+      const traces = [];
+      traces.push({ x, y: inp, type:'scatter', mode:'lines', name:"User's data", line:{color: metricColor, width:1}, opacity:0.8 });
+      traces.push({ x, y: expBest, type:'scatter', mode:'lines', name:'Best Match', line:{color:'#fb923c', width:1}, opacity:0.8 });
+
+      const layout = { margin:{t:40,l:50,r:10,b:45}, legend:{orientation:'h'}, title:{text:'SFS',font:{size:14}}, paper_bgcolor:getComputedStyle(document.body).getPropertyValue('--card').trim(), plot_bgcolor:getComputedStyle(document.body).getPropertyValue('--card').trim(), font:{color:getComputedStyle(document.body).getPropertyValue('--fg').trim()} };
+
+      // Render base plot (user + best). We'll add the picked trace afterward so it is always on top.
+      const hostDiv = document.getElementById('sfsFullPlot');
+      try {
+        Plotly.newPlot(hostDiv, traces, layout, {displaylogo:false,responsive:true});
+      } catch(_){ /* fall back silently */ }
+
+      // If the user has selected a different model/pop (and it's not the best match),
+      // attempt to locate its expected_sfs in the in-page match data; if not found,
+      // fetch it from the server and add as a new trace on top.
+      if(pickedDM && pickedPop && !sameAsBest){
+        let pickedVec = null;
+        try{
+          const tops = matchData.top_matches || [];
+          for(const t of tops){ if(norm(t.demographic_model)===norm(pickedDM) && norm(t.population)===norm(pickedPop) && Array.isArray(t.expected_sfs)){ pickedVec = t.expected_sfs; break; } }
+          if(!pickedVec){ const all = matchData.all_jsd || []; for(const a of all){ if(norm(a.demographic_model)===norm(pickedDM) && norm(a.population)===norm(pickedPop) && Array.isArray(a.expected_sfs)){ pickedVec = a.expected_sfs; break; } } }
+        }catch(_){ }
+
+        const addPickedToPlot = (vec, src) => {
+          if(!hostDiv || !Array.isArray(vec)) return;
+          try{
+            Plotly.addTraces(hostDiv, [{ x, y: vec, type:'scatter', mode:'lines', name:'Picked Model', line:{color:'#22c55e', width:1}, opacity:0.8 }]);
+            console.log('[SFS] Added Picked Model trace (source:', src, ')');
+          }catch(e){ console.warn('[SFS] Failed to add picked trace:', e); }
+        };
+
+        if(pickedVec){
+          addPickedToPlot(pickedVec, 'top_matches');
+        } else {
+          // Fetch expected_sfs for the selected dm/pop and add on top when available
+          const runId = (document.getElementById('run-meta')||{}).getAttribute && document.getElementById('run-meta').getAttribute('data-run-id');
+          const url = `/runs/${encodeURIComponent(runId)}/expected_sfs?dm=${encodeURIComponent(pickedDM)}&pop=${encodeURIComponent(pickedPop)}`;
+          console.log('[SFS] Fetching picked model SFS for full modal:', {pickedDM, pickedPop, url});
+          fetch(url).then(r=>r.json()).then(js => {
+            if(js && Array.isArray(js.expected_sfs)) addPickedToPlot(js.expected_sfs, 'fetch');
+            else console.warn('[SFS] No expected_sfs in response for full modal:', js);
+          }).catch((err)=> console.error('[SFS] Error fetching picked model SFS for full modal:', err));
+        }
+      }
+    }catch(_){ }
+  }
+
+  function showTooltip(ev, mode){
+    if(!matchData) return;
+    if(mode === 'sfs'){
+      const inp = matchData.input_sfs || matchData.observed_sfs || [];
+      const expBest = matchData.best_expected_sfs || [];
+      if(inp.length && expBest.length && window.Plotly){
+  content.innerHTML = '<div id="sfsMiniPlot" style="width:420px;height:280px;"></div>';
+        const plotDiv = document.getElementById('sfsMiniPlot');
+        const x = inp.map((_,i)=>i+1);
+    // Determine picked dm/pop from visible header
+        let pickedDM = '', pickedPop = '';
+        try{
+          const md = document.getElementById('model-used-text');
+          const pp = document.getElementById('pop-used-text');
+          pickedDM = (md && md.textContent) ? md.textContent.trim() : '';
+          pickedPop = (pp && pp.textContent) ? pp.textContent.trim() : '';
+        }catch(_){ }
+  const bestDM = matchData.demographic_model || '';
+  const bestPop = matchData.population || '';
+  // normalize for robust comparison (ignore spaces/underscores/case)
+  const norm = (s) => String(s||'').replace(/\s+/g,'').replace(/_/g,'').toLowerCase();
+  const sameAsBest = pickedDM && pickedPop && (norm(pickedDM) === norm(bestDM)) && (norm(pickedPop) === norm(bestPop));
+        // Build traces: user's input, best expected, and optionally picked expected (if different)
+        const traces = [];
+        try {
+          // Attempt to reuse the metric plot's first trace color so the SFS user's
+          // line exactly matches the metric's line color. Fall back to a sensible
+          // default if we can't read it.
+          let metricColor = '#60a5fa';
+          try {
+            const mainPlot = document.getElementById('plotlyChart');
+            if(mainPlot && mainPlot.data && mainPlot.data[0] && mainPlot.data[0].line && mainPlot.data[0].line.color){
+              metricColor = mainPlot.data[0].line.color;
+            }
+          } catch(_){ /* ignore and use fallback */ }
+          traces.push({ x, y: inp, type:'scatter', mode:'lines', name:"User\'s data", line:{color: metricColor, width:1}, opacity:0.8 });
+          traces.push({ x, y: expBest, type:'scatter', mode:'lines', name:'Best Match', line:{color:'#fb923c', width:1}, opacity:0.8 });
+          if(plotDiv){
+            Plotly.newPlot(plotDiv, traces, { margin:{t:30,l:40,r:10,b:30}, legend:{orientation:'h'}, title:{text:'SFS',font:{size:12}}, paper_bgcolor:getComputedStyle(document.body).getPropertyValue('--card').trim(), plot_bgcolor:getComputedStyle(document.body).getPropertyValue('--card').trim(), font:{color:getComputedStyle(document.body).getPropertyValue('--fg').trim()} }, {displaylogo:false,responsive:false});
+          }
+          // Add picked model trace on top (if different from best match)
+          if(pickedDM && pickedPop && !sameAsBest){
+            let pickedVec = null;
+            try{
+              const tops = matchData.top_matches || [];
+              for(const t of tops){ if(norm(t.demographic_model) === norm(pickedDM) && norm(t.population) === norm(pickedPop) && Array.isArray(t.expected_sfs)){ pickedVec = t.expected_sfs; break; } }
+              if(!pickedVec){ const all = matchData.all_jsd || []; for(const a of all){ if(norm(a.demographic_model) === norm(pickedDM) && norm(a.population) === norm(pickedPop) && Array.isArray(a.expected_sfs)){ pickedVec = a.expected_sfs; break; } } }
+            }catch(_){ }
+            const addPicked = (vec, src) => { if(plotDiv && Array.isArray(vec)){ Plotly.addTraces(plotDiv, [{ x, y: vec, type:'scatter', mode:'lines', name:'Picked Model', line:{color:'#22c55e', width:1}, opacity:0.8 }]); console.log('[SFS] Added Picked Model trace (source:', src, ')'); } };
+            if(pickedVec){ addPicked(pickedVec, 'top_matches'); }
+            else {
+              const runId = (document.getElementById('run-meta')||{}).getAttribute && document.getElementById('run-meta').getAttribute('data-run-id');
+              const url = `/runs/${encodeURIComponent(runId)}/expected_sfs?dm=${encodeURIComponent(pickedDM)}&pop=${encodeURIComponent(pickedPop)}`;
+              console.log('[SFS] Fetching picked model SFS:', {pickedDM, pickedPop, url});
+              fetch(url).then(r=>r.json()).then(js => {
+                if(js && Array.isArray(js.expected_sfs)) addPicked(js.expected_sfs, 'fetch');
+                else console.warn('[SFS] No expected_sfs in response:', js);
+              }).catch((err)=> console.error('[SFS] Error fetching picked model SFS:', err));
+            }
+          }
+        } catch(e){ content.innerHTML='<div style="padding:6px;">Failed to render SFS plot</div>'; }
+      } else {
+        content.innerHTML = '<div style="padding:6px;">SFS data unavailable</div>';
+      }
+    } else if(mode === 'top'){
+      const tops = matchData.top_matches || [];
+      if(!tops.length){ content.innerHTML='<div style="padding:6px;">No match ranking available</div>'; }
+      else {
+        const rows = tops.map((m,i)=>{
+          const jsdTxt = (m.jsd!==undefined && isFinite(m.jsd)) ? m.jsd.toFixed(6) : '';
+            return `<tr><td>${i+1}</td><td>${m.demographic_model||''}</td><td>${m.population||''}</td><td>${jsdTxt}</td></tr>`;
+        }).join('');
+  content.innerHTML = `<table class=\"mini-table\"><thead><tr><th>#</th><th>Demographic Model</th><th>Population</th><th>JSD</th></tr></thead><tbody>${rows}</tbody></table>`;
+      }
+    }
+    tooltip.hidden = false;
+    posTooltip(ev);
+  }
+  function hideTooltip(){ tooltip.hidden = true; }
+  ['mouseenter','focus'].forEach(evName => { sfsTrigs.forEach(el => el.addEventListener(evName, e=>showTooltip(e,'sfs'))); });
+  // Click opens full-screen modal (zoomable)
+  sfsTrigs.forEach(el => el.addEventListener('click', openSfsModal));
+  ['mouseenter','focus'].forEach(evName => { topTrigs.forEach(el => el.addEventListener(evName, e=>showTooltip(e,'top'))); });
+  ['mouseleave','blur'].forEach(evName => { sfsTrigs.forEach(el => el.addEventListener(evName, hideTooltip)); });
+  ['mouseleave','blur'].forEach(evName => { topTrigs.forEach(el => el.addEventListener(evName, hideTooltip)); });
+  document.addEventListener('mousemove', e=>{ if(!tooltip.hidden) posTooltip(e); });
+})();
+// All distances panel: populate from match-data.all_jsd and wire toggle + filter
+(function(){
+  const toggle = document.getElementById('allMatchesToggle');
+  const panel = document.getElementById('allMatchesPanel');
+  const tableBody = document.querySelector('#allMatchesTable tbody');
+  const filterInput = document.getElementById('allMatchesFilter');
+  let allList = [];
+  try { allList = (JSON.parse(document.getElementById('match-data')?.textContent || '{}').all_jsd) || []; } catch(_){ allList = []; }
+
+  // removed per-row spinner; no spin-style necessary
+
+  function renderRows(list){
+    if(!tableBody) return;
+    tableBody.innerHTML = '';
+    if(!list || !list.length){ tableBody.innerHTML = '<tr><td colspan="4">No data</td></tr>'; return; }
+    list.forEach((m,i)=>{
+      const tr = document.createElement('tr');
+      tr.setAttribute('data-dm', m.demographic_model || '');
+      tr.setAttribute('data-pop', m.population || '');
+      tr.style.cursor = 'pointer';
+      const idxTd = document.createElement('td'); idxTd.style.padding='6px'; idxTd.textContent = String(i+1);
+      const mod = document.createElement('td'); mod.style.padding='6px'; mod.textContent = m.demographic_model || '';
+      const pop = document.createElement('td'); pop.style.padding='6px'; pop.textContent = m.population || '';
+  const jsd = document.createElement('td'); jsd.style.padding='6px'; jsd.style.textAlign='right'; jsd.textContent = (m.jsd!==undefined && isFinite(m.jsd)) ? Number(m.jsd).toFixed(6) : '';
+      tr.appendChild(idxTd); tr.appendChild(mod); tr.appendChild(pop); tr.appendChild(jsd);
+      tr.addEventListener('click', ()=> startRescan(tr, m.demographic_model, m.population));
+      tr.addEventListener('keypress', (e)=>{ if(e.key==='Enter' || e.key===' '){ e.preventDefault(); startRescan(tr, m.demographic_model, m.population); }});
+      tr.setAttribute('tabindex', '0');
+      tableBody.appendChild(tr);
+    });
+  }
+
+  function openPanel(){ if(!panel || !toggle) return; panel.style.display='block'; toggle.setAttribute('aria-expanded','true'); toggle.textContent = 'All distances ▴'; }
+  function closePanel(){ if(!panel || !toggle) return; panel.style.display='none'; toggle.setAttribute('aria-expanded','false'); toggle.textContent = 'All distances ▾'; }
+  if(toggle){ toggle.addEventListener('click', ()=>{ if(!panel) return; if(panel.style.display==='none' || panel.style.display===''){ renderRows(allList); openPanel(); } else { closePanel(); } }); }
+  if(filterInput){ filterInput.addEventListener('input', ()=>{ const v = (filterInput.value||'').toLowerCase().trim(); if(!v) return renderRows(allList); const filtered = allList.filter(m => ((m.demographic_model||'') + ' ' + (m.population||'')).toLowerCase().indexOf(v) !== -1); renderRows(filtered); }); }
+  document.addEventListener('keydown', (e)=>{ if(e.key === 'Escape'){ closePanel(); } });
+
+  // Rescan flow
+  const runMeta = document.getElementById('run-meta');
+  const runId = runMeta ? runMeta.getAttribute('data-run-id') : null;
+  let lastRescan = null; // {dm, pop} for UI updates after rescan completes
+
+  function startRescan(rowEl, dm, pop){
+  if(!runId || !dm || !pop) return;
+  lastRescan = { dm: dm, pop: pop };
+  // show overlay
+    showRescanOverlay(dm, pop);
+    rowEl.classList.add('rescan-active');
+
+  fetch(`/runs/${encodeURIComponent(runId)}/rescan`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ demographic_model: dm, population: pop }) })
+      .then(r => r.json().then(j => ({ok:r.ok, status:r.status, body:j})))
+      .then(({ok,status,body})=>{
+        if(!ok){ throw new Error(body && body.error ? body.error : `HTTP ${status}`); }
+        if(!body || !body.job_id){ throw new Error('Missing job id'); }
+        if(body.status === 'done'){
+          // reused/persisted case
+          onRescanDone(rowEl, dm, pop, body.job_id);
+        } else {
+          pollRescan(rowEl, body.job_id);
+        }
+      })
+      .catch(err => {
+        hideRescanOverlay();
+        rowEl.classList.remove('rescan-active');
+        showRescanError('Failed to start rescan: ' + (err && err.message ? err.message : String(err)));
+      });
+  }
+
+  function pollRescan(rowEl, jobId){
+    let tries = 0; const maxTries = 1800; const intervalMs = 2000;
+    const intv = setInterval(() => {
+      tries += 1;
+      fetch(`/runs/${encodeURIComponent(runId)}/rescan_status?job=${encodeURIComponent(jobId)}`)
+        .then(r => r.json())
+        .then(st => {
+          if(st.status === 'done'){
+            clearInterval(intv);
+            onRescanDone(rowEl, st.demographic_model || '', st.population || '', jobId);
+          } else if(st.status === 'error'){
+            clearInterval(intv);
+            onRescanError(rowEl, st.error || 'unknown');
+          }
+        }).catch(()=>{/* ignore transient */});
+      if(tries >= maxTries){ clearInterval(intv); onRescanError(rowEl, 'timeout'); }
+    }, intervalMs);
+  }
+
+  function onRescanDone(rowEl, dm, pop, jobId){
+    // update displayed model/pop to the one that was clicked (if provided)
+    try{
+      if(dm){
+        const modelText = document.getElementById('model-used-text');
+        const modelLink = document.getElementById('model-used-link');
+        if(modelText) modelText.textContent = dm;
+        if(modelLink){
+          // construct docs url similarly to server-side
+          const spec = (document.getElementById('run-meta')||{}).getAttribute && (document.getElementById('run-meta').getAttribute('data-species')||'');
+          const speciesCodeMap = { 'Homo_sapiens':'homsap','Mus_musculus':'musmus','Arabidopsis_thaliana':'aratha' };
+          const sc = speciesCodeMap[spec] || (spec||'').toLowerCase();
+          const anchor = (dm||'').toLowerCase();
+          modelLink.href = 'https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html#sec_catalog_' + sc + '_models_' + anchor;
+        }
+      }
+      if(pop){ const popText = document.getElementById('pop-used-text'); if(popText) popText.textContent = pop; }
+    }catch(_){ }
+    rowEl.classList.remove('rescan-active');
+    hideRescanOverlay();
+    showRescanSuccess('Rescan complete');
+    // update CSV link and refresh sweep_TR
+    refreshAfterRescan();
+  }
+  function onRescanError(rowEl, msg){
+    rowEl.classList.remove('rescan-active');
+    hideRescanOverlay();
+    showRescanError('Rescan failed: ' + msg);
+  }
+
+  function refreshAfterRescan(){
+    try {
+      const link = document.querySelector('a[href*="/report_csv"]');
+      if(link){ link.href = link.href.replace(/([?&])_ts=\d+/, '') + (link.href.includes('?') ? '&' : '?') + '_ts=' + Date.now(); }
+    } catch(_){ }
+    try {
+      const sel = document.getElementById('plot-select'); if(!sel) return; const current = sel.value; const want = Array.from(sel.options).map(o=>o.value).find(v => v && /sweep/i.test(v)) || current; if(want){ sel.value = want; sel.dispatchEvent(new Event('change')); }
+    } catch(_){ }
+    // Also update the RAiSD-AI Report header to reflect the last rescan choice (if available)
+    try{
+      if(lastRescan && lastRescan.dm){
+        const modelText = document.getElementById('model-used-text');
+        const modelLink = document.getElementById('model-used-link');
+        const popText = document.getElementById('pop-used-text');
+        if(modelText) modelText.textContent = lastRescan.dm;
+        if(popText) popText.textContent = lastRescan.pop;
+        if(modelLink){
+          const spec = (document.getElementById('run-meta')||{}).getAttribute && (document.getElementById('run-meta').getAttribute('data-species')||'');
+          const speciesCodeMap = { 'Homo_sapiens':'homsap','Mus_musculus':'musmus','Arabidopsis_thaliana':'aratha' };
+          const sc = speciesCodeMap[spec] || (spec||'').toLowerCase();
+          const anchor = (lastRescan.dm||'').toLowerCase();
+          modelLink.href = 'https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html#sec_catalog_' + sc + '_models_' + anchor;
+        }
+      }
+    }catch(_){ }
+  }
+
+  // Overlay UI helpers (improved animation)
+  function ensureRescanStyle(){
+    if(document.getElementById('rescan-style')) return;
+    const css = `
+      @keyframes rescan-rotate { to { transform: rotate(360deg); } }
+      @keyframes rescan-pulse { 0%{ opacity:0.6; transform:scale(1); } 50%{ opacity:1; transform:scale(1.08); } 100%{ opacity:0.6; transform:scale(1); } }
+      .rescan-overlay { position:fixed; left:0; top:0; right:0; bottom:0; background:rgba(2,6,23,0.45); backdrop-filter: blur(4px) saturate(120%); display:flex; align-items:center; justify-content:center; z-index:1300; }
+      .rescan-box { background:var(--card); border:1px solid var(--border); padding:18px 22px; border-radius:12px; box-shadow:0 10px 40px rgba(2,6,23,0.45); min-width:360px; display:flex; gap:16px; align-items:center; }
+      .rescan-rings { width:56px; height:56px; position:relative; }
+      .rescan-rings svg { width:100%; height:100%; display:block; }
+      .rescan-rings .ring { fill:none; stroke:var(--accent); stroke-opacity:0.12; stroke-width:3; transform-origin:50% 50%; animation:rescan-rotate 2.5s linear infinite; }
+      .rescan-rings .ring.top { stroke-opacity:0.28; stroke-width:3.5; animation-duration:1.6s; }
+      .rescan-text { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; }
+      .rescan-title { font-weight:700; margin-bottom:6px; }
+      .rescan-sub { color:var(--muted); font-size:13px; }
+      .rescan-ellipsis::after { content: ' .'; animation: rescan-ellipsis-anim 1s steps(3,end) infinite; }
+      @keyframes rescan-ellipsis-anim { 0%{ content: ' .'; } 33%{ content: ' ..'; } 66%{ content: ' ...'; } 100%{ content: ' .'; } }
+      .rescan-active-row { animation: rescan-pulse 1.2s ease-in-out infinite; }
+    `;
+    const st = document.createElement('style'); st.id = 'rescan-style'; st.appendChild(document.createTextNode(css)); document.head.appendChild(st);
+  }
+
+  function showRescanOverlay(dm, pop){
+    ensureRescanStyle();
+    // remove any existing overlay so we start fresh
+    const prev = document.getElementById('rescanOverlay'); if(prev) prev.remove();
+    const o = document.createElement('div'); o.id='rescanOverlay'; o.className = 'rescan-overlay';
+    o.setAttribute('role','status'); o.setAttribute('aria-live','polite');
+    const box = document.createElement('div'); box.className = 'rescan-box';
+
+    const rings = document.createElement('div'); rings.className = 'rescan-rings';
+    rings.innerHTML = `
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <circle class="ring" cx="32" cy="32" r="24" stroke-linecap="round" stroke-dasharray="80 150"></circle>
+        <circle class="ring top" cx="32" cy="32" r="14" stroke-linecap="round" stroke-dasharray="40 80"></circle>
+      </svg>
+    `;
+
+    const txt = document.createElement('div'); txt.className = 'rescan-text';
+    const title = document.createElement('div'); title.className = 'rescan-title'; title.textContent = `Rescanning with ${dm} / ${pop}`;
+    const sub = document.createElement('div'); sub.className = 'rescan-sub'; sub.textContent = 'Running model-specific RAiSD-AI scan — this may take a few minutes';
+    txt.appendChild(title); txt.appendChild(sub);
+
+    box.appendChild(rings); box.appendChild(txt); o.appendChild(box);
+    document.body.appendChild(o);
+  }
+
+  function hideRescanOverlay(){ const o=document.getElementById('rescanOverlay'); if(o) o.remove(); }
+
+  function showRescanError(msg){ let o=document.getElementById('rescanError'); if(!o){ o=document.createElement('div'); o.id='rescanError'; o.style.cssText='position:fixed; right:16px; top:16px; z-index:1400; background:#fff2f2; border:1px solid #fecaca; padding:10px 14px; border-radius:6px; color:#7f1d1d; box-shadow:0 6px 20px rgba(0,0,0,0.06);'; document.body.appendChild(o);} o.textContent=msg; setTimeout(()=>{ try{o.style.display='none'}catch(_){ } }, 8000); o.style.display='block'; }
+  function showRescanSuccess(msg){ let o=document.getElementById('rescanSuccess'); if(!o){ o=document.createElement('div'); o.id='rescanSuccess'; o.style.cssText='position:fixed; right:16px; top:16px; z-index:1400; background:#ecfdf5; border:1px solid #bbf7d0; padding:10px 14px; border-radius:6px; color:#065f46; box-shadow:0 6px 20px rgba(0,0,0,0.06);'; document.body.appendChild(o);} o.textContent=msg; setTimeout(()=>{ try{o.style.display='none'}catch(_){ } }, 4500); o.style.display='block'; }
+
+  // Wire best-match elements so user can click to rescan the best match
+  (function bindBestMatchClick(){
+    try{
+      const modelEl = document.getElementById('best-match-model-link');
+      const popEl = document.getElementById('best-match-pop');
+      if(!modelEl || !popEl) return;
+      // Extract model/pop text content
+      const dm = modelEl.textContent.trim();
+      const pop = popEl.textContent.trim();
+      // Make them appear interactive
+      modelEl.classList.add('best-match-action'); popEl.classList.add('best-match-action');
+      modelEl.style.cursor = 'pointer'; popEl.style.cursor = 'pointer';
+      const handler = (e) => { e.preventDefault && e.preventDefault(); const fakeRow = { classList: { add: ()=>{}, remove: ()=>{} } }; startRescan(fakeRow, dm, pop); };
+      modelEl.addEventListener('click', handler);
+      popEl.addEventListener('click', handler);
+      modelEl.addEventListener('keypress', (e)=>{ if(e.key==='Enter' || e.key===' '){ e.preventDefault(); handler(e); } });
+      popEl.addEventListener('keypress', (e)=>{ if(e.key==='Enter' || e.key===' '){ e.preventDefault(); handler(e); } });
+      // Also bind the same behavior to the RAiSD-AI Report model/pop elements so
+      // the two cards behave identically.
+  // Do not attach rescan handlers to the RAiSD-AI Report model/pop here —
+  // keep the RAiSD-AI model as a regular link (template provides target="_blank")
+  // and RAiSD-AI population as plain text.
+    }catch(_){ }
+  })();
+
+})();
+//# sourceMappingURL=all-in-one.js.map
+</script>
+<script>
+// Clean up the run folder when the user leaves this page to avoid filling the disk.
+(function(){
+  const meta = document.getElementById('run-meta');
+  const runId = meta ? meta.getAttribute('data-run-id') : null;
+  if(!runId) return;
+  // Arriving here from processing: clear retain flag so we do clean up when leaving results
+  try { sessionStorage.removeItem('retain-run-' + runId); } catch(_) { }
+  let cleaned = false;
+  function cleanup(){
+    if(cleaned) return; cleaned = true;
+    const url = `/runs/${encodeURIComponent(runId)}/cleanup`;
+    try {
+      if(navigator.sendBeacon){
+        const blob = new Blob([], {type:'text/plain'});
+        navigator.sendBeacon(url, blob);
+        return;
+      }
+    } catch(_) { /* fall through */ }
+    try {
+      fetch(url, { method:'POST', keepalive:true, headers:{'Content-Type':'text/plain'}, body:'' }).catch(()=>{});
+    } catch(_) { /* ignore */ }
+  }
+  // pagehide is more reliable than unload on modern browsers; keep unload as fallback
+  window.addEventListener('pagehide', cleanup, { once:true });
+  window.addEventListener('unload', cleanup, { once:true });
+})();
+</script>
+{% endblock %}

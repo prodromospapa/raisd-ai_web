@@ -1,0 +1,108 @@
+:root { --fg:#111; --bg:#fafafa; --muted:#6b7280; --accent:#2563eb; --warn:#b45309; --card:#fff; --border:#e5e7eb; --field:#fff; }
+body.dark { --fg:#e5e7eb; --bg:#0f172a; --muted:#94a3b8; --accent:#3b82f6; --warn:#fb923c; --card:#1e293b; --border:#334155; --field:color-mix(in srgb, #ffffff 8%, #1e293b 92%); }
+*{ box-sizing:border-box; }
+body{ font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial; margin:0; color:var(--fg); background:var(--bg); transition:background .25s, color .25s; }
+header{ padding:16px 20px; border-bottom:1px solid #e5e7eb; }
+h1{ margin:0; font-size:22px; }
+main{ max-width:900px; margin:24px auto; padding:0 16px; }
+footer{ max-width:900px; margin:24px auto; padding:0 16px; color:var(--muted); font-size:14px; }
+.card{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:18px; margin-bottom:16px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+.grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+label span{ display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
+input[type=number], select{ width:100%; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; font-size:14px; }
+input[type=text], input[type=number], select { background:var(--field); color:var(--fg); }
+/* Inputs without explicit type attribute (default text) */
+#biotype, #zoom-xmin, #zoom-xmax { background:var(--field); color:var(--fg); border:1px solid var(--border); border-radius:10px; padding:6px 10px; font-size:14px; }
+body.dark #biotype, body.dark #zoom-xmin, body.dark #zoom-xmax { border-color:var(--border); }
+input[type=text]:focus, input[type=number]:focus, select:focus { outline:2px solid var(--accent); outline-offset:1px; }
+body.dark input[type=text], body.dark input[type=number], body.dark select { border-color:var(--border); }
+button{ background:var(--accent); color:white; border:none; padding:10px 14px; border-radius:10px; font-weight:600; cursor:pointer; }
+button:hover{ filter:brightness(0.95); }
+body.dark button{ color:#fff; }
+.dropzone{ margin-top:12px; position:relative; border:2px dashed var(--border); border-radius:14px; padding:24px; text-align:center; background:color-mix(in srgb, var(--card) 94%, var(--accent) 6%); transition:background .25s, color .25s; }
+body.dark .dropzone{ background:color-mix(in srgb, var(--card) 90%, var(--accent) 10%); }
+.dropzone.drag{ background:#eef2ff; border-color:#a5b4fc; }
+.dropzone p{ margin:6px 0; }
+.dropzone .muted{ color:var(--muted); font-size:13px; }
+.dropzone input[type=file]{ position:absolute; inset:0; opacity:0; cursor:pointer; }
+.flash{ margin-bottom:16px; }
+.flash-item{ background:#fee2e2; color:#7f1d1d; border:1px solid #fecaca; padding:10px; border-radius:10px; }
+body.dark .flash-item{ background:#7f1d1d; color:#fee2e2; border-color:#b91c1c; }
+.kv{ list-style:none; padding:0; margin:0; display:grid; grid-template-columns:1fr 2fr; gap:8px 12px; }
+.kv li{ display:contents; }
+.kv span{ color:var(--muted); }
+.kv strong{ font-weight:600; }
+.warn{ color:var(--warn); margin-left:.5em; }
+.plot{ width:100%; height:auto; border:1px solid #e5e7eb; border-radius:12px; }
+body.dark .plot{ border-color:var(--border); }
+.back{ text-decoration:none; }
+
+/* Scrollable genes table container so plot + list fit on screen */
+.genes-scroll{ max-height:260px; overflow-y:auto; border:1px solid var(--border); border-radius:10px; margin-top:8px; background:var(--card); }
+.genes-scroll table{ margin:0; width:100%; border-collapse:collapse; }
+.genes-scroll thead th{ position:sticky; top:0; background:color-mix(in srgb, var(--card) 85%, var(--bg) 15%); z-index:1; }
+/* Active gene rows highlighted when hovering plot position. The actual
+	colors are driven by CSS variables --accent-hover and --accent-active so
+	JS can set them to exact rgba(...) to match Plotly highlight shapes. */
+.genes-scroll tbody tr:hover{ background: var(--accent-hover, color-mix(in srgb, var(--accent) 30%, var(--card) 70%)); }
+.genes-scroll tbody tr.gene-active{ background: var(--accent-active, color-mix(in srgb, var(--accent) 55%, var(--card) 45%)) !important; box-shadow:inset 0 0 0 1px var(--accent); }
+/* Genes table grid */
+#genesTbl{ border-collapse:separate; border-spacing:0; }
+#genesTbl th, #genesTbl td{ border:1px solid var(--border); }
+#genesTbl th{ font-weight:600; }
+#genesTbl thead th[role="button"]{ outline: none; }
+#genesTbl thead th[role="button"]:focus{ box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent 78%); border-radius:6px; }
+#genesTbl th:first-child, #genesTbl td:first-child{ border-left:0; }
+#genesTbl tr:first-child th{ border-top:0; }
+
+/* Theme toggle button */
+.theme-toggle{ position:absolute; top:12px; right:16px; background:var(--card); color:var(--fg); border:1px solid var(--border); padding:6px 12px; border-radius:20px; font-size:13px; cursor:pointer; display:inline-flex; align-items:center; gap:6px; }
+.theme-toggle:hover{ filter:brightness(1.05); }
+body.dark .theme-toggle{ box-shadow:0 0 0 1px #475569; }
+
+/* Upload progress */
+.upload-status{ margin-top:12px; }
+.upload-status .label{ font-size:14px; margin:6px 0; }
+.progress{ position:relative; background:color-mix(in srgb,var(--bg) 80%, #ffffff 20%); border:1px solid var(--border); border-radius:10px; height:14px; overflow:hidden; }
+.progress-bar{ position:absolute; inset:0; background:linear-gradient(90deg, color-mix(in srgb,var(--accent) 85%, #ffffff 15%) 0%, var(--accent) 60%, color-mix(in srgb,var(--accent) 80%, #000 20%) 100%); height:100%; width:0; transition:width .35s cubic-bezier(.4,.0,.2,1); will-change:width; box-shadow:0 0 0 1px rgba(0,0,0,.08) inset, 0 1px 2px rgba(0,0,0,.25); overflow:hidden; }
+.progress-bar.animate::after{ content:""; position:absolute; top:0; bottom:0; left:0; width:40%; background:linear-gradient(110deg, transparent 0%, rgba(255,255,255,.55) 45%, rgba(255,255,255,.55) 55%, transparent 100%); animation:pbShimmer 1.1s linear infinite; mix-blend-mode:overlay; }
+.progress-bar.completed{ box-shadow:0 0 0 1px rgba(0,0,0,.12) inset, 0 0 0 2px rgba(255,255,255,.35), 0 2px 6px -1px rgba(0,0,0,.35); }
+body.dark .progress-bar.completed{ box-shadow:0 0 0 1px rgba(255,255,255,.15) inset, 0 0 0 2px rgba(255,255,255,.25), 0 2px 6px -1px rgba(0,0,0,.75); }
+@keyframes pbShimmer { from { transform:translateX(-100%); } to { transform:translateX(250%); } }
+@media (prefers-reduced-motion: reduce){ .progress-bar.animate::after{ animation:pbShimmer 3s linear infinite; } }
+body.dark .progress{ background:color-mix(in srgb,var(--bg) 60%, var(--card) 40%); }
+body.dark .progress-bar{ box-shadow:0 0 0 1px rgba(255,255,255,.05) inset, 0 1px 3px rgba(0,0,0,.6); }
+body.dark .progress-bar.animate::after{ background:linear-gradient(110deg, transparent 0%, rgba(255,255,255,.30) 45%, rgba(255,255,255,.30) 55%, transparent 100%); }
+
+/* Text selection colors */
+::selection { background:color-mix(in srgb, var(--accent) 55%, #ffffff 45%); color:var(--bg); }
+body.dark ::selection { background:#60a5fa; color:#0f172a; }
+
+/* Dark mode link contrast */
+body.dark a{ color:#93c5fd; text-decoration:none; }
+body.dark a:hover, body.dark a:focus{ color:#bfdbfe; text-decoration:underline; }
+/* Special actionable links used for model/population (clickable in RAiSD-AI report) */
+.best-match-action{ color:var(--accent); text-decoration:none; font-weight:700; }
+.best-match-action:hover, .best-match-action:focus{ text-decoration:underline; outline:2px solid transparent; outline-offset:3px; }
+body.dark .best-match-action{ color:#93c5fd; }
+/* Inline hover triggers & tooltip for JSD extras */
+.inline-hover-trigger{ font-size:11px; font-weight:500; margin-left:6px; padding:2px 6px; background:color-mix(in srgb, var(--accent) 12%, var(--card) 88%); border:1px solid var(--border); border-radius:8px; cursor:default; color:var(--accent); line-height:1.3; white-space:nowrap; }
+body.dark .inline-hover-trigger{ background:color-mix(in srgb, var(--accent) 25%, var(--card) 75%); }
+.inline-hover-trigger:focus, .inline-hover-trigger:hover{ outline:2px solid var(--accent); outline-offset:1px; }
+.hover-tooltip{ position:fixed; z-index:1000; background:var(--card); color:var(--fg); border:1px solid var(--border); border-radius:10px; padding:8px 10px; box-shadow:0 4px 16px -2px rgba(0,0,0,.25); width:max-content; max-width:520px; }
+.hover-tooltip table.mini-table{ border-collapse:collapse; width:100%; font-size:11px; }
+.hover-tooltip table.mini-table th, .hover-tooltip table.mini-table td{ border:1px solid var(--border); padding:2px 4px; text-align:left; }
+.hover-tooltip table.mini-table th{ background:color-mix(in srgb, var(--card) 85%, var(--bg) 15%); }
+body.dark .hover-tooltip{ box-shadow:0 4px 16px -2px rgba(0,0,0,.7); }
+
+/* Chromosome select wrapper for neon autofill glow */
+.chromosome-list-wrapper { position: relative; display: inline-block; width:100%; }
+.chromosome-list-wrapper select { position: relative; z-index: 1; border-radius:10px; }
+
+/* All distances table scroll container */
+.all-matches-scroll{ border-radius:8px; overflow:auto; }
+.all-matches-scroll::-webkit-scrollbar{ width:10px; }
+.all-matches-scroll::-webkit-scrollbar-track{ background:transparent; }
+.all-matches-scroll::-webkit-scrollbar-thumb{ background:color-mix(in srgb, var(--accent) 18%, var(--card) 82%); border-radius:8px; border:2px solid transparent; background-clip: padding-box; }
+/* Firefox thin scrollbar */
+.all-matches-scroll{ scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--accent) 18%, var(--card) 82%) transparent; }

@@ -14,8 +14,8 @@ main_parallel = 5
 max_ram_percent = 80
 max_sims_per_work = 1 # can be None
 
-samples = 100
-testing = True # Set to True for testing mode
+samples = 10_000
+testing = False # Set to True for testing mode
 sweep = False
 
 
@@ -77,7 +77,10 @@ else:
 # testing directory and name it consistently with the CSV file base so it's
 # easy to correlate (e.g. testing/{species}_{samples}_failed_parts.jsonl).
 if testing:
-    failed_path = f"testing/{species}_{samples}_failed_parts.jsonl"
+    if sweep:
+        failed_path = f"testing/{species}_{samples}_sweep_failed_parts.jsonl"
+    else:
+        failed_path = f"testing/{species}_{samples}_failed_parts.jsonl"
 else:
     failed_path = f"data/{species_folder_name}/failed_parts.jsonl"
 failed_keys = set()
@@ -142,8 +145,10 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
             ]
 
             if sweep:
-                base_args += ["--sweep-pos", "50",
-                              "--fixation-time","0"
+                base_args += [
+                    "--sweep-pos", "50",
+                    "--fixation-time", "0",
+                    "--sel-s", "0.1",
                 ]
 
 
