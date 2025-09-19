@@ -73,9 +73,11 @@ else:
     else:
         print(f"Running in training mode with sample size {samples}")
 
-# Load existing failed keys so we can skip them
+# Determine failed_parts.jsonl path. When in testing mode we place it in the
+# testing directory and name it consistently with the CSV file base so it's
+# easy to correlate (e.g. testing/{species}_{samples}_failed_parts.jsonl).
 if testing:
-    failed_path = "testing/failed_parts.jsonl"
+    failed_path = f"testing/{species}_{samples}_failed_parts.jsonl"
 else:
     failed_path = f"data/{species_folder_name}/failed_parts.jsonl"
 failed_keys = set()
@@ -97,24 +99,30 @@ if os.path.exists(failed_path):
         # If we can't read the file for some reason, proceed without skipping
         failed_keys = set()
 
-# Count total runs (all model_id × population combinations)
-total_runs = sum(len(pops) for pops in demographic_models.values())
+# Build list of all model_id=population keys and compute remaining work
+all_keys = [f"{model_id}={population}"
+            for model_id, populations in demographic_models.items()
+            for population in populations]
+
+# Exclude runs already present in the sfs CSV and those recorded as failed
+remaining_keys = [k for k in all_keys if k not in sfs_csv.index and k not in failed_keys]
+total_runs = len(remaining_keys)
+
+# If there's nothing left to run, exit with a clear message so users know the
+# SFS CSV is already complete for the selected settings.
+if total_runs == 0:
+    print(f"Nothing to run: SFS file '{file_name}' already contains all entries or runs are marked failed.")
+    import sys
+    sys.exit(0)
 
 with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
     for model_id, populations in demographic_models.items():
         for population in populations:
             reason = "unknown"
             key = f"{model_id}={population}"
-            if key in sfs_csv.index:
-                # already done
-                pbar.update(1)
-                pbar.refresh()
-                continue
-
-            # Skip if this run previously failed and is recorded in failed_parts.jsonl
-            if key in failed_keys:
-                pbar.update(1)
-                pbar.refresh()
+            # Skip keys that are already done or previously failed; they are not
+            # counted in the progress bar total and should not advance it here.
+            if key not in remaining_keys:
                 continue
             if sweep:
                 engine = "discoal"
@@ -281,13 +289,12 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
                 reason = "run_out_of_ram"
 
             if not done:
-                # Record failure for this model/population
-                if testing:
-                    failed_dir = "."
-                else:
-                    failed_dir = f"data/{species_folder_name}"
-                os.makedirs(failed_dir, exist_ok=True)
-                failed_path = os.path.join(failed_dir, "failed_parts.jsonl")
+                # Record failure for this model/population using the same
+                # failed_path we used when reading so testing and non-testing
+                # runs are consistent.
+                failed_dir = os.path.dirname(failed_path) or "."
+                if failed_dir:
+                    os.makedirs(failed_dir, exist_ok=True)
                 record = {
                     "key": f"{model_id}={population}",
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
