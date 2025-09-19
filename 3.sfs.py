@@ -8,14 +8,14 @@ from tqdm import tqdm
 
 species = "Homo sapiens"
 engine ="msprime"
-chromosome = "1"
+chromosome = "21"
 replicates = 10
 main_parallel = 5
 max_ram_percent = 80
 max_sims_per_work = 1 # can be None
 
 samples = 100
-testing = True # Set to True for testing mode
+testing = False # Set to True for testing mode
 
 
 species_dict = {sp.name: sp.id for sp in stdpopsim.all_species()}

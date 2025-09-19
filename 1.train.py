@@ -31,8 +31,8 @@ parser.add_argument("--gpu", action='store_true', default=False,
                     help="Enable GPU mode for simulator/training when supported")
 parser.add_argument("--parallel", type=int, default=None,
                     help="Parallel worker count for simulator runs (default: half of CPUs)")
-parser.add_argument("--engine", type=str, default="msms",
-                    help="Simulation engine to use (default: msms)")
+parser.add_argument("--engine", type=str, default="discoal",
+                    help="Simulation engine to use (default: discoal)")
 args = parser.parse_args()
 
 species = args.species
@@ -120,8 +120,6 @@ def run_simulation(engine,species_id,model_id,population,train_sample_individual
         "--target-snps-tol", "10",
     "--paired-neutral", "neutral.ms",
         ]
-    print(subprocess.list2cmdline(args))
-    exit()
     if gpu:
         args.append("--gpu")
     # run inside the target directory; if it fails, retry once using discoal and add --sweep-time (in generations)
@@ -266,22 +264,27 @@ demographic_models = {
         for m in species_std.demographic_models}
 
 # Progress accounting (models with varying population counts) -----------------
-total_tasks = sum(len(pops) * len(chromosomes) for pops in demographic_models.values())
-
-# Count already completed tasks (model file exists)
+# Count total tasks and determine which are already done or skipped so we
+# can set tqdm's total to only the remaining work for this run. This prevents
+# the ETA from being skewed by previously completed tasks.
 def _model_done(model_id, population, chromosome):
     return os.path.exists(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/RAiSD_Model.model/model.pt")
 
-tasks_done = sum(
-    1
-    for model_id, pops in demographic_models.items()
-    for population in pops
-    for chromosome in chromosomes
-    if _model_done(model_id, population, chromosome)
-)
+# Build list of all task keys and mark which are to be processed this run.
+all_tasks = []  # list of tuples (model_id, population, chromosome)
+for model_id, pops in demographic_models.items():
+    for population in pops:
+        for chromosome in chromosomes:
+            all_tasks.append((model_id, population, chromosome))
 
-first = True
-with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as total_bar:
+# Refresh skipped entries and compute remaining tasks (not done and not skipped)
+existing_skipped = load_skipped()
+remaining_tasks_list = [t for t in all_tasks if (not _model_done(t[0], t[1], t[2])) and (f"{t[0]}={t[1]}" not in existing_skipped)]
+remaining_tasks = len(remaining_tasks_list)
+
+# Use tqdm only for remaining tasks so ETA is meaningful for this run
+with tqdm(total=remaining_tasks, desc="remaining", unit="task") as total_bar:
+    # iterate the same order as before but only act on remaining tasks
     for model_id, populations in demographic_models.items():
         for population in populations:
             for chromosome in chromosomes:
@@ -289,29 +292,20 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                 # refresh skipped set on each iteration to catch skips written by other processes
                 try:
                     latest_skipped = load_skipped()
-                    # any newly recorded skipped keys should be removed from sfs.csv to keep bookkeeping consistent
-                    # update the in-memory set (we no longer modify sfs.csv here)
                     existing_skipped.update(latest_skipped)
                 except Exception:
-                    # if we fail to reload skipped file, fall back to previously loaded set
                     pass
 
+                # skip if canonical skipped list contains this key
                 if key in existing_skipped:
-                    total_bar.update(1)
-                    total_bar.refresh()
-                    # canonical skip list contains this key; no additional skip logging required
                     continue
 
+                # skip if already done
                 if _model_done(model_id, population, chromosome):
-                    total_bar.update(1)
-                    total_bar.refresh()
-                    first = False
-                    # already counted in initial; just continue
                     continue
+
+                # At this point this task is part of remaining work for this run.
                 try:
-                    if first:
-                        pass
-                    first = False
                     sweep_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep.ms"
                     neutral_path = f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/neutral.ms"
                     if not os.path.exists(sweep_path) or not os.path.exists(neutral_path):
@@ -319,14 +313,12 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                             run_simulation(engine, species_id, model_id, population, train_sample_individuals, window, ips, iws, chromosome, train_replicates, sel_s)
                         except subprocess.CalledProcessError as e:
                             reason = f"simulation_error {getattr(e, 'returncode', 'N/A')}"
-                            # include a snippet of stderr if available
                             try:
                                 stderr = getattr(e, 'stderr', '') or ''
                                 if stderr:
                                     reason += f": {stderr.strip()[:200]}"
                             except Exception:
                                 pass
-                            # record failure and skip further processing for this key
                             record_failed(key, reason, source="1.train")
                             existing_skipped.add(key)
                             continue
@@ -363,12 +355,9 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                             if type_ == "neutral":
                                 os.remove(f"data/{species_folder_name}/{model_id}/{population}/{chromosome}/sweep_info.txt")
                         except Exception:
-                            # If any per-type processing fails, ensure we break out to outer loop
                             break
 
-                    # If we reached here without adding the key to skipped, proceed to training
                     if key in existing_skipped:
-                        # already recorded as failed by earlier step
                         continue
 
                     try:
@@ -389,6 +378,6 @@ with tqdm(total=total_tasks, initial=tasks_done, desc="total", unit="task") as t
                     if os.path.exists(img_bin):
                         shutil.rmtree(img_bin)
                 finally:
-                    # Only advance when task just completed (not pre-counted)
+                    # Only advance the progress bar for tasks this run processed
                     total_bar.update(1)
                     total_bar.refresh()
