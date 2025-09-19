@@ -15,7 +15,8 @@ max_ram_percent = 80
 max_sims_per_work = 1 # can be None
 
 samples = 100
-testing = False # Set to True for testing mode
+testing = True # Set to True for testing mode
+sweep = False
 
 
 species_dict = {sp.name: sp.id for sp in stdpopsim.all_species()}
@@ -34,18 +35,25 @@ demographic_models = {
     for m in species_std.demographic_models
 }
 
+if not testing:
+    sweep = False
+
 # Ensure 'testing' is defined (default to False)
 if "testing" not in globals():
     testing = False
+
 if testing: 
-    print(f"Running in testing mode with sample size {samples}")
-    file_name = f"testing/{species}_{samples}.csv"
+    if sweep:
+        file_name = f"testing/{species}_{samples}_sweep.csv"
+    else:
+        file_name = f"testing/{species}_{samples}.csv"
 else:
-    print(f"Running in training mode with sample size {samples}")
     file_name = f"data/{species_folder_name}/sfs.csv"
 
+preset = False
 if os.path.exists(file_name):
     sfs_csv = pd.read_csv(file_name,index_col=0)
+    preset = True
     samples = (sfs_csv.shape[1] // ploidy)+1
 else:
     if testing:
@@ -53,6 +61,17 @@ else:
     else:
         os.makedirs(f"data/{species_folder_name}", exist_ok=True)
     sfs_csv = pd.DataFrame(columns= range(1,ploidy*(samples)))
+
+if testing: 
+    if sweep:
+        print(f"Running in testing mode with sample size {samples} and sweep enabled")
+    else:
+        print(f"Running in testing mode with sample size {samples}")
+else:
+    if preset:
+        print(f"Resuming from existing file {file_name} with sample size {samples}")
+    else:
+        print(f"Running in training mode with sample size {samples}")
 
 # Load existing failed keys so we can skip them
 if testing:
@@ -97,7 +116,8 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
                 pbar.update(1)
                 pbar.refresh()
                 continue
-
+            if sweep:
+                engine = "discoal"
             base_args = [
                 "simulator.py",
                 "--engine", engine,
@@ -112,6 +132,12 @@ with tqdm(total=total_runs, desc="Simulations", unit="run") as pbar:
                 "--sfs-normalized",
                 "--max-ram-percent", str(max_ram_percent),
             ]
+
+            if sweep:
+                base_args += ["--sweep-pos", "50",
+                              "--fixation-time","0"
+                ]
+
 
             if max_sims_per_work is not None:
                 base_args += ["--sims-per-work", str(max_sims_per_work)]
