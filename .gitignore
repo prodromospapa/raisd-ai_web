@@ -17,3 +17,5 @@ website/runs/
 !ui_simulator/**
 ui_simulator/artifacts/
 !ui_simulator.py
+website/__pycache__/
+ui_simulator/__pycache__/
