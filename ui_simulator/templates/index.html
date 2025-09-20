@@ -1,0 +1,284 @@
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Genomic Simulator (Flask)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header><h1>🧬 Genomic Simulator</h1></header>
+
+<main class="wrap">
+  <!-- Species / Model / Chromosome -->
+  <section class="card">
+    <h2>1) Species</h2>
+    <div class="row">
+      <label>Species</label>
+      <select id="species"></select>
+    </div>
+    <div class="row grid-2">
+      <div>
+        <label>2) Demographic Model</label>
+        <select id="model" disabled></select>
+      </div>
+      <div class="right">
+        <a id="catalogLink" class="btn info" href="#" target="_blank" rel="noopener" style="display:none;">Catalog docs</a>
+      </div>
+    </div>
+    <div class="row">
+      <label>3) Chromosome</label>
+      <select id="chromosome" disabled></select>
+    </div>
+    </div>
+  </section>
+
+  <!-- Populations -->
+  <section class="card">
+    <h2>4) Populations & Sample Sizes</h2>
+    <div id="popBuilder" class="pop-builder"></div>
+  </section>
+
+  <!-- Core & Engine -->
+  <section class="card">
+    <h2>Core &amp; Engine</h2>
+    <div class="row grid-4">
+      <div>
+        <label>Engine</label>
+        <select id="engine" disabled></select>
+        
+      </div>
+      <div>
+        <label>Replicates</label>
+        <input type="number" id="replicates" min="1" value="1" disabled>
+      </div>
+      <div>
+        <label>Use native chromosome length</label>
+        <input type="checkbox" id="chrom_length_mode" disabled>
+        <div class="hint" id="chromLenHint" style="display:inline-block; margin-left:0.5rem"></div>
+      </div>
+      <div></div>
+    </div>
+
+    <div class="row grid-3">
+      <div>
+        <label>Length (bp)</label>
+        <input type="number" id="seq_length" min="0" value="0" disabled>
+      </div>
+      <div>
+        <label>Target SNPs</label>
+        <input type="number" id="target_snps" min="0" value="0" disabled>
+      </div>
+      <div>
+        <label>Tolerance</label>
+        <div class="inline">
+          <label><input type="checkbox" id="tol_auto" checked disabled> Auto</label>
+        </div>
+        <input type="number" id="target_snps_tol" min="0.000000001" step="0.1" value="10" disabled>
+      </div>
+    </div>
+
+    <div class="row grid-2">
+      <div>
+        <label>Output format</label>
+        <select id="output_format" disabled>
+          <option>ms</option><option>ms.gz</option><option>vcf</option><option>vcf.gz</option><option>bcf</option>
+        </select>
+      </div>
+      <div>
+  <label>Output path</label>
+  <input type="text" id="output_path" placeholder="output.ms" disabled>
+      </div>
+    </div>
+
+    <div class="row grid-2">
+      <div>
+        <label>Temp location</label>
+        <select id="temp_loc" disabled>
+          <option>local</option><option>system</option>
+        </select>
+      </div>
+    </div>
+  </section>
+
+  <!-- Optimization -->
+  <section class="card">
+    <h2>Optimization</h2>
+    <div class="row grid-3">
+      <div id="parallelBox">
+        <label>Parallel workers</label>
+        <input type="range" id="parallel" min="1" max="1" value="1">
+        <div class="hint">Selected: <span id="parVal">1</span></div>
+      </div>
+      <div id="simsBox">
+        <label>Simulation per Work</label>
+        <label class="inline"><input type="checkbox" id="sims_auto" checked> Auto</label>
+        <input type="range" id="sims_per_work" min="1" max="1" value="1" disabled>
+        <div class="hint">Value: <span id="spwVal">1</span></div>
+      </div>
+      <div id="ramBox">
+        <label>Max RAM %</label>
+        <input type="range" id="max_ram_percent" min="1" max="100" value="80">
+        <div class="hint">Selected: <span id="ramVal">80%</span></div>
+        <div class="inline">
+          <label><input type="radio" name="ram_cap" value="system" checked> system</label>
+          <label><input type="radio" name="ram_cap" value="run"> run</label>
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <label>Growth max fold</label>
+      <input type="text" id="growth_max_fold" value="1.05">
+    </div>
+  </section>
+
+  <!-- SFS -->
+  <section class="card">
+    <h2>Site Frequency Spectrum (SFS)</h2>
+    <div class="row">
+      <label><input type="checkbox" id="sfs_on" disabled> Compute SFS</label>
+    </div>
+    <div id="sfsPanel" class="hide">
+      <div class="row grid-3">
+        <div>
+          <label>SFS output</label>
+          <input type="text" id="sfs_output" placeholder="output.sfs">
+        </div>
+        <div>
+          <label>Normalize SFS</label>
+          <input type="checkbox" id="sfs_normalized">
+        </div>
+        <div>
+          <label>SFS mode</label>
+          <select id="sfs_mode"><option>mean</option><option>per-rep</option></select>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Selection -->
+  <section class="card">
+    <h2>Selection</h2>
+    <div class="row">
+      <label><input type="checkbox" id="sweep_enable" disabled> Sweep (selection)</label>
+    </div>
+    <div id="selPanel" class="hide">
+      <div class="row">
+        <label>Sweep population</label>
+        <select id="sweep_pop"></select>
+      </div>
+      <div class="row grid-3">
+        <div id="posPercentBox">
+          <label>Sweep position (%)</label>
+          <input type="range" id="sweep_pos_percent" min="0" max="100" step="0.1" value="50">
+          <div class="hint" id="posPctLbl">50%</div>
+        </div>
+        <div id="posBpBox" class="hide">
+          <label>Sweep position (bp)</label>
+          <input type="range" id="sweep_pos_bp" min="0" max="0" value="0">
+          <div class="hint" id="posBpHint"></div>
+        </div>
+        <div>
+          <label>Selection Coefficient (s)</label>
+          <input type="number" id="sel_s" step="0.0001" value="0.1">
+        </div>
+      </div>
+      <div class="row grid-3">
+        <div>
+          <label>Time type</label>
+          <select id="time_mode">
+            <option value="">-- pick time type --</option>
+            <option>Sweep Time</option>
+            <option>Fixation Time</option>
+          </select>
+        </div>
+        <div>
+          <label id="timeValueLabel">Time value</label>
+          <input type="text" id="time_value">
+        </div>
+        <div>
+          <label>Units</label>
+          <label class="inline"><input type="radio" name="time_units" value="gens" checked> gens</label>
+          <label class="inline"><input type="radio" name="time_units" value="4N"> 4N</label>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Paired Neutral -->
+  <section class="card" id="pairedCard" style="display:none;">
+    <h2>Paired Neutral output</h2>
+    <div class="row">
+      <label><input type="checkbox" id="paired_neutral"> Run paired neutral</label>
+    </div>
+    <div id="pairedPanel" class="hide">
+      <div class="row grid-2">
+        <div>
+          <label>Paired Neutral output (base)</label>
+          <input type="text" id="paired_neutral_name" placeholder="output_neutral">
+        </div>
+        <div>
+          <label>Neutral engine</label>
+          <select id="neutral_engine">
+            <option value=""> </option>
+            <option value="discoal">discoal</option>
+            <option value="ms">ms</option>
+            <option value="msms">msms</option>
+            <option value="scrm">scrm</option>
+            <option value="msprime">msprime</option>
+          </select>
+          <div class="hint" style="margin-top:0.25rem">* sweep engine</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Build -->
+  <section class="card">
+    <h2>Build</h2>
+    <div class="row">
+      <label><input type="checkbox" id="progress_flag"> Include progress flag</label>
+      <label class="inline"><input type="checkbox" id="run_sfs_only"> Run SFS only (omit primary output)</label>
+    </div>
+
+    <div id="errors" class="errors"></div>
+
+    <div class="row grid-2">
+      <button id="showCmd" class="btn">Show engine command</button>
+      <button id="downloadCmd" class="btn">Download engine command</button>
+    </div>
+
+    <div id="engineCmd" class="codeblock hide"></div>
+    
+    <div class="row grid-2" id="run-controls" style="margin-top:1rem;">
+      <button id="btn-execute" class="btn primary">Execute</button>
+      <button id="btn-cancel" class="btn danger" disabled>Cancel</button>
+    </div>
+
+    <div class="row" id="progress-core-row" style="display:none;">
+      <label>Progress (core)</label>
+      <progress id="core-progress" max="100" value="0" style="width:100%"></progress>
+    </div>
+    <div class="row" id="progress-pn-row" style="display:none;">
+      <label>Progress (paired neutral)</label>
+      <progress id="pn-progress" max="100" value="0" style="width:100%"></progress>
+    </div>
+    <div class="row" id="eta-row" style="display:none;">
+      <label>ETA: <span id="eta-text"></span></label>
+    </div>
+
+    <div class="row" id="artifacts-row" style="display:none;">
+      <h3>Expected artifacts</h3>
+      <ul id="artifacts-list"></ul>
+    </div>
+  </section>
+</main>
+
+<script>
+  window.__INITIAL_STATE__ = {{ stt|tojson }};
+  window.__DERIVED__ = {{ derived|tojson }};
+</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

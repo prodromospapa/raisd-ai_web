@@ -14,8 +14,8 @@ main_parallel = 5
 max_ram_percent = 80
 max_sims_per_work = 1 # can be None
 
-samples = 10_000
-testing = False # Set to True for testing mode
+samples = 100
+testing = True # Set to True for testing mode
 sweep = False
 
 

@@ -1,6 +1,7 @@
 *
 !website/
 !website/**
+website/runs/
 !website_launcher.py
 !install_dependencies.sh
 !raisd-ai.yml
@@ -12,4 +13,6 @@
 !run.sh
 !.gitignore
 !README.md
-!ui_simulator.py
+!ui_simulator/
+!ui_simulator/**
+ui_simulator/artifacts/
