@@ -3792,7 +3792,8 @@ with st.container():
 
         # Separate flag used solely for the Show engine command button so
         # we can disable that button for msprime while leaving execution and
-        # the copyable CLI available when other inputs are valid.
+        # the copyable CLI available when other inputs are valid. Provide
+        # a short explanation caption when Show is disabled to help the user.
         show_engine_disabled = btn_disabled_effective or (engine == "msprime")
         try:
             if paired_neutral_missing:
@@ -3871,22 +3872,33 @@ with st.container():
             except Exception:
                 return False
 
-        # Render Show and Download side-by-side
+        # Render Show and Download side-by-side. When Show is disabled provide
+        # a short explanatory caption so users know why they can't view the
+        # external engine command (e.g. msprime runs in-process).
         col_show, col_dl = st.columns([1,1])
-        if col_show.button("Show engine command", key=f"show_engine_cmd_btn_{model_key}", disabled=show_engine_disabled):
-            # If we already prepared an engine command earlier, just show it
-            cur_engine = st.session_state.get(engine_cmd_key, None)
-            if cur_engine:
-                try:
-                    st.session_state[engine_cmd_visible_key] = True
-                except Exception:
-                    pass
-            else:
-                # Prepare the command and show it (no download mode)
-                ok = prepare_engine_command(download_mode=False)
-                if not ok:
-                    # prepare_engine_command will surface errors
-                    pass
+        with col_show:
+            if st.button("Show engine command", key=f"show_engine_cmd_btn_{model_key}", disabled=show_engine_disabled):
+                # If we already prepared an engine command earlier, just show it
+                cur_engine = st.session_state.get(engine_cmd_key, None)
+                if cur_engine:
+                    try:
+                        st.session_state[engine_cmd_visible_key] = True
+                    except Exception:
+                        pass
+                else:
+                    # Prepare the command and show it (no download mode)
+                    ok = prepare_engine_command(download_mode=False)
+                    if not ok:
+                        # prepare_engine_command will surface errors
+                        pass
+            # Show a compact caption explaining why the Show button may be disabled
+            if show_engine_disabled:
+                if engine == 'msprime':
+                    st.caption("Show engine command disabled: msprime runs in-process and does not produce an external engine CLI.")
+                elif btn_disabled_effective:
+                    st.caption("Show disabled: fix missing inputs (see errors above).")
+                else:
+                    st.caption("Show engine command unavailable.")
 
         # NOTE: removed 'Include --show-command' checkbox per user request.
 
@@ -3933,9 +3945,8 @@ with st.container():
                     with btn_col2:
                         st.write(" ")
             else:
-                # Execution isn't possible right now; avoid showing the copyable CLI.
-                # Message removed per user request.
-                pass
+                # Execution isn't possible right now; show a short reason
+                st.caption("Execution unavailable — fix the errors shown above to enable the CLI and execution.")
 
             # Execute immediately when the Execute button is pressed
             cancel_key_ui = f"_cancel_run_{model_key}"
@@ -4352,6 +4363,10 @@ with st.container():
                         pass
 
                 st.button("Execute", disabled=exec_disabled, key=f"exec_btn_{model_key}", on_click=_request_exec_local)
+                # When Execute is disabled show a concise hint so users know why
+                if exec_disabled and not st.session_state.get(running_key, False):
+                    # Avoid repeating long errors; show a short action hint
+                    st.caption("Execute disabled: resolve the validation errors displayed above (missing paths, sweep settings, or zero sample sizes).")
                 # Diagnostics: intentionally hide any user-facing message when Execute is disabled
                 try:
                     # Keep diagnostics internal-only via ui_diag (controlled by SHOW_DEV_DIAG)
