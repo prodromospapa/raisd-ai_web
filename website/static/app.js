@@ -1,5 +1,6 @@
 const dz = document.getElementById('dropzone');
 const form = document.getElementById('job-form');
+const submitBtn = document.getElementById('submit-btn');
 
 // helper: bind change handler to the current file input element
 function bindFileInput() {
@@ -11,6 +12,8 @@ function bindFileInput() {
     if (input.files && input.files[0]) {
       handleFile(input.files[0]);
     }
+    // reevaluate readiness when file selection changes
+    try { updateAnalyzeEnabled(); } catch(_) {}
   });
   input._bound = true;
 }
@@ -28,6 +31,30 @@ let lastSuggestedChromosome = null;
 // suppress showing the auto-selection popover while we refresh the
 // chromosome list (e.g. after species change)
 let suppressAutoMessageDuringRefresh = false;
+
+// Determine whether the Analyze button should be enabled
+function isAnalyzeReady() {
+  if (!form) return false;
+  const speciesEl = document.getElementById('species-select') || form.querySelector('select[name=species]');
+  const chromEl = document.getElementById('chromosome-select') || form.querySelector('select[name=chromosome]');
+  const gridEl = form.querySelector('input[name=grid]');
+  const species = speciesEl && speciesEl.value;
+  const chromosome = chromEl && chromEl.value;
+  const gridVal = gridEl && gridEl.value;
+  const gridOk = gridVal && Number(gridVal) > 0 && Number.isFinite(Number(gridVal));
+  const hasStaged = Boolean(stagedRunId && stagedFilename);
+  const fileInput = document.getElementById('file-input');
+  const hasLocalFile = !!(fileInput && fileInput.files && fileInput.files.length > 0);
+  if (isUploading) return false;
+  return Boolean(species && chromosome && gridOk && (hasStaged || hasLocalFile));
+}
+
+function updateAnalyzeEnabled() {
+  if (!submitBtn) return;
+  const ready = isAnalyzeReady();
+  submitBtn.disabled = !ready;
+  submitBtn.setAttribute('aria-disabled', String(!ready));
+}
 
 // ensure the CSS for the chromosome glow animation is injected once
 function ensureChromGlowCSS() {
@@ -166,7 +193,11 @@ function updateUploadStatus(file, loaded, total) {
       }
     }
   }
-  if (submitBtn) submitBtn.disabled = isUploading;
+  if (submitBtn) {
+    // Disable during upload or when inputs are incomplete
+    submitBtn.disabled = isUploading || !isAnalyzeReady();
+    submitBtn.setAttribute('aria-disabled', String(submitBtn.disabled));
+  }
 }
 
 function handleFile(file) {
@@ -192,6 +223,7 @@ function handleFile(file) {
   } catch(_){}
   // show preview and create a fresh hidden input
   setDropzonePreview(file);
+  try { updateAnalyzeEnabled(); } catch(_) {}
   // assign the file to the newly-created input element so it's available for FormData
   try {
     const cur = document.getElementById('file-input');
@@ -230,12 +262,13 @@ function handleFile(file) {
     alert('Upload failed. Please try again.');
     resetDropzone();
     try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
+    try { updateAnalyzeEnabled(); } catch(_) {}
   };
   xhr.onload = function () {
   isUploading = false;
     lastUploadXhr = null;
     try {
-      const data = xhr.response;
+      let data = xhr.response;
       if (!data && xhr.responseText) {
         // some browsers don't parse json when responseType=json and status != 200
         try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
@@ -310,19 +343,23 @@ function handleFile(file) {
           // ignore UI update errors
           console.warn('Failed to apply contig suggestion:', e);
         }
+        try { updateAnalyzeEnabled(); } catch(_) {}
       } else if (data && data.error) {
   alert('Upload failed: ' + data.error);
         resetDropzone();
         try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
+        try { updateAnalyzeEnabled(); } catch(_) {}
       } else if (xhr.status < 200 || xhr.status >= 300) {
         alert('Upload failed: server returned ' + xhr.status);
         resetDropzone();
         try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
+        try { updateAnalyzeEnabled(); } catch(_) {}
       }
     } catch (e) {
       alert('Upload failed: ' + e);
       resetDropzone();
       try { const bar = document.getElementById('upload-bar'); if (bar) bar.classList.remove('animate'); } catch(_) {}
+      try { updateAnalyzeEnabled(); } catch(_) {}
     }
   };
   xhr.send(fd);
@@ -388,6 +425,7 @@ if (dz) {
       // assign files and immediately handle
       handleFile(e.dataTransfer.files[0]);
     }
+    try { updateAnalyzeEnabled(); } catch(_) {}
   });
 
   // if user clicks the dropzone to open file picker, keep default input behavior
@@ -409,6 +447,7 @@ if (dz) {
 
   // bind change on the input (ensures we bind the current element)
   bindFileInput();
+  try { updateAnalyzeEnabled(); } catch(_) {}
 
   // Fetch chromosomes when species is changed
   const speciesSelect = document.getElementById('species-select') || document.querySelector('select[name=species]');
@@ -460,6 +499,7 @@ if (dz) {
       // don't fetch when placeholder is selected
       if (!species) {
         chromSelect.innerHTML = '<option value="" selected hidden>Select a chromosome</option>';
+        try { updateAnalyzeEnabled(); } catch(_) {}
         return;
       }
       // prevent showing the auto-selection popover while we refresh options
@@ -474,10 +514,12 @@ if (dz) {
           } else {
             chromSelect.innerHTML = '<option value="" selected hidden>No chromosomes found</option>';
           }
+          try { updateAnalyzeEnabled(); } catch(_) {}
         })
         .catch(() => {
           suppressAutoMessageDuringRefresh = false;
     chromSelect.innerHTML = '<option value="" selected hidden>Error loading chromosomes</option>';
+          try { updateAnalyzeEnabled(); } catch(_) {}
         });
     }
 
@@ -497,13 +539,14 @@ if (dz) {
             if (data.chromosomes && Array.isArray(data.chromosomes)) {
               populateChromOptions(data.chromosomes, false);
             }
+            try { updateAnalyzeEnabled(); } catch(_) {}
           })
-          .catch(() => { suppressAutoMessageDuringRefresh = false; });
+          .catch(() => { suppressAutoMessageDuringRefresh = false; try { updateAnalyzeEnabled(); } catch(_) {} });
       } catch (e) { /* ignore */ }
     });
-    speciesSelect.addEventListener('change', updateChromosomes);
+    speciesSelect.addEventListener('change', () => { updateChromosomes(); try { updateAnalyzeEnabled(); } catch(_) {} });
   // if user manually chooses a chromosome, forget the server suggestion
-  chromSelect.addEventListener('change', () => { try { lastSuggestedChromosome = null; } catch(_) {} });
+  chromSelect.addEventListener('change', () => { try { lastSuggestedChromosome = null; } catch(_) {}; try { updateAnalyzeEnabled(); } catch(_) {} });
     // Initial population on page load
     updateChromosomes();
   }
@@ -511,6 +554,11 @@ if (dz) {
 
 // Keep submit behavior: if user presses Analyze and a file is present, start upload (or ignore if already uploading)
 if (form) {
+  // watch grid validity to toggle readiness
+  try {
+    const gridEl = form.querySelector('input[name=grid]');
+    if (gridEl) ['input','change','blur'].forEach(ev => gridEl.addEventListener(ev, () => { try { updateAnalyzeEnabled(); } catch(_) {} }));
+  } catch(_) {}
   form.addEventListener('submit', function (e) {
     const input = document.getElementById('file-input');
     const species = document.getElementById('species-select') ? document.getElementById('species-select').value : (form.querySelector('select[name=species]') && form.querySelector('select[name=species]').value);
@@ -569,3 +617,6 @@ if (form) {
   if (!isUploading) uploadFile(file);
   });
 }
+
+// Initial state
+try { updateAnalyzeEnabled(); } catch(_) {}

@@ -19,6 +19,12 @@ body.dark input[type=text], body.dark input[type=number], body.dark select { bor
 button{ background:var(--accent); color:white; border:none; padding:10px 14px; border-radius:10px; font-weight:600; cursor:pointer; }
 button:hover{ filter:brightness(0.95); }
 body.dark button{ color:#fff; }
+/* Visually indicate disabled primary actions */
+button[disabled], button:disabled, button.disabled{
+	opacity: .55;
+	cursor: not-allowed;
+	filter: grayscale(18%);
+}
 .dropzone{ margin-top:12px; position:relative; border:2px dashed var(--border); border-radius:14px; padding:24px; text-align:center; background:color-mix(in srgb, var(--card) 94%, var(--accent) 6%); transition:background .25s, color .25s; }
 body.dark .dropzone{ background:color-mix(in srgb, var(--card) 90%, var(--accent) 10%); }
 .dropzone.drag{ background:#eef2ff; border-color:#a5b4fc; }
