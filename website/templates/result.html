@@ -8,6 +8,15 @@
     .sfs-compare-btn:hover{ transform:translateY(-1px); box-shadow:0 6px 18px rgba(2,6,23,0.06); }
     .sfs-compare-btn:active{ transform:translateY(0); }
     .sfs-compare-btn svg{ color:var(--muted); }
+    /* Combined metrics pill-style UI */
+    #combined-metric-checkboxes { display:flex; flex-direction:column; gap:6px; }
+    .combined-controls { display:flex; gap:8px; align-items:center; }
+    .combined-control-btn { background:transparent; border:1px solid var(--border); padding:4px 8px; border-radius:8px; cursor:pointer; font-size:12px; color:var(--fg); }
+    .combined-count { font-size:12px; color:var(--muted); margin-left:auto; }
+    .combined-pills { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .combined-pill { display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; border:1px solid var(--border); background:transparent; cursor:pointer; font-size:13px; color:var(--fg); }
+    .combined-pill.active { background: linear-gradient(180deg,var(--accent-active) 0%, var(--accent-hover) 100%); color: #fff; border-color: transparent; box-shadow: 0 6px 16px rgba(2,6,23,0.08); }
+    .combined-pill input[type=checkbox]{ display:none; }
   </style>
   <div class="card">
     <h2>Best Match</h2>
@@ -34,7 +43,7 @@
             {% set model_anchor = value|lower %}
             {% set doc_url = 'https://popsim-consortium.github.io/stdpopsim-docs/stable/catalog.html#sec_catalog_' ~ spec_code ~ '_models_' ~ model_anchor %}
             <li><span>{{ label }}</span><strong><a href="{{ doc_url }}" target="_blank" rel="noopener">{{ value }}</a></strong></li>
-          {% elif label|lower == 'jsd' %}
+          {% elif label|lower == 'jsd' or (match and match.selected_metric and (label|lower == (match.selected_metric|lower))) %}
             <li><span>{{ label }}</span><strong>{{ value }}</strong>
               <button class="sfs-compare-btn inline-hover-trigger" id="sfsCompareTrigger" aria-label="Compare SFS distributions" title="Compare SFS distributions">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false" style="vertical-align:middle; margin-right:6px;">
@@ -86,12 +95,40 @@
   </div>
   <div id="allMatchesPanel" class="all-matches-panel" style="display:none; margin-top:8px; max-height:360px; overflow:hidden; border:1px solid var(--border); background:var(--card); padding:8px;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-      <strong>All calculated distances</strong>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <!-- header label removed per user request -->
+  <label for="distance-metric-select" style="margin-left:8px; font-size:13px;">Metric:</label>
+  <select id="distance-metric-select" style="font-size:13px; padding:4px;">
+    {%- set m_av = match.metrics_available if match is defined and match.metrics_available is defined else [] -%}
+  {%- set m_av_sorted = (m_av | default([])) | sort -%}
+    {# Always show Combined as the first option; skip it when iterating available metrics to avoid duplicates. #}
+    <option value="Combined" {% if match.selected_metric == 'Combined' %}selected{% endif %}>Combined</option>
+    {% if m_av_sorted and m_av_sorted|length > 0 %}
+      {% for m in m_av_sorted %}
+        {% if m != 'Combined' %}
+          <option value="{{ m }}" {% if match.selected_metric and (match.selected_metric == m) %}selected{% endif %}>{{ m }}</option>
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+  </select>
+  {# Show the toggle only when Combined is selected. Start collapsed so user must opt-in. #}
+  {% if match and match.selected_metric and (match.selected_metric|lower == 'combined') %}
+    <button id="combined-toggle-btn" class="combined-toggle-btn" aria-expanded="false" style="font-size:12px; padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:transparent; cursor:pointer; margin-left:6px;">Show</button>
+  {% else %}
+    <button id="combined-toggle-btn" class="combined-toggle-btn" aria-expanded="false" style="font-size:12px; padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:transparent; cursor:pointer; margin-left:6px; display:none;">Show</button>
+  {% endif %}
+      </div>
+      
         <input id="allMatchesFilter" placeholder="Filter model/population" style="font-size:12px; padding:4px;" />
+    </div>
+    <!-- Combined metric pills are rendered into the container below so they appear above the table, aligned to the right -->
+    {# Always include combined container but hidden by default. Toggle will reveal it as needed. #}
+    <div id="combined-metric-container" style="width:100%; justify-content:flex-end; margin-bottom:8px; gap:8px; align-items:flex-start; display:none;">
+      <div id="combined-metric-checkboxes" style="display:none; font-size:12px; padding:4px; background:var(--card); border:1px solid var(--border); border-radius:8px;"></div>
     </div>
     <div class="all-matches-scroll" style="max-height:280px; overflow:auto;">
       <table id="allMatchesTable" class="mini-table" style="width:100%; border-collapse:collapse; font-size:13px;">
-        <thead><tr><th style="text-align:left; padding:6px;">#</th><th style="text-align:left; padding:6px;">Demographic Model</th><th style="text-align:left; padding:6px;">Population</th><th style="text-align:right; padding:6px;">JSD</th></tr></thead>
+  <thead><tr><th style="text-align:left; padding:6px;">#</th><th style="text-align:left; padding:6px;">Demographic Model</th><th style="text-align:left; padding:6px;">Population</th><th id="allMatchesMetricHeader" style="text-align:right; padding:6px;">{{ match.selected_metric if match and match.selected_metric else 'JSD' }}</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -151,18 +188,19 @@
           <option value="{{ raw|e }}" {% if loop.first %}selected{% endif %}>{{ disp }}</option>
         {% endfor %}
       </select>
-      <div style="margin-top:0.75rem;">
-        <span id="biotypeFilter" style="display:none;">
-          <label style="vertical-align:top;">Biotypes:</label>
-          <span id="biotypeBox" style="display:inline-block; max-width:260px; vertical-align:top;"></span>
-        </span>
-        <span style="margin-left:1rem;">Manual range: <input id="zoom-xmin" style="width:120px;" placeholder="start"> - <input id="zoom-xmax" style="width:120px;" placeholder="end"> <button id="zoomBtn">Go</button> <button id="resetZoom">Full</button></span>
+      <div style="margin-top:0.75rem; display:flex; gap:0.75rem; align-items:flex-start; flex-wrap:wrap;">
+        <span style="margin-left:auto;">Manual range: <input id="zoom-xmin" style="width:120px;" placeholder="start"> - <input id="zoom-xmax" style="width:120px;" placeholder="end"> <button id="zoomBtn">Go</button> <button id="resetZoom">Full</button></span>
       </div>
   <div id="plotlyChart" style="width:100%; max-width:100%; height:540px; margin-top:10px;"></div>
-  <h3>Genes in selected window <button id="genesResetBtn" type="button" style="display:none; margin-left:8px; font-size:12px; padding:4px 10px;">Reset</button></h3>
-      <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px; flex-wrap:wrap;">
+      <h3>Genes in selected window <button id="genesResetBtn" type="button" style="display:none; margin-left:8px; font-size:12px; padding:4px 10px;">Reset</button></h3>
+      <div style="display:flex; gap:12px; align-items:center; margin-bottom:6px; flex-wrap:wrap;">
         <label for="ensemblVersionSelect" style="margin:0; font-size:13px;">Ensembl version:</label>
         <select id="ensemblVersionSelect"></select>
+        <!-- Biotype filter moved next to annotation controls for easier access -->
+        <div id="biotypeFilter" style="display:none; margin-left:6px;">
+          <label style="vertical-align:middle; font-size:13px; margin-right:6px;">Biotypes:</label>
+          <span id="biotypeBox" style="display:inline-block; max-width:360px; vertical-align:middle;"></span>
+        </div>
         <!-- Gene search: searches only genes currently loaded for the file (within its min/max) -->
         <div style="display:inline-flex; gap:6px; margin-left:auto; position:relative;">
           <input id="geneSearchInput" placeholder="Search" style="min-width:220px; max-width:360px; padding:6px; font-size:13px;" autocomplete="off" />
@@ -259,6 +297,50 @@
       root.style.setProperty('--accent-hover', ACCENT_RGBA(0.30));
       root.style.setProperty('--accent-active', ACCENT_RGBA(0.55));
     }catch(e){ /* noop */ }
+  })();
+
+  // Resilient wiring for the combined toggle button: ensure click toggles the outer container and persists state
+  (function wireCombinedToggleDirect(){
+    try{
+      const toggleBtn = document.getElementById('combined-toggle-btn');
+      // Use the outer container as the authoritative element for layout/show-hide.
+      const combinedContainer = document.getElementById('combined-metric-container');
+      const runMeta = document.getElementById('run-meta');
+      const runId = runMeta ? runMeta.getAttribute('data-run-id') : null;
+      const storageKey = runId ? ('combined_visible_' + runId) : 'combined_visible';
+      if(!toggleBtn) return;
+      // Click handling is wired by the central combined-controls initializer
+      // (in the combined checkbox rendering / static app.js). Do not attach
+      // another listener here to avoid duplicate/conflicting handlers which
+      // could cause the first click to be ignored.
+      // Initialize button label & container from storage when Combined is active,
+      // otherwise reflect the current container visibility.
+      try{
+        const metricSel = document.getElementById('distance-metric-select');
+        const isCombined = metricSel && String(metricSel.value).toLowerCase() === 'combined';
+        const stored = (function(){ try{ return localStorage.getItem(storageKey); }catch(_){ return null; } })();
+        if(isCombined && stored !== null){
+          const vis = stored === '1';
+          // Prefer the centralized setter when available so the authoritative
+          // state is updated in one place (container + toggle). If it's not
+          // ready yet (external script loads later), update the label now
+          // and schedule a short retry to call the central setter.
+          if(window && typeof window.setCombinedVisible === 'function'){
+            try{ window.setCombinedVisible(vis, false); }catch(_){ /* ignore */ }
+          } else {
+            try{ toggleBtn.textContent = vis ? 'Hide' : 'Show'; }catch(_){ }
+            try{ toggleBtn.setAttribute('aria-expanded', String(vis)); }catch(_){ }
+            // Retry once after a short delay to let external script initialize
+            setTimeout(()=>{ try{ if(window && typeof window.setCombinedVisible === 'function'){ window.setCombinedVisible(vis, false); } }catch(_){ } }, 60);
+          }
+        } else {
+          // no stored preference or not combined -> reflect current container state
+          const curVis = combinedContainer ? (window.getComputedStyle(combinedContainer).display !== 'none') : false;
+          try{ toggleBtn.textContent = curVis ? 'Hide' : 'Show'; }catch(_){ }
+          try{ toggleBtn.setAttribute('aria-expanded', String(!!curVis)); }catch(_){ }
+        }
+      }catch(_){ }
+    }catch(_){ }
   })();
 
   function sanitizeMetric(m){ return (m||'').trim(); }
@@ -1172,10 +1254,15 @@
   })();
 })();
 // Hover tooltips for JSD supplementary info (SFS comparison & top matches)
-(function(){
+// Expose as an initializer so the client can call it after match-heavy data
+// has been merged into the page (lazy-load support).
+window.initHoverTooltips = function(){
+  // Allow initialization multiple times but avoid binding duplicate DOM
+  // listeners. If already initialized, we keep bound handlers but ensure
+  // the handlers read the latest match-data on each invocation.
+  if (!window._hoverTooltipsInit) window._hoverTooltipsInit = true;
   const matchDataTag = document.getElementById('match-data');
-  let matchData = {};
-  try { matchData = JSON.parse(matchDataTag?.textContent || '{}'); } catch(_){ matchData = {}; }
+  function getMatchData(){ try { return JSON.parse(matchDataTag?.textContent || '{}') || {}; } catch(_){ return {}; } }
   const tooltip = document.getElementById('hoverTooltip');
   const content = document.getElementById('hoverContent');
   // collect SFS compare triggers (support both new .sfs-compare-btn and legacy #sfsCompareTrigger)
@@ -1205,18 +1292,19 @@
     document.addEventListener('keydown', esc);
     // build the full plot
     try{
-      const inp = matchData.input_sfs || matchData.observed_sfs || [];
-      const expBest = matchData.best_expected_sfs || [];
+        const md = getMatchData();
+        const inp = md.input_sfs || md.observed_sfs || [];
+        const expBest = md.best_expected_sfs || [];
       if(!(inp.length && expBest.length && window.Plotly)) return;
       const x = inp.map((_,i)=>i+1);
       const mainPlot = document.getElementById('plotlyChart');
       let metricColor = '#60a5fa';
       try{ if(mainPlot && mainPlot.data && mainPlot.data[0] && mainPlot.data[0].line && mainPlot.data[0].line.color){ metricColor = mainPlot.data[0].line.color; } }catch(_){ }
       // read picked
-      let pickedDM = '', pickedPop = '';
-      try{ pickedDM = (document.getElementById('model-used-text')?.textContent||'').trim(); pickedPop = (document.getElementById('pop-used-text')?.textContent||'').trim(); }catch(_){ }
-      const bestDM = matchData.demographic_model || '';
-      const bestPop = matchData.population || '';
+  let pickedDM = '', pickedPop = '';
+  try{ pickedDM = (document.getElementById('model-used-text')?.textContent||'').trim(); pickedPop = (document.getElementById('pop-used-text')?.textContent||'').trim(); }catch(_){ }
+  const bestDM = md.demographic_model || '';
+  const bestPop = md.population || '';
       const norm = (s) => String(s||'').replace(/\s+/g,'').replace(/_/g,'').toLowerCase();
       const sameAsBest = pickedDM && pickedPop && (norm(pickedDM)===norm(bestDM)) && (norm(pickedPop)===norm(bestPop));
       // Plot user's data + best-match first, then add the picked model trace on top
@@ -1238,9 +1326,9 @@
       if(pickedDM && pickedPop && !sameAsBest){
         let pickedVec = null;
         try{
-          const tops = matchData.top_matches || [];
+          const tops = md.top_matches || [];
           for(const t of tops){ if(norm(t.demographic_model)===norm(pickedDM) && norm(t.population)===norm(pickedPop) && Array.isArray(t.expected_sfs)){ pickedVec = t.expected_sfs; break; } }
-          if(!pickedVec){ const all = matchData.all_jsd || []; for(const a of all){ if(norm(a.demographic_model)===norm(pickedDM) && norm(a.population)===norm(pickedPop) && Array.isArray(a.expected_sfs)){ pickedVec = a.expected_sfs; break; } } }
+          if(!pickedVec){ const all = md.all_jsd || []; for(const a of all){ if(norm(a.demographic_model)===norm(pickedDM) && norm(a.population)===norm(pickedPop) && Array.isArray(a.expected_sfs)){ pickedVec = a.expected_sfs; break; } } }
         }catch(_){ }
 
         const addPickedToPlot = (vec, src) => {
@@ -1268,10 +1356,10 @@
   }
 
   function showTooltip(ev, mode){
-    if(!matchData) return;
+    const md = (typeof getMatchData === 'function') ? getMatchData() : (matchData || {});
     if(mode === 'sfs'){
-      const inp = matchData.input_sfs || matchData.observed_sfs || [];
-      const expBest = matchData.best_expected_sfs || [];
+      const inp = md.input_sfs || md.observed_sfs || [];
+      const expBest = md.best_expected_sfs || [];
       if(inp.length && expBest.length && window.Plotly){
   content.innerHTML = '<div id="sfsMiniPlot" style="width:420px;height:280px;"></div>';
         const plotDiv = document.getElementById('sfsMiniPlot');
@@ -1279,13 +1367,13 @@
     // Determine picked dm/pop from visible header
         let pickedDM = '', pickedPop = '';
         try{
-          const md = document.getElementById('model-used-text');
+          const mdEl = document.getElementById('model-used-text');
           const pp = document.getElementById('pop-used-text');
-          pickedDM = (md && md.textContent) ? md.textContent.trim() : '';
+          pickedDM = (mdEl && mdEl.textContent) ? mdEl.textContent.trim() : '';
           pickedPop = (pp && pp.textContent) ? pp.textContent.trim() : '';
         }catch(_){ }
-  const bestDM = matchData.demographic_model || '';
-  const bestPop = matchData.population || '';
+  const bestDM = md.demographic_model || '';
+  const bestPop = md.population || '';
   // normalize for robust comparison (ignore spaces/underscores/case)
   const norm = (s) => String(s||'').replace(/\s+/g,'').replace(/_/g,'').toLowerCase();
   const sameAsBest = pickedDM && pickedPop && (norm(pickedDM) === norm(bestDM)) && (norm(pickedPop) === norm(bestPop));
@@ -1311,9 +1399,9 @@
           if(pickedDM && pickedPop && !sameAsBest){
             let pickedVec = null;
             try{
-              const tops = matchData.top_matches || [];
+              const tops = md.top_matches || [];
               for(const t of tops){ if(norm(t.demographic_model) === norm(pickedDM) && norm(t.population) === norm(pickedPop) && Array.isArray(t.expected_sfs)){ pickedVec = t.expected_sfs; break; } }
-              if(!pickedVec){ const all = matchData.all_jsd || []; for(const a of all){ if(norm(a.demographic_model) === norm(pickedDM) && norm(a.population) === norm(pickedPop) && Array.isArray(a.expected_sfs)){ pickedVec = a.expected_sfs; break; } } }
+              if(!pickedVec){ const all = md.all_jsd || []; for(const a of all){ if(norm(a.demographic_model) === norm(pickedDM) && norm(a.population) === norm(pickedPop) && Array.isArray(a.expected_sfs)){ pickedVec = a.expected_sfs; break; } } }
             }catch(_){ }
             const addPicked = (vec, src) => { if(plotDiv && Array.isArray(vec)){ Plotly.addTraces(plotDiv, [{ x, y: vec, type:'scatter', mode:'lines', name:'Picked Model', line:{color:'#22c55e', width:1}, opacity:0.8 }]); console.log('[SFS] Added Picked Model trace (source:', src, ')'); } };
             if(pickedVec){ addPicked(pickedVec, 'top_matches'); }
@@ -1353,32 +1441,106 @@
   ['mouseleave','blur'].forEach(evName => { sfsTrigs.forEach(el => el.addEventListener(evName, hideTooltip)); });
   ['mouseleave','blur'].forEach(evName => { topTrigs.forEach(el => el.addEventListener(evName, hideTooltip)); });
   document.addEventListener('mousemove', e=>{ if(!tooltip.hidden) posTooltip(e); });
-})();
+};
+// Ensure hover tooltips are initialized if match-data already exists and
+// the external app script didn't (or ran earlier). This is a best-effort
+// invocation and will be no-op if initialization already occurred.
+try{ if(document.getElementById('match-data') && typeof window.initHoverTooltips === 'function'){ window.initHoverTooltips(); } }catch(_){ }
 // All distances panel: populate from match-data.all_jsd and wire toggle + filter
 (function(){
   const toggle = document.getElementById('allMatchesToggle');
   const panel = document.getElementById('allMatchesPanel');
   const tableBody = document.querySelector('#allMatchesTable tbody');
   const filterInput = document.getElementById('allMatchesFilter');
-  let allList = [];
-  try { allList = (JSON.parse(document.getElementById('match-data')?.textContent || '{}').all_jsd) || []; } catch(_){ allList = []; }
+  const metricSelect = document.getElementById('distance-metric-select');
+  const combinedCheckboxes = document.getElementById('combined-metric-checkboxes');
+  // Adjust the scrollable table area when combined controls are visible so rows are not obscured
+  function adjustAllMatchesScroll(){
+    try{
+      const scrollEl = document.querySelector('.all-matches-scroll');
+      if(!scrollEl) return;
+      // baseline max height (matches inline style) — keep in sync with template
+      const baseMax = 280;
+      // Prefer the actual checkboxes element height when visible; the outer
+      // container may remain present but empty when the user hides the inner
+      // controls, which would otherwise incorrectly shrink the table.
+      const inner = document.getElementById('combined-metric-checkboxes');
+      const outer = document.getElementById('combined-metric-container');
+      let extra = 0;
+      if(inner && inner.style.display !== 'none'){
+        extra = inner.offsetHeight + 8; // small gap to avoid overlap
+      } else if(outer && outer.style.display !== 'none'){
+        // fallback to outer only when inner is not visible
+        extra = outer.offsetHeight + 8;
+      }
+      // When no combined UI is visible, restore full baseline height.
+      const newMax = extra ? Math.max(80, baseMax - extra) : baseMax;
+      scrollEl.style.maxHeight = newMax + 'px';
+    }catch(_){ }
+  }
+  // Read match-data on demand so we always see merged heavy payload
+  function loadBaseList(){
+    const md = JSON.parse(document.getElementById('match-data')?.textContent || '{}') || {};
+    // Prefer full per-metric `all_distances` entries when available, otherwise
+    // fall back to legacy `all_jsd` (converted to distances with JSD key).
+    let list = [];
+    if(md.all_distances && Array.isArray(md.all_distances) && md.all_distances.length){
+      list = md.all_distances.map(x => ({ demographic_model: x.demographic_model, population: x.population, distances: x.distances || {} }));
+    } else if(md.all_jsd && Array.isArray(md.all_jsd)){
+      list = md.all_jsd.map(x => ({ demographic_model: x.demographic_model, population: x.population, distances: Object.assign({}, (x.distances||{}), { JSD: (x.jsd!=null? x.jsd : (x.distances && x.distances.JSD) ) }) }));
+    }
+    return { list: list, metrics: (md.metrics_available && Array.isArray(md.metrics_available) && md.metrics_available.length) ? md.metrics_available.slice() : (list.length ? Object.keys(list[0].distances || {}) : ['JSD']) };
+  }
 
-  // removed per-row spinner; no spin-style necessary
+  function computeCombined(list, metrics){
+    const N = list.length; if(!N) return [];
+    const ranks = {};
+    metrics.forEach(m=>{ ranks[m]=new Array(N); const arr = list.map((it,idx)=>({idx:idx,val:(it.distances&&it.distances[m]!=null)?it.distances[m]:Infinity})); arr.sort((a,b)=> (a.val===b.val)? a.idx-b.idx : a.val - b.val); for(let i=0;i<arr.length;i++){ ranks[m][arr[i].idx]=i+1; } });
+    const avg = new Array(N); for(let i=0;i<N;i++){ let s=0; metrics.forEach(m=>{ s += (ranks[m][i]||N); }); avg[i]=s/metrics.length; }
+    return avg.map(v=>v/N);
+  }
 
-  function renderRows(list){
+  function renderRowsByMetric(baseList, metric, combinedMetrics){
     if(!tableBody) return;
     tableBody.innerHTML = '';
-    if(!list || !list.length){ tableBody.innerHTML = '<tr><td colspan="4">No data</td></tr>'; return; }
-    list.forEach((m,i)=>{
-      const tr = document.createElement('tr');
-      tr.setAttribute('data-dm', m.demographic_model || '');
-      tr.setAttribute('data-pop', m.population || '');
-      tr.style.cursor = 'pointer';
+    const list = baseList.slice();
+    const N = list.length;
+    if(!N){ tableBody.innerHTML = '<tr><td colspan="4">No data</td></tr>'; return; }
+    const order = list.map((_,i)=>i);
+    if(metric === 'Combined'){
+      const metrics = (combinedMetrics && combinedMetrics.length) ? combinedMetrics : Object.keys(list[0].distances || {});
+      // If no metrics selected for Combined, empty the table (no rows)
+      if(!metrics || metrics.length === 0){
+        try{ const hdr = document.getElementById('allMatchesMetricHeader'); if(hdr) hdr.textContent = 'Combined'; }catch(e){}
+        tableBody.innerHTML = '';
+        return;
+      }
+      const norm = computeCombined(list, metrics);
+      order.sort((a,b)=> norm[a] - norm[b]);
+    } else {
+      order.sort((a,b)=> { const va=(list[a].distances&&list[a].distances[metric]!=null)?list[a].distances[metric]:Infinity; const vb=(list[b].distances&&list[b].distances[metric]!=null)?list[b].distances[metric]:Infinity; if(va===vb) return a-b; return va-vb; });
+    }
+    // update header label
+    try{ const hdr = document.getElementById('allMatchesMetricHeader'); if(hdr) hdr.textContent = metric === 'Combined' ? 'Combined' : metric; }catch(e){}
+
+    order.forEach((idx,i)=>{
+      const m = list[idx];
+      const tr = document.createElement('tr'); tr.setAttribute('data-dm', m.demographic_model||''); tr.setAttribute('data-pop', m.population||''); tr.style.cursor='pointer';
       const idxTd = document.createElement('td'); idxTd.style.padding='6px'; idxTd.textContent = String(i+1);
-      const mod = document.createElement('td'); mod.style.padding='6px'; mod.textContent = m.demographic_model || '';
-      const pop = document.createElement('td'); pop.style.padding='6px'; pop.textContent = m.population || '';
-  const jsd = document.createElement('td'); jsd.style.padding='6px'; jsd.style.textAlign='right'; jsd.textContent = (m.jsd!==undefined && isFinite(m.jsd)) ? Number(m.jsd).toFixed(6) : '';
-      tr.appendChild(idxTd); tr.appendChild(mod); tr.appendChild(pop); tr.appendChild(jsd);
+      const mod = document.createElement('td'); mod.style.padding='6px'; mod.textContent = m.demographic_model||'';
+      const pop = document.createElement('td'); pop.style.padding='6px'; pop.textContent = m.population||'';
+      const valTd = document.createElement('td'); valTd.style.padding='6px'; valTd.style.textAlign='right';
+      let display = '';
+      if(metric === 'Combined'){
+        const metrics = (combinedMetrics && combinedMetrics.length)? combinedMetrics : Object.keys(list[0].distances || {});
+        const norm = computeCombined(list, metrics);
+        display = isFinite(norm[idx])? norm[idx].toFixed(6) : '';
+      } else {
+        const v = (m.distances && m.distances[metric] != null)? m.distances[metric] : null;
+        display = (v !== null && v !== undefined && isFinite(v)) ? Number(v).toFixed(6) : '';
+      }
+      valTd.textContent = display;
+      tr.appendChild(idxTd); tr.appendChild(mod); tr.appendChild(pop); tr.appendChild(valTd);
       tr.addEventListener('click', ()=> startRescan(tr, m.demographic_model, m.population));
       tr.addEventListener('keypress', (e)=>{ if(e.key==='Enter' || e.key===' '){ e.preventDefault(); startRescan(tr, m.demographic_model, m.population); }});
       tr.setAttribute('tabindex', '0');
@@ -1388,9 +1550,196 @@
 
   function openPanel(){ if(!panel || !toggle) return; panel.style.display='block'; toggle.setAttribute('aria-expanded','true'); toggle.textContent = 'All distances ▴'; }
   function closePanel(){ if(!panel || !toggle) return; panel.style.display='none'; toggle.setAttribute('aria-expanded','false'); toggle.textContent = 'All distances ▾'; }
-  if(toggle){ toggle.addEventListener('click', ()=>{ if(!panel) return; if(panel.style.display==='none' || panel.style.display===''){ renderRows(allList); openPanel(); } else { closePanel(); } }); }
-  if(filterInput){ filterInput.addEventListener('input', ()=>{ const v = (filterInput.value||'').toLowerCase().trim(); if(!v) return renderRows(allList); const filtered = allList.filter(m => ((m.demographic_model||'') + ' ' + (m.population||'')).toLowerCase().indexOf(v) !== -1); renderRows(filtered); }); }
+
+  function getCombinedSelection(){
+    if(combinedCheckboxes){ const checks = Array.from(combinedCheckboxes.querySelectorAll('input[type=checkbox]')).filter(i=>i.checked).map(i=>i.value); if(checks && checks.length) return checks; }
+    // fallback: use metricSelect options except Combined
+    if(metricSelect){ return Array.from(metricSelect.options).map(o=>o.value).filter(v=>v && v !== 'Combined'); }
+    return [];
+  }
+
+  function populateCombinedCheckboxes(metrics){
+    if(!combinedCheckboxes) return;
+    combinedCheckboxes.innerHTML = '';
+    if(!metrics || !metrics.length) return;
+    // Sort metrics alphanumerically, case-insensitive
+    try{ metrics = metrics.slice().sort((a,b)=> String(a).toLowerCase().localeCompare(String(b).toLowerCase())); }catch(_){ }
+    // Top controls: Select All / Clear and count
+    const controls = document.createElement('div'); controls.className = 'combined-controls';
+    const selectAll = document.createElement('button'); selectAll.type='button'; selectAll.className='combined-control-btn'; selectAll.textContent = 'Select all';
+    const clearBtn = document.createElement('button'); clearBtn.type='button'; clearBtn.className='combined-control-btn'; clearBtn.textContent = 'Clear';
+    const countSpan = document.createElement('div'); countSpan.className = 'combined-count'; countSpan.textContent = metrics.length + ' selected';
+    controls.appendChild(selectAll); controls.appendChild(clearBtn); controls.appendChild(countSpan);
+    combinedCheckboxes.appendChild(controls);
+
+      const pills = document.createElement('div'); pills.className = 'combined-pills';
+      const state = { selected: new Set(metrics) };
+      // Create or reuse a table-blocking overlay that informs user to pick >=2 metrics
+      const scrollEl = document.querySelector('.all-matches-scroll');
+      let combinedOverlay = null;
+      try{
+            if(scrollEl){
+          // For robust visibility, attach the overlay to the document body as a fixed-position element
+          // so it's never clipped by the scroll container. We still compute the overlay's position
+          // to sit on top of the All Matches panel when needed.
+          combinedOverlay = document.getElementById('combined_block_overlay');
+          if(!combinedOverlay){
+            combinedOverlay = document.createElement('div');
+            combinedOverlay.id = 'combined_block_overlay';
+            combinedOverlay.setAttribute('role','alert');
+            combinedOverlay.style.cssText = 'position:fixed; display:none; align-items:center; justify-content:center; background: rgba(0,0,0,0.5); z-index:1400; pointer-events:auto; padding:12px; left:50%; transform:translateX(-50%);';
+            const inner = document.createElement('div');
+            inner.style.cssText = 'max-width:560px; text-align:center; padding:16px; border-radius:10px; background: var(--card); border:1px solid var(--border); box-shadow: 0 8px 32px rgba(2,6,23,0.6);';
+            inner.innerHTML = '<div style="font-weight:700; margin-bottom:6px;">Select at least two metrics</div><div style="color:var(--muted); font-size:13px; margin-bottom:8px;">Combined requires at least two metrics. Pick two or more metrics to enable the table.</div>';
+            combinedOverlay.appendChild(inner);
+            document.body.appendChild(combinedOverlay);
+          }
+        }
+      }catch(_){ combinedOverlay = null; }
+
+      // Helper to show/hide overlay and update table rendering based on selection
+      function updateCombinedStateUI(){
+        try{
+          const selSize = state.selected.size;
+          // If Combined is the active metric, show overlay when <2 selected
+          const isCombinedActive = (metricSelect && metricSelect.value === 'Combined');
+          if(combinedOverlay){ combinedOverlay.style.display = (isCombinedActive && selSize < 2) ? 'flex' : 'none'; }
+          // update persistent feedback message (if present)
+          try{
+            const msgEl = combinedCheckboxes ? combinedCheckboxes.querySelector('.combined-feedback') : null;
+            if(msgEl){ msgEl.textContent = (isCombinedActive && selSize < 2) ? 'Pick at least two metrics to enable Combined' : ''; }
+          }catch(_){ }
+          // If enough metrics, render table; otherwise re-render empty header (but keep rows hidden under overlay)
+          const md = loadBaseList();
+          if(isCombinedActive){
+            if(selSize >= 2){ renderRowsByMetric(md.list, 'Combined', Array.from(state.selected)); }
+            else { try{ const hdr = document.getElementById('allMatchesMetricHeader'); if(hdr) hdr.textContent = 'Combined'; }catch(_){ } tableBody.innerHTML = ''; }
+          } else {
+            // not Combined: render by selected metric
+            const cur = metricSelect ? metricSelect.value : (md.metrics && md.metrics[0]) || 'JSD'; renderRowsByMetric(md.list, cur, getCombinedSelection());
+          }
+        }catch(_){ }
+        try{ adjustAllMatchesScroll(); }catch(_){ }
+      }
+  // feedback message (transient) when user action is blocked
+  const msg = document.createElement('div'); msg.className = 'combined-feedback'; msg.style.fontSize='12px'; msg.style.color='var(--muted)'; msg.style.padding='6px 0 0 0'; combinedCheckboxes.appendChild(msg);
+  // ensure the initial state of the feedback message reflects current selection
+  try{ const initialSel = state.selected.size; const isCombinedActiveInit = (metricSelect && metricSelect.value === 'Combined'); if(msg && isCombinedActiveInit && initialSel < 2){ msg.textContent = 'Pick at least two metrics to enable Combined'; } }catch(_){ }
+    metrics.forEach(m => {
+      const id = 'combined_pill_' + m.replace(/[^a-z0-9]/gi,'_');
+      const btn = document.createElement('button'); btn.type='button'; btn.className='combined-pill active'; btn.setAttribute('data-metric', m); btn.id = id; btn.title = m;
+      const chk = document.createElement('input'); chk.type='checkbox'; chk.value = m; chk.checked = true;
+      const span = document.createElement('span'); span.textContent = m;
+      btn.appendChild(chk); btn.appendChild(span);
+      btn.addEventListener('click', ()=>{
+        const val = btn.getAttribute('data-metric');
+        if(state.selected.has(val)){
+          state.selected.delete(val); btn.classList.remove('active'); chk.checked = false;
+        } else { state.selected.add(val); btn.classList.add('active'); chk.checked = true; }
+        countSpan.textContent = state.selected.size + ' selected';
+        // Centralized UI update (handles overlay and rendering)
+        updateCombinedStateUI();
+      });
+      pills.appendChild(btn);
+    });
+    combinedCheckboxes.appendChild(pills);
+
+    selectAll.addEventListener('click', ()=>{
+      metrics.forEach(m=> state.selected.add(m));
+      Array.from(pills.children).forEach(b=>{ b.classList.add('active'); b.querySelector('input').checked = true; });
+      countSpan.textContent = state.selected.size + ' selected';
+      updateCombinedStateUI();
+    });
+    clearBtn.addEventListener('click', ()=>{
+      // Clear all selections — user must pick at least two to enable table
+      state.selected.clear();
+      Array.from(pills.children).forEach(b=>{ b.classList.remove('active'); b.querySelector('input').checked = false; });
+      countSpan.textContent = state.selected.size + ' selected';
+      // Persistent instruction until the user selects at least two metrics
+      try{ msg.textContent = 'Pick at least two metrics to enable Combined'; }catch(_){ }
+      updateCombinedStateUI();
+    });
+    // Toggle button wiring (persist per-run)
+    try{
+      const runMeta = document.getElementById('run-meta');
+      const runId = runMeta ? runMeta.getAttribute('data-run-id') : null;
+      const toggleBtn = document.getElementById('combined-toggle-btn');
+      const storageKey = runId ? ('combined_visible_' + runId) : 'combined_visible';
+      function setCombinedVisible(vis, persist=true){
+        try{ const container = document.getElementById('combined-metric-container'); if(container) container.style.display = vis ? 'flex' : 'none'; }catch(_){ }
+        try{ const cb = document.getElementById('combined-metric-checkboxes'); if(cb) cb.style.display = vis ? 'block' : 'none'; }catch(_){}
+        try{ if(toggleBtn) { toggleBtn.textContent = vis ? 'Hide' : 'Show'; toggleBtn.setAttribute('aria-expanded', String(vis)); } }catch(_){}
+        try{ if(persist) localStorage.setItem(storageKey, vis ? '1' : '0'); }catch(_){ }
+        try{ adjustAllMatchesScroll(); }catch(_){ }
+      }
+      // Expose so other handlers (top-level toggle) can call it even if defined later
+      try{ window.setCombinedVisible = setCombinedVisible; }catch(_){ }
+  try{ const stored = localStorage.getItem(storageKey); if(stored === null){ setCombinedVisible(false, false); } else { setCombinedVisible(stored === '1', false); } }catch(_){ setCombinedVisible(false, false); }
+    }catch(_){ }
+    // After populating, adjust the scroll area so rows are fully visible
+    try{ adjustAllMatchesScroll(); }catch(_){ }
+  }
+
+  if(toggle){ toggle.addEventListener('click', ()=>{ if(!panel) return; const md = loadBaseList(); const curMetric = metricSelect ? metricSelect.value : (md.metrics && md.metrics[0]) || 'JSD'; if(panel.style.display==='none' || panel.style.display===''){ // populate combined checkboxes for Combined mode
+    try{ populateCombinedCheckboxes(md.metrics || []); }catch(_){ }
+    const comb = curMetric === 'Combined' ? getCombinedSelection() : [];
+    renderRowsByMetric(md.list, curMetric, comb); openPanel(); try{ adjustAllMatchesScroll(); }catch(_){ } } else { closePanel(); try{ adjustAllMatchesScroll(); }catch(_){ } } }); }
+
+  if(metricSelect){ metricSelect.addEventListener('change', ()=>{ const md = loadBaseList(); const curMetric = metricSelect.value; // when switching to Combined, populate checkboxes
+      if(curMetric === 'Combined'){ try{ populateCombinedCheckboxes(md.metrics || []); }catch(_){ } }
+      // Show both the toggle and the combined metric list when Combined is chosen
+    if(curMetric === 'Combined'){
+  try{ if(typeof setCombinedVisible === 'function'){ /* leave visibility to central setter (respect stored pref) */ } else { const container = document.getElementById('combined-metric-container'); if(container) container.style.display = 'none'; const cb = document.getElementById('combined-metric-checkboxes'); if(cb) cb.style.display = 'block'; if(toggleBtn){ toggleBtn.textContent = 'Show'; toggleBtn.setAttribute('aria-expanded','false'); } } }catch(_){ try{ const container = document.getElementById('combined-metric-container'); if(container) container.style.display = 'none'; }catch(_){ } }
+        try{ adjustAllMatchesScroll(); }catch(_){ }
+      }
+      if(panel && (panel.style.display==='block' || panel.style.display==='')){ const comb = curMetric === 'Combined' ? getCombinedSelection() : []; renderRowsByMetric(md.list, curMetric, comb); } else { // update header even when panel closed
+        try{ const hdr = document.getElementById('allMatchesMetricHeader'); if(hdr) hdr.textContent = curMetric === 'Combined' ? 'Combined' : curMetric; }catch(e){}
+      }
+  if(curMetric === 'Combined' && combinedCheckboxes){ /* already handled above */ } else if(combinedCheckboxes){ combinedCheckboxes.style.display = 'none'; }
+    try{ adjustAllMatchesScroll(); }catch(_){ }
+  }); }
+
+  // Ensure combined controls visibility follows the metric select on page load
+  (function ensureCombinedVisibility(){
+    try{
+      const metricSel = document.getElementById('distance-metric-select');
+      const combinedContainer = document.getElementById('combined-metric-container');
+      const combinedToggle = document.getElementById('combined-toggle-btn');
+      function update(){
+        const v = (metricSel && metricSel.value) ? String(metricSel.value).toLowerCase() : '';
+        if(v === 'combined'){
+          // Do not force the container visible here — the central setter
+          // (setCombinedVisible) controls the authoritative visibility so
+          // the toggle text and container remain in sync. Only show the
+          // toggle button and populate controls.
+          if(combinedToggle) combinedToggle.style.display = '';
+          try{
+            // Populate combined controls on initial load so toggle button is wired
+            const md = loadBaseList();
+            const cb = document.getElementById('combined-metric-checkboxes');
+            if(cb && cb.childElementCount === 0){ populateCombinedCheckboxes(md.metrics || []); }
+          }catch(_){ }
+          try{ adjustAllMatchesScroll(); }catch(_){ }
+        } else {
+          if(combinedContainer) combinedContainer.style.display = 'none';
+          if(combinedToggle) combinedToggle.style.display = 'none';
+          try{ adjustAllMatchesScroll(); }catch(_){ }
+        }
+      }
+      // run now and when the select changes
+      update();
+      if(metricSel) metricSel.addEventListener('change', update);
+    }catch(_){ }
+  })();
+
+  if(filterInput){ filterInput.addEventListener('input', ()=>{ const v = (filterInput.value||'').toLowerCase().trim(); const md = loadBaseList(); if(!v) return renderRowsByMetric(md.list, metricSelect ? metricSelect.value : (md.metrics && md.metrics[0]) || 'JSD', getCombinedSelection()); const filtered = md.list.filter(m => ((m.demographic_model||'') + ' ' + (m.population||'')).toLowerCase().indexOf(v) !== -1); renderRowsByMetric(filtered, metricSelect ? metricSelect.value : 'JSD', getCombinedSelection()); }); }
   document.addEventListener('keydown', (e)=>{ if(e.key === 'Escape'){ closePanel(); } });
+
+})();
+
+/* Metric selector UI is initialized from external script (website/static/app.js).
+   The app.js exposes window.initAllDistancesUI() and auto-initializes it when
+   a #match-data element exists. */
 
   // Rescan flow
   const runMeta = document.getElementById('run-meta');
@@ -1575,8 +1924,6 @@
   // and RAiSD-AI population as plain text.
     }catch(_){ }
   })();
-
-})();
 //# sourceMappingURL=all-in-one.js.map
 </script>
 <script>

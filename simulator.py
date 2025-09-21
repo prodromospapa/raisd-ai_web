@@ -208,6 +208,27 @@ def remap_indices_ms_1based(ms_cmd, mapping):
         out.append(t); i += 1
     return ' '.join(out)
 
+
+def sanitize_ms_demography(ms_demog_fragment):
+    """Normalize an ms-style demography fragment.
+
+    This conservative sanitizer performs whitespace normalization, strips
+    surrounding whitespace, and ensures the fragment is returnable to be
+    appended to command lines. It intentionally avoids interpreting or
+    validating numeric tokens; callers rely on the external engine to
+    validate semantics. If input is falsy, returns an empty string.
+    """
+    try:
+        if not ms_demog_fragment:
+            return ''
+        # Collapse any whitespace sequences to single spaces and trim
+        toks = str(ms_demog_fragment).split()
+        return ' '.join(toks)
+    except Exception:
+        # On any error, fallback to a conservative empty string so callers
+        # do not accidentally inject None into command lines.
+        return ''
+
 def map_ej_to_ed(ms_cmd):
     toks = ms_cmd.split(); out = []; i = 0
     while i < len(toks):
@@ -291,254 +312,6 @@ def stepwise_from_exponential_epochs_graph_order(graph, N0, max_fold_per_step=1.
                     en.append((t_ms, i1, n_t / N0))
     en.sort(key=lambda x: -x[0])
     return en
-
-def sanitize_ms_demography(ms_demog_str):
-    toks = ms_demog_str.split(); out = []; i = 0
-    # include common ms-style -e* flags with their expected argument counts so
-    # sanitize preserves their arguments instead of dropping them. Missing
-    # entries here caused flags like '-es' to be emitted without their args,
-    # which breaks downstream MS-like parsers (see CmdLineParseException).
-    # Flags with fixed argument counts
-    arg_counts = {'-n':2,'-en':3,'-m':3,'-em':4,'-ej':3, '-ed':3, '-es':3, '-eg':4}
-    def is_flag(tok):
-        return tok.startswith('-')
-
-    while i < len(toks):
-        t = toks[i]
-        if t in arg_counts:
-            need = arg_counts[t]
-            # Special-case '-n': it may be followed by multiple size values for the same index
-            # (demes.ms.to_ms can emit multiple sizes in sequence). Convert sequences like
-            # '-n IDX SIZE1 SIZE2' into '-n IDX SIZE1 -n IDX SIZE2' so downstream ms-like
-            # parsers don't see orphan numeric tokens.
-            if t == '-n':
-                # ensure index token exists
-                if i + 1 >= len(toks):
-                    i += 1
-                    continue
-                idx_tok = toks[i+1]
-                # collect following non-flag tokens as sizes
-                j = i + 2
-                sizes = []
-                while j < len(toks) and not is_flag(toks[j]):
-                    sizes.append(toks[j]); j += 1
-                # if no sizes found, just emit the original -n and index (defensive)
-                if not sizes:
-                    out.extend(toks[i:min(len(toks), i+1+need)])
-                    i = min(len(toks), i+1+need)
-                    continue
-                # emit one '-n idx size' for each size token
-                for sz in sizes:
-                    out.extend(['-n', idx_tok, sz])
-                i = j
-                continue
-            # default handling for flags with fixed argument counts
-            take_end = min(len(toks), i + 1 + need)
-            out.extend(toks[i:take_end])
-            i = take_end
-            continue
-        if is_flag(t):
-            # Unknown flag: keep the flag and also keep following tokens until next flag
-            out.append(t)
-            j = i + 1
-            while j < len(toks) and not is_flag(toks[j]):
-                out.append(toks[j]); j += 1
-            i = j
-            continue
-        # bare token (shouldn't usually happen) - keep it
-        out.append(t); i += 1
-    return ' '.join(out)
-
-
-def _active_pops_at_time(ms_demog_str: str, initial_npop: int, t_when: float) -> int:
-    """Return the number of populations active at time t_when (4N units) given ms-style demography.
-
-    We start from the initial number of populations specified via -I and apply only those events
-    whose time <= t_when. Events that change population count are:
-      -es t i p  -> split population i (increase count by +1)
-      -ej t i j  -> join population j into i (decrease count by -1)
-    Other events (-en, -em, -eg, etc.) do not change counts.
-    """
-    try:
-        np = int(initial_npop)
-    except Exception:
-        np = initial_npop
-    if not ms_demog_str:
-        return max(1, int(np) if isinstance(np, int) else 1)
-    try:
-        toks = ms_demog_str.split()
-        i = 0
-        while i < len(toks):
-            tok = toks[i]
-            if tok == '-es' and i + 3 < len(toks):
-                # -es time idx prop
-                try:
-                    t = float(toks[i+1])
-                except Exception:
-                    t = float('inf')
-                # ms/msms times are 'backwards' (time measured into the past). An event at time t
-                # affects population structure at times t' >= t (further in the past). Therefore when
-                # computing active populations at t_when we should include events whose time <= t_when
-                # (i.e., events that have already occurred by time t_when).
-                if t <= t_when:
-                    np += 1
-                i += 4
-                continue
-            if tok == '-ej' and i + 3 < len(toks):
-                # -ej time i j
-                try:
-                    t = float(toks[i+1])
-                except Exception:
-                    t = float('inf')
-                # same reasoning for joins: if event time <= t_when the join has already occurred
-                # when looking at time t_when and reduces the active population count.
-                if t <= t_when:
-                    np = max(1, np - 1)
-                i += 4
-                continue
-            # advance over known-arity flags to avoid mis-parsing
-            if tok in ('-n',):
-                i += 3; continue
-            if tok in ('-en',):
-                i += 4; continue
-            if tok in ('-m',):
-                i += 4; continue
-            if tok in ('-em',):
-                i += 5; continue
-            if tok in ('-eg',):
-                i += 5; continue
-            i += 1
-        return max(1, int(np))
-    except Exception:
-        # On any parsing error, fall back to initial npop
-        try:
-            return max(1, int(initial_npop))
-        except Exception:
-            return 1
-
-
-def _map_present_index_to_time_index(ms_demog_str: str, present_npop: int, present_index: int, t_when: float):
-    """Attempt to map a present-time population index to the population index at time t_when.
-
-    Strategy (conservative, best-effort):
-    - Parse demography flags and collect events with times.
-    - Start from the present active label set: {1..present_npop}.
-    - Undo events that occurred after t_when (i.e., events with time < t_when) in descending time order:
-        * Undo -es (split): remove the most-recently-created label (highest numeric label) from the active set.
-        * Undo -ej (join): re-insert the joined label into the active set.
-    - After undoing, compute the sorted active labels and find the position of the present_index if present.
-    - Return (npop_at_time, idx_at_time_pos) where idx_at_time_pos is 1-based position inside the compact vector.
-      If the present_index is not present at t_when, return (npop_at_time, None) to indicate fallback required.
-
-    This is a pragmatic approach that works for common models built by stdpopsim where new labels are appended
-    in increasing order and joins/splits are reasonably well-formed. It may not be correct for intentionally
-    pathological demographies; in those cases we fallback to placing the initialization in deme 1.
-    """
-    # Deterministic remapping algorithm:
-    # 1) Parse events in chronological order and simulate label creation deterministically: each -es event creates a new label
-    #    assigned as the next integer > current max label. Record which created-label corresponds to which -es event.
-    # 2) To map a present-time label back to time t_when, undo only those -es/-ej events that occurred after t_when in reverse
-    #    chronological order, applying the inverse of the original transformation using the exact labels created in step (1).
-    # This avoids relying on heuristics about "highest label" and produces a reproducible mapping consistent with ms/msms
-    # label allocation where splits append new labels in creation order.
-    try:
-        toks = ms_demog_str.split()
-    except Exception:
-        toks = []
-
-    # Track events with times and original args in order
-    events = []  # list of (time, type, args, raw_index)
-    i = 0
-    raw_index = 0
-    while i < len(toks):
-        t = toks[i]
-        if t == '-es' and i + 3 < len(toks):
-            try:
-                ev_time = float(toks[i+1])
-                idx = int(float(toks[i+2]))
-                prop = toks[i+3]
-                events.append((ev_time, 'es', (idx, prop), raw_index))
-            except Exception:
-                pass
-            i += 4; raw_index += 1; continue
-        if t == '-ej' and i + 3 < len(toks):
-            try:
-                ev_time = float(toks[i+1])
-                i_from = int(float(toks[i+2])); i_to = int(float(toks[i+3]))
-                events.append((ev_time, 'ej', (i_from, i_to), raw_index))
-            except Exception:
-                pass
-            i += 4; raw_index += 1; continue
-        # skip other flags with known arities so parsing stays aligned
-        if t == '-en' and i + 3 < len(toks):
-            i += 4; raw_index += 1; continue
-        if t == '-em' and i + 4 < len(toks):
-            i += 5; raw_index += 1; continue
-        if t == '-m' and i + 3 < len(toks):
-            i += 4; raw_index += 1; continue
-        i += 1
-
-    # Sort events by increasing time (ms times measure into the past). We will simulate forwards from present -> past
-    events.sort(key=lambda x: x[0])
-
-    # Simulate deterministic label assignment going forwards in chronological order.
-    # Start with present active labels [1..present_npop]
-    present_npop_i = int(present_npop)
-    active_labels = list(range(1, present_npop_i + 1))
-    max_label = present_npop_i
-    # Map from es-event-raw_index -> created_label (the new label assigned at that split)
-    created_label_for_es = {}
-
-    for ev_time, etype, args, ridx in events:
-        if etype == 'es':
-            # split: creates a new label appended as next integer
-            max_label += 1
-            created_label_for_es[ridx] = max_label
-            # splitting an existing label doesn't change the set of active labels at the present
-            # but we record created label so we can undo it when mapping to earlier times
-        elif etype == 'ej':
-            # join: one label is merged into another at this time -> at present both labels may exist or not
-            # We don't alter max_label here; record event for undoing
-            pass
-
-    # To map present_index back to time t_when, we need to undo events that happened after t_when
-    # (i.e., events with time < t_when because times are measured into the past). Collect those and undo in reverse chronological order.
-    to_undo = [ (et,etype,args,ridx) for (et,etype,args,ridx) in events if et < t_when ]
-    to_undo.sort(key=lambda x: x[0], reverse=True)
-
-    # Start with the set of labels that are active at present (including any created labels up to max_label)
-    active = set(range(1, max_label + 1))
-
-    # Now undo events. For deterministic undo:
-    # - for an -es that created label L (we recorded via created_label_for_es), undo by removing L from active
-    # - for an -ej i j (join j into i), undo by adding j back to active
-    for ev_time, etype, args, ridx in to_undo:
-        if etype == 'es':
-            # find created label for this es event (by raw index)
-            lbl = created_label_for_es.get(ridx)
-            if lbl is not None and lbl in active:
-                active.discard(lbl)
-        elif etype == 'ej':
-            try:
-                i_from, i_to = args
-                # Undo a join i_from -> i_to by re-inserting i_from
-                active.add(i_from)
-            except Exception:
-                pass
-        else:
-            pass
-
-    active_sorted = sorted(x for x in active if isinstance(x, int))
-    npop_at_time = len(active_sorted)
-    # Determine compact 1-based position of present_index if present
-    try:
-        if int(present_index) in active_sorted:
-            pos = active_sorted.index(int(present_index)) + 1
-            return npop_at_time, pos
-        else:
-            return npop_at_time, None
-    except Exception:
-        return npop_at_time, None
 
 
 def _primary_simulation_is_neutral(meta):
@@ -665,6 +438,30 @@ def _run_and_register(*popen_args, **popen_kwargs):
     check = popen_kwargs.pop('check', False)
     env = popen_kwargs.pop('env', None)
     pre = popen_kwargs.pop('preexec_fn', None)
+    # Pre-flight: if the command to run is a string or list, verify the
+    # executable exists in PATH and raise a helpful error message if not.
+    try:
+        cmd0 = None
+        if popen_args:
+            first = popen_args[0]
+            # common invocation patterns: list (['msms', ...]) or string ('msms ...')
+            if isinstance(first, (list, tuple)) and first:
+                cmd0 = first[0]
+            elif isinstance(first, str):
+                # When passing a string, it's often the program name when shell=False
+                # Try to split to the program token, but be conservative.
+                cmd0 = first.split()[0] if first.split() else first
+        if cmd0:
+            # shutil.which handles absolute paths as well
+            if shutil.which(cmd0) is None:
+                raise FileNotFoundError(f"Executable '{cmd0}' not found in PATH. Please install it or run inside an environment where it's available.")
+    except FileNotFoundError:
+        # Re-raise to allow callers to catch, but avoid attempting to spawn.
+        raise
+    except Exception:
+        # Non-fatal: fall through and let Popen attempt to run (it will raise if needed).
+        pass
+
     # Build Popen args
     try:
         proc = subprocess.Popen(*popen_args, stdin=stdin, stdout=subprocess.PIPE if capture_output else None,
@@ -1178,6 +975,11 @@ _register_cleanup_handlers()
 
 def ms_like_to_vcf(ms_text: str, length: int, chrom: str = 'chr1', ploidy: int = 1) -> str:
     """Convert a single-replicate ms-like block to a simple VCF string.
+
+    NOTE: This implementation was adapted from the repository's `ms2vcf.py`
+    conversion logic and preserves any leading '##' metadata lines found in
+    ms-like output. The VCF contig header is written using the provided
+    `chrom` parameter as the contig ID (e.g. chromosome number).
 
     Expects a block starting with 'segsites:' and a following 'positions:' line, then haplotypes.
     """

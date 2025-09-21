@@ -19,6 +19,7 @@ matplotlib.use("Agg")  # headless servers
 import json
 import time
 import threading
+import copy
 from concurrent.futures import ThreadPoolExecutor, Future
 import matplotlib.pyplot as plt
 import pysam
@@ -26,6 +27,8 @@ import signal
 
 from collections import Counter
 from math import lgamma
+from scipy.special import gammaln
+import math
 
 from flask import (
     Flask, render_template, request, redirect, url_for,
@@ -53,6 +56,13 @@ CLEANUP_GRACE_SECONDS = int(os.environ.get('CLEANUP_GRACE_SECONDS', '30'))
 app = Flask(__name__)
 app.config.update(MAX_CONTENT_LENGTH=MAX_CONTENT, SECRET_KEY=os.urandom(16))
 os.makedirs(RUNS_DIR, exist_ok=True)
+
+# Server-side combined precompute options (opt-in via env vars)
+PRECOMPUTE_COMBINED_ENABLED = str(os.environ.get('SERVER_PRECOMPUTE_COMBINED', '')).lower() in ('1', 'true', 'yes')
+_PRECOMPUTE_COMBINED_METRICS = os.environ.get('SERVER_COMBINED_METRICS')
+PRECOMPUTE_COMBINED_METRICS = None
+if _PRECOMPUTE_COMBINED_METRICS:
+    PRECOMPUTE_COMBINED_METRICS = [s.strip() for s in _PRECOMPUTE_COMBINED_METRICS.split(',') if s.strip()]
 
 
 @app.route('/ext_gene_link')
@@ -359,6 +369,79 @@ def jsd(p, q, eps=1e-12):
     m = 0.5 * (p + q)
     return float(0.5 * ((p * np.log(p / m)).sum() + (q * np.log(q / m)).sum()) / np.log(2.0))
 
+# Additional distance metrics (match names used in UI)
+def _prep_pq(p, q, eps=1e-12):
+    p = np.asarray(p, float); q = np.asarray(q, float)
+    p = np.clip(p, 0, None); q = np.clip(q, 0, None)
+    ps = p.sum(); qs = q.sum()
+    if ps <= 0 or not np.isfinite(ps): p = np.ones_like(p); ps = p.sum()
+    if qs <= 0 or not np.isfinite(qs): q = np.ones_like(q); qs = q.sum()
+    p /= ps; q /= qs
+    p = np.clip(p, eps, 1.0); q = np.clip(q, eps, 1.0)
+    return p, q
+
+def l1(p, q):
+    p, q = _prep_pq(p, q)
+    return float(np.abs(p - q).sum())
+
+def l2(p, q):
+    p, q = _prep_pq(p, q)
+    return float(np.sqrt(((p - q) ** 2).sum()))
+
+def cosine_distance(p, q, eps=1e-12):
+    p = np.asarray(p, float); q = np.asarray(q, float)
+    p = np.clip(p, 0, None); q = np.clip(q, 0, None)
+    num = float((p * q).sum())
+    den = math.sqrt(float((p * p).sum())) * math.sqrt(float((q * q).sum()))
+    if den <= eps: return 1.0
+    return 1.0 - (num / den)
+
+def hellinger(p, q):
+    p, q = _prep_pq(p, q)
+    return float(np.linalg.norm(np.sqrt(p) - np.sqrt(q)) / math.sqrt(2.0))
+
+def bhattacharyya(p, q, eps=1e-12):
+    p, q = _prep_pq(p, q, eps)
+    bc = float(np.sum(np.sqrt(p * q)))
+    bc = min(max(bc, eps), 1.0)
+    return float(-math.log(bc))
+
+def bray_curtis(p, q, eps=1e-12):
+    p, q = _prep_pq(p, q, eps)
+    num = float(np.abs(p - q).sum())
+    den = float((p + q).sum())
+    if den <= eps: return 0.0
+    return num / den
+
+def canberra(p, q, eps=1e-12):
+    p, q = _prep_pq(p, q, eps)
+    num = np.abs(p - q)
+    den = np.abs(p) + np.abs(q) + eps
+    return float((num / den).sum())
+
+def chi_square(p, q, eps=1e-12):
+    p, q = _prep_pq(p, q, eps)
+    return float(0.5 * (((p - q) ** 2) / (p + q + eps)).sum())
+
+def corr_distance(p, q, eps=1e-12):
+    p = np.asarray(p, float); q = np.asarray(q, float)
+    if np.allclose(p, p.mean()) or np.allclose(q, q.mean()):
+        return 1.0
+    r = np.corrcoef(p, q)[0, 1]
+    if not np.isfinite(r): return 1.0
+    return float(1.0 - r)
+
+def ks_distance(p, q):
+    p, q = _prep_pq(p, q)
+    P = np.cumsum(p); Q = np.cumsum(q)
+    return float(np.max(np.abs(P - Q)))
+
+def aitchison(p, q, eps=1e-12):
+    p, q = _prep_pq(p, q, eps)
+    lp = np.log(p); lq = np.log(q)
+    cp = lp - lp.mean(); cq = lq - lq.mean()
+    return float(np.linalg.norm(cp - cq))
+
 def load_sfs_matrix(path):
     df = pd.read_csv(path, index_col=0).astype(float)
     cols = sorted(df.columns, key=lambda c: int(c))
@@ -432,6 +515,7 @@ def _load_annotation(species: str, chromosome: str, ensembl_version: Optional[st
     # Always try the legacy single annotation directory patterns too
     ver_variants.append(os.path.join('{species}', 'annotation', '{chr}.tsv'))
 
+    df = None
     for cand in candidates:
         if not cand or cand in seen:
             continue
@@ -462,6 +546,10 @@ def _load_annotation(species: str, chromosome: str, ensembl_version: Optional[st
             if pd.notna(v):
                 return v
         return np.nan
+
+    # Safety: ensure df was loaded (static analyzers may not follow the earlier raise)
+    if df is None:
+        raise FileNotFoundError(f"Annotation file not found for species={species} chromosome={chromosome}")
 
     gene_level = (
         df.sort_values(["gene_id", "start"]).
@@ -500,23 +588,40 @@ def _genes_in_window(species: str, chromosome: str, start: int, end: int, biotyp
     return hits[["label", "start", "end", "biotype", "overlap_bp"]]
 
 # ------------------ projection helpers ------------------
-def _pre_lgamma(N):
-    G = np.zeros(N + 2, float)
-    for m in range(1, N + 2):
-        G[m] = lgamma(m)
-    return G
+def _logC(n, k):
+    """Stable log binomial coefficient using gammaln.
 
-def _logC(n, k, G):
-    return G[n + 1] - G[k + 1] - G[n - k + 1]
+    Accepts scalars or numpy arrays for n and k.
+    """
+    return gammaln(n + 1.0) - gammaln(k + 1.0) - gammaln(n - k + 1.0)
 
-def _pmf_i(i, nproj, N, G):
+
+def _pmf_i(i, nproj, N):
+    """Return (jmin, jmax, pmf_array) for projecting a derived-count i from
+    sample size N down to nproj haplotypes.
+
+    The pmf_array has length nproj+1 and is normalized; entries outside the
+    support jmin..jmax are zero. Computation is done in log-space with a
+    log-sum-exp stabilization to avoid underflow for large N.
+    """
     jmin = max(0, nproj + i - N)
     jmax = min(i, nproj)
+    if jmax < jmin:
+        return jmin, jmax, np.zeros(nproj + 1, float)
     js = np.arange(jmin, jmax + 1, dtype=int)
-    denom = _logC(N, i, G)
-    pmf = np.exp(_logC(nproj, js, G) + _logC(N - nproj, i - js, G) - denom)
-    s = pmf.sum()
-    return jmin, jmax, (pmf / s if s > 0 else pmf)
+    denom = _logC(N, i)
+    # compute log-probabilities for supported js
+    logp = _logC(nproj, js) + _logC(N - nproj, i - js) - denom
+    mx = np.max(logp)
+    if not np.isfinite(mx):
+        return jmin, jmax, np.zeros(nproj + 1, float)
+    pmf_vals = np.exp(logp - mx)
+    out = np.zeros(nproj + 1, float)
+    out[js] = pmf_vals
+    s = out.sum()
+    if s > 0:
+        out /= s
+    return jmin, jmax, out
 
 def normalize_sfs_df(df: pd.DataFrame) -> pd.DataFrame:
     """Return a DataFrame containing only the polymorphic bins by dropping
@@ -555,7 +660,7 @@ def project_expected_df(df, target):
     N = max_col
     if target > N:
         raise ValueError(f"target ({target}) > reference N ({N}); projection is downsampling only.")
-    G, cache = _pre_lgamma(N), {}
+    cache = {}
     rows = []
     for _, row in df.iterrows():
         # Build full-length p vector indexed 0..N
@@ -564,16 +669,27 @@ def project_expected_df(df, target):
             idx = int(c)
             if 0 <= idx <= N:
                 p_full[idx] = float(v)
+        # We will build a full-length vector indexed 0..N and then project into
+        # target+1 bins (0..target). However the SFS table and UI use polymorphic
+        # bins (1..n-1). After projection we will drop the invariant bins (0 and
+        # target) and return columns 1..(target-1).
         z = np.zeros(target + 1, float)
         for i, w in enumerate(p_full):
             if w <= 0:
                 continue
             if i not in cache:
-                cache[i] = _pmf_i(i, target, N, G)
+                cache[i] = _pmf_i(i, target, N)
             jmin, jmax, pmf = cache[i]
-            z[jmin:jmax + 1] += w * pmf
-        rows.append(norm(z[1:]))
-    return pd.DataFrame(rows, index=df.index, columns=[str(k) for k in range(1, target + 1)])
+            z += w * pmf
+        # drop invariant bins (0 and target) to produce polymorphic-only vector
+        if target <= 1:
+            polymorphic = np.asarray([], float)
+        else:
+            polymorphic = z[1:target]
+        rows.append(norm(polymorphic))
+    # columns correspond to bins 1..(target-1)
+    cols_out = [str(k) for k in range(1, target)]
+    return pd.DataFrame(rows, index=df.index, columns=cols_out)
 
 # ----------------------- RAiSD report + plotting ------------------------
 # RAiSD native output order (do NOT change this list ordering; it must match tool output):
@@ -586,21 +702,21 @@ RAISD_HEADER_RAW = [
     r"$\mu_{var}^{sweep_{TR}}$",
 ]
 
-# Desired display / report order requested: muVar, muSFS, muLD, mu, mu_var_sweep_TR, sweepTR
-# i.e. swap the last two compared to raw tool output.
+# Desired display / report order required by RAiSD AI report UI:
+# r"$\\mu_{Var}$, r"$\\mu_{SFS}$, r"$\\mu_{LD}$, r"$\\mu$", r"$sweep_{TR}$", r"$\\mu_{var}^{sweep_{TR}}$"
+# Keep order exactly as requested by user so display/reports follow this sequence.
 DISPLAY_HEADER = [
     r"$\mu_{Var}$",
     r"$\mu_{SFS}$",
     r"$\mu_{LD}$",
     r"$\mu$",
-    r"$\mu_{var}^{sweep_{TR}}$",
     r"$sweep_{TR}$",
+    r"$\mu_{var}^{sweep_{TR}}$",
 ]
 
-# UI requirement: only expose these metrics in the dropdown (plots for others may still be generated internally)
-# Keep internal/raw RAiSD header strings here; provide a small display map so the UI
-# shows nicer names (μ and sweepTR) while the code continues to use the original
-# RAiSD column names for data lookups.
+# UI requirement: only expose a subset of metrics in the dropdown (plots for others
+# may still be generated internally). Use the raw RAiSD header LaTeX strings here.
+# Exposed metrics should follow the same logical ordering (μ then sweep_TR).
 EXPOSED_METRICS = {r"$\mu$", r"$sweep_{TR}$"}
 EXPOSED_METRIC_DISPLAY = {
     r"$\mu$": "μ",
@@ -869,11 +985,11 @@ def runs_report_csv(run_id):
         else:
             app.logger.debug(f"Requested report {rp} not found for run {run_id}; will fallback")
 
-    # 2) honor dm/pop pair -> RAiSD_Report.<dm>__<pop>
+    # 2) honor dm/pop pair -> RAiSD_Report.<dm>_<pop>
     if report_path is None and req_dm and req_pop:
         safe_dm = re.sub(r'[^A-Za-z0-9_\-]+', '_', req_dm).strip('_')
         safe_pop = re.sub(r'[^A-Za-z0-9_\-]+', '_', req_pop).strip('_')
-        persisted_name = f"RAiSD_Report.{safe_dm}__{safe_pop}"
+        persisted_name = f"RAiSD_Report.{safe_dm}_{safe_pop}"
         cand = os.path.join(run_dir, persisted_name)
         if os.path.exists(cand):
             report_path = cand
@@ -902,7 +1018,7 @@ def runs_report_csv(run_id):
     except Exception as e:
         return json.dumps({'error': f'failed to serialize csv: {e}'}), 500, {'Content-Type': 'application/json'}
     csv_data = buf.getvalue()
-    # Name the CSV after the underlying report when available (e.g., RAiSD_Report.<dm>__<pop>.csv)
+    # Name the CSV after the underlying report when available (e.g., RAiSD_Report.<dm>_<pop>.csv)
     try:
         base = os.path.basename(report_path)
         if base.endswith('.results'):
@@ -918,7 +1034,49 @@ def _plots_exist(run_dir: str) -> bool:  # backward compatibility shim
     return True
 
 # ------------------------------ Pipeline ------------------------------
-def compute_best_match(species: str, vcf_path: str):
+def _compute_combined_scores_server(all_distances, metrics_to_use=None):
+    """Compute normalized average-rank combined scores for a list of all_distances.
+
+    all_distances: list of {'demographic_model', 'population', 'distances': {metric:val}}
+    metrics_to_use: list of metric names to include (default: all keys found)
+    Returns: list of normalized combined scores aligned to all_distances (index order)
+    """
+    try:
+        if not all_distances:
+            return []
+        N = len(all_distances)
+        # Determine metrics
+        sample = all_distances[0].get('distances', {}) if all_distances else {}
+        if metrics_to_use is None:
+            metrics = [m for m in sample.keys()]
+        else:
+            metrics = [m for m in metrics_to_use if m in sample]
+        if not metrics:
+            return [None] * N
+        # Build per-metric ranks (1..N)
+        ranks = {m: [0] * N for m in metrics}
+        for m in metrics:
+            arr = []
+            for idx, entry in enumerate(all_distances):
+                v = entry.get('distances', {}).get(m, None)
+                arr.append((idx, float('inf') if v is None else v))
+            arr.sort(key=lambda x: (x[1], x[0]))
+            for rnk, (idx, _) in enumerate(arr, start=1):
+                ranks[m][idx] = rnk
+        # Average ranks and normalize
+        avg = []
+        for i in range(N):
+            s = 0
+            for m in metrics:
+                s += ranks[m][i] if ranks[m][i] else N
+            avg_rank = s / len(metrics)
+            avg.append(avg_rank / N)
+        return avg
+    except Exception:
+        return [None] * (len(all_distances) if all_distances else 0)
+
+
+def compute_best_match(species: str, vcf_path: str, precompute_combined: bool = False, combined_metrics: Optional[list] = None, primary_metric: Optional[str] = None):
     sfs_table = os.path.join(DATA_DIR, species, 'sfs.csv')
     if not os.path.exists(sfs_table):
         raise FileNotFoundError(f"Missing SFS table: {sfs_table}")
@@ -938,7 +1096,14 @@ def compute_best_match(species: str, vcf_path: str):
     try:
         proj = project_expected_df(df, target)
         sfs = sfs_from_bcftools(vcf_path, target)
-        q = norm(sfs[1:])  # observed SFS (skip invariant)
+        # observed SFS should match the polymorphic bins in the SFS table:
+        # use bins 1..(target-1). If target is small, fall back to available polymorphic bins.
+        if target <= 1:
+            # no polymorphic bins; normalize empty array to avoid errors
+            q = np.asarray([], float)
+        else:
+            # sfs is length target+1 (0..target); take 1..target-1
+            q = norm(sfs[1:target])
     except ValueError as e:
         # Detect the specific 'target > reference N' error from project_expected_df
         msg = str(e)
@@ -963,10 +1128,13 @@ def compute_best_match(species: str, vcf_path: str):
             cols = [str(i) for i in range(0, len(obs_full))]
             obs_df = pd.DataFrame([obs_full], index=['_obs_'], columns=cols)
             obs_proj = project_expected_df(obs_df, int(N_ref)).loc['_obs_'].values
+            # project_expected_df now returns polymorphic bins (1..N_ref-1), so obs_proj
+            # corresponds to those bins already; normalize to be safe
             q = norm(obs_proj)
         else:
             # Unknown ValueError - propagate
             raise
+    # First compute JSD per projected row so we can still return JSD values
     pop_jsd_pairs = []  # list of (full_name, jsd_val)
     for pop in proj.index:
         try:
@@ -975,40 +1143,205 @@ def compute_best_match(species: str, vcf_path: str):
             d = float('inf')
         pop_jsd_pairs.append((pop, d))
     pop_jsd_pairs.sort(key=lambda x: x[1])
-    best_pop, best_jsd = pop_jsd_pairs[0]
-    demographic_model, population = best_pop.split("=")
-    best_expected = proj.loc[best_pop].values.tolist()
-    # Build structured lists
-    top_matches = []
-    for name, val in pop_jsd_pairs[:6]:
+    best_jsd = pop_jsd_pairs[0][1]
+
+    # Compute a richer per-population distance dictionary for the UI to use
+    metrics_available = [
+        "JSD", "L1", "L2", "Cosine", "Hellinger", "Bhattacharyya",
+        "BrayCurtis", "Canberra", "ChiSquare", "CorrDist", "KS", "Aitchison",
+    ]
+    all_distances = []
+    all_jsd = []
+    for name, jsd_val in pop_jsd_pairs:
         try:
             dm, popn = name.split('=')
-        except ValueError:
+        except Exception:
             dm, popn = name, ''
-        # Attach the projected expected SFS for the same target so UI can draw without re-fetch
+        distances = {}
+        # compute metric values with best-effort exception handling
         try:
-            expected_vec = proj.loc[name].values.tolist()
+            distances['JSD'] = jsd(proj.loc[name].values, q)
+        except Exception:
+            distances['JSD'] = None
+        try:
+            distances['L1'] = l1(proj.loc[name].values, q)
+        except Exception:
+            distances['L1'] = None
+        try:
+            distances['L2'] = l2(proj.loc[name].values, q)
+        except Exception:
+            distances['L2'] = None
+        try:
+            distances['Cosine'] = cosine_distance(proj.loc[name].values, q)
+        except Exception:
+            distances['Cosine'] = None
+        try:
+            distances['Hellinger'] = hellinger(proj.loc[name].values, q)
+        except Exception:
+            distances['Hellinger'] = None
+        try:
+            distances['Bhattacharyya'] = bhattacharyya(proj.loc[name].values, q)
+        except Exception:
+            distances['Bhattacharyya'] = None
+        try:
+            distances['BrayCurtis'] = bray_curtis(proj.loc[name].values, q)
+        except Exception:
+            distances['BrayCurtis'] = None
+        try:
+            distances['Canberra'] = canberra(proj.loc[name].values, q)
+        except Exception:
+            distances['Canberra'] = None
+        try:
+            distances['ChiSquare'] = chi_square(proj.loc[name].values, q)
+        except Exception:
+            distances['ChiSquare'] = None
+        try:
+            distances['CorrDist'] = corr_distance(proj.loc[name].values, q)
+        except Exception:
+            distances['CorrDist'] = None
+        try:
+            distances['KS'] = ks_distance(proj.loc[name].values, q)
+        except Exception:
+            distances['KS'] = None
+        try:
+            distances['Aitchison'] = aitchison(proj.loc[name].values, q)
+        except Exception:
+            distances['Aitchison'] = None
+
+        # Build legacy all_jsd entry (keep expected_sfs when available)
+        entry = {'demographic_model': dm, 'population': popn, 'jsd': float(jsd_val)}
+        try:
+            entry_expected = proj.loc[name].values.tolist()
+            entry['expected_sfs'] = entry_expected
+        except Exception:
+            pass
+        all_jsd.append(entry)
+
+        all_distances.append({'demographic_model': dm, 'population': popn, 'distances': distances})
+
+    # If requested, compute combined normalized average-rank scores server-side
+    if precompute_combined:
+        try:
+            combined_scores = _compute_combined_scores_server(all_distances, combined_metrics)
+            if combined_scores and len(combined_scores) == len(all_distances):
+                for i, val in enumerate(combined_scores):
+                    try:
+                        # Ensure distances dict exists
+                        if 'distances' not in all_distances[i] or all_distances[i]['distances'] is None:
+                            all_distances[i]['distances'] = {}
+                        all_distances[i]['distances']['Combined'] = (None if val is None else float(val))
+                    except Exception:
+                        # Non-fatal: continue for other entries
+                        continue
+                if 'Combined' not in metrics_available:
+                    metrics_available.append('Combined')
+        except Exception:
+            # best-effort: ignore failures and return without Combined
+            pass
+    # Determine which metric should be used to pick the primary/top matches
+    sel_metric = (primary_metric or 'JSD').strip()
+    # If Combined requested but not present, attempt to compute it now using provided combined_metrics
+    if sel_metric == 'Combined' and 'Combined' not in metrics_available:
+        try:
+            combined_scores = _compute_combined_scores_server(all_distances, combined_metrics)
+            if combined_scores and len(combined_scores) == len(all_distances):
+                for i, val in enumerate(combined_scores):
+                    try:
+                        if 'distances' not in all_distances[i] or all_distances[i]['distances'] is None:
+                            all_distances[i]['distances'] = {}
+                        all_distances[i]['distances']['Combined'] = (None if val is None else float(val))
+                    except Exception:
+                        continue
+                if 'Combined' not in metrics_available:
+                    metrics_available.append('Combined')
+        except Exception:
+            pass
+
+    # Build an ordering by the selected metric (fall back to JSD when metric missing)
+    order = []  # list of (name_key, metric_value)
+    for entry in all_distances:
+        dm = entry.get('demographic_model')
+        popn = entry.get('population')
+        name_key = f"{dm}={popn}" if popn else dm
+        val = None
+        try:
+            val = entry.get('distances', {}).get(sel_metric)
+        except Exception:
+            val = None
+        if val is None:
+            # fallback to JSD value from all_jsd array
+            try:
+                # find matching all_jsd entry
+                found = next((a for a in all_jsd if a.get('demographic_model') == dm and a.get('population') == popn), None)
+                val = found.get('jsd') if found else float('inf')
+            except Exception:
+                val = float('inf')
+        order.append((name_key, float('inf') if val is None else float(val)))
+    order.sort(key=lambda x: (x[1], x[0]))
+
+    # Select top (best) by chosen metric
+    demographic_model = ''
+    population = ''
+    best_expected = None
+    best_primary_value = None
+    if order:
+        best_name = order[0][0]
+        try:
+            best_primary_value = float(order[0][1]) if order[0][1] is not None else None
+        except Exception:
+            best_primary_value = None
+        if '=' in best_name:
+            demographic_model, population = best_name.split('=', 1)
+        else:
+            demographic_model, population = best_name, ''
+        try:
+            best_expected = proj.loc[best_name].values.tolist()
+        except Exception:
+            # try alternative lookup by splitting
+            try:
+                key = f"{demographic_model}={population}" if population else demographic_model
+                best_expected = proj.loc[key].values.tolist()
+            except Exception:
+                best_expected = None
+    # Determine best_jsd by looking up the JSD value for the selected-best entry
+    best_jsd = None
+    try:
+        found_jsd = next((a.get('jsd') for a in all_jsd if a.get('demographic_model') == demographic_model and a.get('population') == population), None)
+        best_jsd = float(found_jsd) if found_jsd is not None else None
+    except Exception:
+        best_jsd = None
+
+    # Build top_matches according to selected metric ordering, also include JSD for each entry
+    top_matches = []
+    for name_key, val in order[:6]:
+        try:
+            if '=' in name_key:
+                dm, popn = name_key.split('=', 1)
+            else:
+                dm, popn = name_key, ''
+        except Exception:
+            dm, popn = name_key, ''
+        try:
+            expected_vec = proj.loc[name_key].values.tolist()
         except Exception:
             expected_vec = None
-        item = {'demographic_model': dm, 'population': popn, 'jsd': float(val)}
+        item = {'demographic_model': dm, 'population': popn}
+        # include the metric value under a predictable key
+        item_key = sel_metric.lower().replace(' ', '_') if sel_metric else 'distance'
+        try:
+            item[item_key] = float(val)
+        except Exception:
+            item[item_key] = None
+        # attach jsd if available
+        try:
+            jsd_val = next((a.get('jsd') for a in all_jsd if a.get('demographic_model') == dm and a.get('population') == popn), None)
+            item['jsd'] = float(jsd_val) if jsd_val is not None else None
+        except Exception:
+            item['jsd'] = None
         if expected_vec is not None:
             item['expected_sfs'] = expected_vec
         top_matches.append(item)
-    # Full list (may be large). We omit expected SFS for non-top matches to keep size smaller.
-    all_jsd = []
-    for name, val in pop_jsd_pairs:
-        try:
-            dm, popn = name.split('=')
-        except ValueError:
-            dm, popn = name, ''
-        item = {'demographic_model': dm, 'population': popn, 'jsd': float(val)}
-        # Attach expected_sfs if available so UI can render picked traces without extra projection
-        try:
-            item_expected = proj.loc[name].values.tolist()
-            item['expected_sfs'] = item_expected
-        except Exception:
-            pass
-        all_jsd.append(item)
+
     return {
         'target': target,
         'ploidy': ploidy,
@@ -1017,10 +1350,14 @@ def compute_best_match(species: str, vcf_path: str):
         'demographic_model': demographic_model,
         'population': population,
         'best_jsd': best_jsd,
+        'selected_metric': sel_metric,
+        'best_selected_value': best_primary_value,
         'input_sfs': q.tolist(),
         'best_expected_sfs': best_expected,
         'top_matches': top_matches,
         'all_jsd': all_jsd,
+        'all_distances': all_distances,
+        'metrics_available': metrics_available,
     }
 
 def _find_and_normalize_report(run_dir: str, prefix: str = "results") -> Optional[str]:
@@ -1058,7 +1395,7 @@ def _choose_persisted_report(run_dir: str) -> Optional[str]:
     """Return the best persisted per-(dm,pop) report for a run.
     Preference order:
       1. `result_meta.json` -> last_rescan.report if exists
-      2. any files matching `RAiSD_Report.<dm>__<pop>.results` (newest)
+    2. any files matching `RAiSD_Report.<dm>_<pop>.results` (newest)
       3. if only RAiSD_Report.results exists and meta.match present: copy it to a persisted name and return that
       4. otherwise None
     """
@@ -1080,7 +1417,7 @@ def _choose_persisted_report(run_dir: str) -> Optional[str]:
             return p
 
     # 2. look for named reports produced by RAiSD (-n <name> -> RAiSD_Report.<name>)
-    # Prefer the newest matching the "<dm>__<pop>" or "<dm>" patterns; fall back to any RAiSD_Report.*
+    # Prefer the newest matching the "<dm>_<pop>" or "<dm>" patterns; fall back to any RAiSD_Report.*
     pattern = os.path.join(run_dir, 'RAiSD_Report.*')
     candidates = []
     for path in glob.glob(pattern):
@@ -1121,13 +1458,14 @@ def run_raisd(run_dir: str, model_path: str, vcf_path: str, chromosome: int, gri
         return re.sub(r'[^A-Za-z0-9_\-]+', '_', (s or '').strip()).strip('_')
 
     # RAiSD -n should be the base name WITHOUT the RAiSD_Report. prefix.
-    # We'll pass <dm>__<pop> (or <dm>) so RAiSD creates RAiSD_Report.<dm>__<pop>
-    # and RAiSD_Info.<dm>__<pop>.
+    # We'll pass <dm>_<pop> (or <dm>) so RAiSD creates RAiSD_Report.<dm>_<pop>
+    # and RAiSD_Info.<dm>_<pop>.
     name_base = 'results'
     try:
         if dm:
             if pop:
-                name_base = f"{_sanitize_name(dm)}__{_sanitize_name(pop)}"
+                # Use single underscore to join demography and population
+                name_base = f"{_sanitize_name(dm)}_{_sanitize_name(pop)}"
             else:
                 name_base = f"{_sanitize_name(dm)}"
     except Exception:
@@ -1201,6 +1539,21 @@ def run_raisd(run_dir: str, model_path: str, vcf_path: str, chromosome: int, gri
             "stdout (tail):\n" + "\n".join(std_tail) + "\n\n"
             "stderr (tail):\n" + "\n".join(err_tail)
         )
+    # If RAiSD didn't produce a named report (RAiSD_Report.<name_base>),
+    # ensure we persist one by copying the generic RAiSD_Report.results to
+    # RAiSD_Report.<name_base>. This guarantees downstream code can look
+    # for per-(dm,pop) persisted reports even when the RAiSD executable
+    # didn't honor the -n flag or produced only the generic filename.
+    try:
+        if not os.path.exists(expected_report_named) and os.path.exists(report_path):
+            try:
+                shutil.copyfile(report_path, expected_report_named)
+                append_log(run_dir, f"Created persisted named report: {os.path.basename(expected_report_named)} from {os.path.basename(report_path)}")
+            except Exception as ce:
+                append_log(run_dir, f"Warning: failed to create persisted named report: {ce}")
+    except Exception:
+        # Non-fatal: continue even if persistence attempt fails
+        pass
     # Successful run: remove grid directory and RAiSD_Info.<name> to save space
     try:
         if os.path.isdir(grid_dir):
@@ -1214,6 +1567,20 @@ def run_raisd(run_dir: str, model_path: str, vcf_path: str, chromosome: int, gri
                 append_log(run_dir, f"Removed RAiSD info file: {os.path.basename(info_named)}")
             except Exception:
                 pass
+        # Also remove any RAiSD_Grid.<name_base> artifact (file or directory)
+        grid_named = os.path.join(run_dir, f"RAiSD_Grid.{name_base}")
+        try:
+            if os.path.isdir(grid_named):
+                shutil.rmtree(grid_named, ignore_errors=True)
+                append_log(run_dir, f"Removed named grid directory: {os.path.basename(grid_named)}")
+            elif os.path.exists(grid_named):
+                try:
+                    os.remove(grid_named)
+                    append_log(run_dir, f"Removed named grid file: {os.path.basename(grid_named)}")
+                except Exception:
+                    pass
+        except Exception as ce:
+            append_log(run_dir, f"Warning: failed to remove named RAiSD_Grid.{name_base}: {ce}")
     except Exception as ce:
         append_log(run_dir, f"Warning: failed to remove grid directory {RAISD_GRIDDIR}: {ce}")
     return report_path
@@ -1226,7 +1593,12 @@ _rescan_meta: Dict[str, dict] = {}
 @app.route('/')
 def index():
     species_options = sorted([d for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d))]) or ["HomSap"]
-    return render_template('index.html', species_options=species_options)
+    # Provide a list of available distance metrics for the initial form
+    metrics_available = [
+        "JSD", "L1", "L2", "Cosine", "Hellinger", "Bhattacharyya",
+        "BrayCurtis", "Canberra", "ChiSquare", "CorrDist", "KS", "Aitchison",
+    ]
+    return render_template('index.html', species_options=species_options, metrics_available=metrics_available)
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -1254,6 +1626,14 @@ def analyze():
         flash("Grid must be a positive integer.")
         return redirect(url_for('index'))
 
+    # Capture metric selections from the form (optional)
+    distance_metric = (request.form.get('distance_metric') or '').strip()
+    # combined_metrics may be a single string or multiple; ensure list
+    combined_metrics_raw = request.form.getlist('combined_metrics') if hasattr(request.form, 'getlist') else []
+    if not combined_metrics_raw:
+        cm_single = (request.form.get('combined_metrics') or '').strip()
+        combined_metrics_raw = [s.strip() for s in cm_single.split(',') if s.strip()] if cm_single else []
+
     if not file or file.filename == '':
         if run_id and uploaded_filename:
             run_dir = os.path.join(RUNS_DIR, run_id)
@@ -1269,13 +1649,15 @@ def analyze():
                 touch_run(run_id)
                 try:
                     staged_meta = {
-                        'run_id': run_id,
-                        'uploaded_name': uploaded_filename,
-                        'species': request.form.get('species', '').strip(),
-                        'chromosome': request.form.get('chromosome', '').strip(),
-                        'grid': request.form.get('grid', '').strip(),
-                        'status': 'staged'
-                    }
+                            'run_id': run_id,
+                            'uploaded_name': uploaded_filename,
+                            'species': request.form.get('species', '').strip(),
+                            'chromosome': request.form.get('chromosome', '').strip(),
+                            'grid': request.form.get('grid', '').strip(),
+                            'distance_metric': distance_metric,
+                            'combined_metrics': combined_metrics_raw,
+                            'status': 'staged'
+                        }
                     with open(os.path.join(run_dir, 'staged_upload.json'), 'w', encoding='utf-8') as sf:
                         sf.write(json.dumps(staged_meta))
                 except Exception:
@@ -1333,6 +1715,8 @@ def analyze():
                 'using_contig': detected_contig,
                 'grid': grid_str if isinstance(grid_str, str) else str(grid_str),
                 'uploaded_name': filename,
+                'distance_metric': distance_metric,
+                'combined_metrics': combined_metrics_raw,
                 'plots_ready': False,
                 'plots': []
             }
@@ -1379,6 +1763,8 @@ def analyze():
                     'using_contig': detected_contig,
                     'grid': grid_str if isinstance(grid_str, str) else str(grid_str),
                     'uploaded_name': filename,
+                    'distance_metric': distance_metric,
+                    'combined_metrics': combined_metrics_raw,
                     'plots_ready': False,
                     'plots': []
                 }
@@ -1492,11 +1878,12 @@ def analyze():
                     if numeric_str in stripped_map:
                         chosen_contig = stripped_map[numeric_str]
                     # If still unresolved, see if first record CHROM matches any contig entry
-                    if chosen_contig is None and first_record_chrom:
-                        if first_record_chrom in contig_set:
-                            chosen_contig = first_record_chrom
-                        elif first_record_chrom.lower().startswith('chr') and first_record_chrom[3:] in stripped_map:
-                            chosen_contig = stripped_map[first_record_chrom[3:]]
+                    if chosen_contig is None and uniq:
+                        fr = uniq[0]
+                        if fr in contig_set:
+                            chosen_contig = fr
+                        elif isinstance(fr, str) and fr.lower().startswith('chr') and fr[3:] in stripped_map:
+                            chosen_contig = stripped_map[fr[3:]]
             if chosen_contig is None:
                 # Could not reconcile; present helpful error if mismatch likely
                 # (Only if user selection not among available options and not single contig case already handled)
@@ -1550,7 +1937,7 @@ def analyze():
     except Exception as ce:
         append_log(run_dir, f"Chromosome inference warning: {ce}")
 
-    def _analyze_worker(run_dir, filename, vcf_path, species, chromosome, grid):
+    def _analyze_worker(run_dir, filename, vcf_path, species, chromosome, grid, primary_metric=None, combined_metrics=None):
         meta = {
             'run_id': os.path.basename(run_dir),
             'species': species,
@@ -1566,6 +1953,10 @@ def analyze():
             'plots': [],
             'plot_url': None,  # will point to the currently selected/first plot
             'analysis_input': None,  # basename of VCF/BCF actually used for analysis (post-conversion)
+            # Preserve the user's metric preferences so downstream readers (runs_final) can
+            # use them when recomputing or rendering without relying on the earlier temp file.
+            'distance_metric': primary_metric,
+            'combined_metrics': combined_metrics or [],
         }
         try:
             # If input is a BCF, convert to compressed VCF (.vcf.gz) so the rest of the
@@ -1608,12 +1999,39 @@ def analyze():
                     raise
                 append_log(run_dir, f"Indexing skipped (plain VCF) or warning: {ie}")
 
-            match = compute_best_match(species, vcf_path)
+            match = compute_best_match(
+                species, vcf_path,
+                precompute_combined=PRECOMPUTE_COMBINED_ENABLED,
+                combined_metrics=combined_metrics if combined_metrics is not None else PRECOMPUTE_COMBINED_METRICS,
+                primary_metric=primary_metric
+            )
             meta['match'] = match
+            # Log both the canonical JSD value (always computed) and the user's
+            # selected primary metric (which may be 'Combined' or another distance).
+            try:
+                sel_metric_log = (match.get('selected_metric') or 'JSD')
+                sel_val_raw = match.get('best_selected_value')
+                if isinstance(sel_val_raw, (int, float)):
+                    sel_val_log = f"{float(sel_val_raw):.6f}"
+                else:
+                    sel_val_log = ''
+            except Exception:
+                sel_metric_log = 'JSD'
+                sel_val_log = ''
+            # Prepare a safe JSD string for logging
+            try:
+                jsd_raw = match.get('best_jsd')
+                if isinstance(jsd_raw, (int, float)):
+                    jsd_log = f"{float(jsd_raw):.6f}"
+                else:
+                    jsd_log = 'n/a'
+            except Exception:
+                jsd_log = 'n/a'
             append_log(run_dir, (
-                f"Best match -> model: {match['demographic_model']}, population: {match['population']}, "
-                f"JSD: {match['best_jsd']:.6f}, target chromosomes: {match['target']}, "
-                f"ploidy: {match['ploidy']}, mixed_ploidy: {match['mixed_ploidy']}"
+                f"Best match -> model: {match.get('demographic_model')}, population: {match.get('population')}, "
+                f"selected_metric: {sel_metric_log}{('='+sel_val_log) if sel_val_log else ''}, "
+                f"JSD: {jsd_log}, target chromosomes: {match.get('target')}, "
+                f"ploidy: {match.get('ploidy')}, mixed_ploidy: {match.get('mixed_ploidy')}"
             ))
             # Persist detailed match/JSD data for later hover usage
             try:
@@ -1702,7 +2120,7 @@ def analyze():
                 pass
 
     try:
-        fut = _executor.submit(_analyze_worker, run_dir, filename, vcf_path, species, chromosome, grid)
+        fut = _executor.submit(_analyze_worker, run_dir, filename, vcf_path, species, chromosome, grid, distance_metric or None, combined_metrics_raw or None)
         with _futures_lock:
             _run_futures[run_id] = fut
     except Exception as e:
@@ -1763,6 +2181,57 @@ def runs_tail(run_id):
         rs_err = '(failed to read RAiSD stderr)'
 
     return json.dumps({'lines': lines, 'raisd_stdout': rs_out, 'raisd_stderr': rs_err, 'done': bool(done)}), 200, {'Content-Type': 'application/json'}
+
+
+@app.route('/runs/<run_id>/match_heavy')
+def runs_match_heavy(run_id):
+    """Return the heavier match payload for a run (all_distances, all_jsd, match_details).
+
+    This endpoint is intended for asynchronous lazy-loading by the client so that
+    the initial results page can render quickly with a lightweight match object.
+    The response is gzipped to reduce network transfer size when large arrays are present.
+    """
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    if not os.path.isdir(run_dir):
+        return json.dumps({'error': 'run not found'}), 404, {'Content-Type': 'application/json'}
+    touch_run(run_id)
+    meta_path = os.path.join(run_dir, 'result_meta.json')
+    match = None
+    try:
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r', encoding='utf-8') as mf:
+                meta = json.load(mf)
+                match = meta.get('match')
+    except Exception:
+        match = None
+
+    # Read separately persisted match_details.json if present
+    details = None
+    details_path = os.path.join(run_dir, 'match_details.json')
+    try:
+        if os.path.exists(details_path):
+            with open(details_path, 'r', encoding='utf-8') as df:
+                details = json.load(df)
+    except Exception:
+        details = None
+
+    payload = {
+        'match': match,
+        'match_details': details,
+    }
+    try:
+        raw = json.dumps(payload)
+    except Exception as e:
+        app.logger.exception(f"Failed to serialize match_heavy for run {run_id}: {e}")
+        return json.dumps({'error': 'serialization failed'}), 500, {'Content-Type': 'application/json'}
+
+    try:
+        gz = gzip.compress(raw.encode('utf-8'))
+        headers = {'Content-Type': 'application/json', 'Content-Encoding': 'gzip'}
+        return (gz, 200, headers)
+    except Exception:
+        # Fallback to plain JSON if gzip fails
+        return raw, 200, {'Content-Type': 'application/json'}
 
 
 @app.route('/runs/<run_id>/cancel', methods=['POST'])
@@ -1903,8 +2372,8 @@ def runs_rescan(run_id):
     def _sanitize(s: str) -> str:
         return re.sub(r'[^A-Za-z0-9_\-]+', '_', s or '').strip('_')
 
-    # Expected RAiSD-produced name components from -n
-    base_name = f"{_sanitize(dm)}__{_sanitize(pop)}"
+    # Expected RAiSD-produced name components from -n (use single underscore)
+    base_name = f"{_sanitize(dm)}_{_sanitize(pop)}"
     persisted_name = f"RAiSD_Report.{base_name}"
     persisted_path = os.path.join(run_dir, persisted_name)
 
@@ -2384,7 +2853,14 @@ def runs_final(run_id):
                     lines = lf.readlines()[-500:]  # tail only
                 import re
                 # Parse best match line
-                best_re = re.compile(r"Best match -> model: (?P<model>[^,]+), population: (?P<pop>[^,]+), JSD: (?P<jsd>[0-9.eE+-]+), target chromosomes: (?P<target>\d+), ploidy: (?P<ploidy>\d+), mixed_ploidy: (?P<mixed>True|False)")
+                # Accept either the legacy form or the new form that includes an
+                # optional selected_metric field: "selected_metric: NAME[=VALUE], "
+                best_re = re.compile(
+                    r"Best match -> model: (?P<model>[^,]+), population: (?P<pop>[^,]+), "
+                    r"(?:selected_metric:\s*(?P<sel_metric>[^,=]+)(?:=(?P<sel_val>[0-9.eE+-]+))?,\s*)?"
+                    r"JSD:\s*(?P<jsd>[0-9.eE+-]+|n/a), target chromosomes: (?P<target>\d+), "
+                    r"ploidy: (?P<ploidy>\d+), mixed_ploidy: (?P<mixed>True|False)"
+                )
                 for line in reversed(lines):  # search from end
                     m = best_re.search(line)
                     if m:
@@ -2437,7 +2913,12 @@ def runs_final(run_id):
                 if os.path.exists(vcf_candidate):
                     append_log(run_dir, 'Recomputing best match metadata (previous values incomplete)')
                     try:
-                        recomputed = compute_best_match(meta.get('species') or '', vcf_candidate)
+                        recomputed = compute_best_match(
+                            meta.get('species') or '', vcf_candidate,
+                            precompute_combined=PRECOMPUTE_COMBINED_ENABLED,
+                            combined_metrics=meta.get('combined_metrics') or PRECOMPUTE_COMBINED_METRICS,
+                            primary_metric=(meta.get('distance_metric') or 'JSD')
+                        )
                         raw_match.update(recomputed)
                         meta['match'] = raw_match
                         # Persist updated meta for future calls
@@ -2463,7 +2944,12 @@ def runs_final(run_id):
                         for cand in candidates:
                             try:
                                 append_log(run_dir, f'Attempting fallback best-match computation using {os.path.basename(cand)}')
-                                recomputed2 = compute_best_match(str(meta.get('species') or ''), cand)
+                                recomputed2 = compute_best_match(
+                                    str(meta.get('species') or ''), cand,
+                                    precompute_combined=PRECOMPUTE_COMBINED_ENABLED,
+                                    combined_metrics=meta.get('combined_metrics') or PRECOMPUTE_COMBINED_METRICS,
+                                    primary_metric=meta.get('distance_metric')
+                                )
                                 raw_match.update(recomputed2)
                                 meta['match'] = raw_match
                                 with open(meta_path, 'w', encoding='utf-8') as mf:
@@ -2512,7 +2998,7 @@ def runs_final(run_id):
         match[k] = v if v is not None else default
 
     # Preserve extra arrays if present in raw_match
-    for extra_key in ('input_sfs', 'best_expected_sfs', 'top_matches', 'all_jsd'):
+    for extra_key in ('input_sfs', 'best_expected_sfs', 'top_matches', 'all_jsd', 'all_distances', 'metrics_available', 'selected_metric', 'best_selected_value'):
         if extra_key in raw_match and extra_key not in match:
             match[extra_key] = raw_match[extra_key]
 
@@ -2531,6 +3017,52 @@ def runs_final(run_id):
                             match.setdefault(k, det[k])
         except Exception as _md_e:
             append_log(run_dir, f"Warning: failed to load match_details.json: {_md_e}")
+
+    # If the user originally requested a non-JSD metric on the main page, ensure
+    # the best-match is computed using that metric rather than defaulting to JSD.
+    try:
+        sel_metric = (meta.get('distance_metric') or '')
+        # Only recompute if user explicitly requested a non-JSD metric AND
+        # the recorded match was not already computed with that metric (or lacks the selected value).
+        if sel_metric and str(sel_metric).strip() and str(sel_metric).strip().upper() != 'JSD':
+            current_match = meta.get('match') or {}
+            recorded_sel = (current_match.get('selected_metric') or '') if isinstance(current_match, dict) else ''
+            recorded_best = current_match.get('best_selected_value') if isinstance(current_match, dict) else None
+            need_recompute = False
+            if not current_match:
+                need_recompute = True
+            else:
+                # If the recorded selected metric doesn't match what the user asked for,
+                # or the recorded value is missing, then recompute. Otherwise skip.
+                if str(recorded_sel).strip() != str(sel_metric).strip() or recorded_best in (None, ''):
+                    need_recompute = True
+
+            if need_recompute:
+                analysis_input = meta.get('analysis_input') or meta.get('uploaded_name')
+                if analysis_input:
+                    candidate = os.path.join(run_dir, analysis_input)
+                    if os.path.exists(candidate):
+                        try:
+                            append_log(run_dir, f"Recomputing best match using selected metric: {sel_metric}")
+                            recomputed = compute_best_match(
+                                meta.get('species') or '', candidate,
+                                precompute_combined=PRECOMPUTE_COMBINED_ENABLED,
+                                combined_metrics=meta.get('combined_metrics') or PRECOMPUTE_COMBINED_METRICS,
+                                primary_metric=sel_metric
+                            )
+                            # Update match and persist to meta so UI and future calls reflect the user's choice
+                            match = recomputed
+                            meta['match'] = recomputed
+                            try:
+                                with open(meta_path, 'w', encoding='utf-8') as mf:
+                                    mf.write(json.dumps(meta))
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            append_log(run_dir, f"Selected-metric recompute failed: {e}")
+    except Exception:
+        # non-fatal
+        pass
 
     # Build/synthesize plots list
     plots = meta.get('plots') or []
@@ -2588,20 +3120,134 @@ def runs_final(run_id):
     summary_fields.append(('Demographic model', dm if dm else ''))
     pop = match.get('population')
     summary_fields.append(('Population', pop if pop else ''))
-    jsd_v = match.get('best_jsd')
-    if isinstance(jsd_v, (int, float)):
-        summary_fields.append(('JSD', f"{jsd_v:.6f}"))
-    else:
-        summary_fields.append(('JSD', ''))
+    # Show only the user's selected primary metric in the Best Match summary.
+    try:
+        sel_metric = (match.get('selected_metric') or meta.get('distance_metric') or '').strip()
+        sel_val = match.get('best_selected_value')
+        if not sel_metric:
+            # default to JSD when no selection available
+            sel_metric = 'JSD'
+            sel_val = match.get('best_jsd')
+        if isinstance(sel_val, (int, float)):
+            summary_fields.append((sel_metric, f"{sel_val:.6f}"))
+        else:
+            summary_fields.append((sel_metric, ''))
+    except Exception:
+        # fallback: always show JSD
+        try:
+            jsd_v = match.get('best_jsd')
+            summary_fields.append(('JSD', f"{jsd_v:.6f}" if isinstance(jsd_v, (int, float)) else ''))
+        except Exception:
+            summary_fields.append(('JSD', ''))
 
     try:
+        # Build a pruned copy of match for embedding in the template. We must avoid
+        # including large numeric arrays (expected_sfs etc.) and also avoid passing
+        # any non-serializable objects (functions, methods). Use deepcopy to avoid
+        # mutating the persisted meta in-place.
+        pruned_match = {}
+        try:
+            pruned_match = copy.deepcopy(match) if isinstance(match, dict) else {}
+        except Exception:
+            # Fallback: shallow copy
+            pruned_match = dict(match) if isinstance(match, dict) else {}
+
+        # Remove unexpectedly large arrays to avoid huge payloads, but keep
+        # small SFS vectors so the client can render the SFS comparison modal
+        # and mini-plot without an extra fetch. Only drop if length is absurd.
+        for key in ('best_expected_sfs', 'input_sfs'):
+            try:
+                val = pruned_match.get(key)
+                if isinstance(val, (list, tuple)) and len(val) > 1024:
+                    pruned_match.pop(key, None)
+                # otherwise keep small arrays (observed/expected SFS) for client-side plotting
+            except Exception:
+                pruned_match.pop(key, None)
+
+        # Prune expected_sfs inside all_jsd list entries
+        if isinstance(pruned_match.get('all_jsd'), list):
+            for ent in (pruned_match.get('all_jsd') or []):
+                try:
+                    if isinstance(ent, dict):
+                        ent.pop('expected_sfs', None)
+                except Exception:
+                    pass
+
+        # For all_distances keep only demographic_model, population and distances dict
+        if isinstance(pruned_match.get('all_distances'), list):
+            new_all_dist = []
+            for ent in (pruned_match.get('all_distances') or []):
+                try:
+                    if isinstance(ent, dict):
+                        d = {'demographic_model': ent.get('demographic_model'), 'population': ent.get('population'), 'distances': {}}
+                        # copy distances but ensure no nested arrays or callables
+                        rawd = ent.get('distances') or {}
+                        for k2, v2 in (rawd.items() if isinstance(rawd, dict) else []):
+                            # avoid callables or big arrays
+                            if callable(v2):
+                                continue
+                            if isinstance(v2, (list, tuple)) and len(v2) > 1024:
+                                # skip unexpectedly huge lists
+                                continue
+                            d['distances'][k2] = v2
+                        new_all_dist.append(d)
+                except Exception:
+                    continue
+            pruned_match['all_distances'] = new_all_dist
+        # Ensure compatibility: if we have all_distances but no all_jsd, synthesize
+        # a lightweight all_jsd list (with JSD values) so legacy templates work.
+        try:
+            if isinstance(pruned_match.get('all_distances'), list) and not isinstance(pruned_match.get('all_jsd'), list):
+                synth = []
+                for ent in (pruned_match.get('all_distances') or []):
+                    try:
+                        dm = ent.get('demographic_model')
+                        popn = ent.get('population')
+                        jsdv = None
+                        try:
+                            jsdv = (ent.get('distances') or {}).get('JSD')
+                        except Exception:
+                            jsdv = None
+                        synth.append({'demographic_model': dm, 'population': popn, 'jsd': (None if jsdv is None else float(jsdv))})
+                    except Exception:
+                        continue
+                pruned_match['all_jsd'] = synth
+        except Exception:
+            pass
+
+        # Conversely, if we have all_jsd but not all_distances, build an
+        # all_distances list so the new metric selector can use it (with only JSD present).
+        try:
+            if isinstance(pruned_match.get('all_jsd'), list) and not isinstance(pruned_match.get('all_distances'), list):
+                synth2 = []
+                for ent in (pruned_match.get('all_jsd') or []):
+                    try:
+                        dm = ent.get('demographic_model')
+                        popn = ent.get('population')
+                        jsdv = ent.get('jsd')
+                        synth2.append({'demographic_model': dm, 'population': popn, 'distances': {'JSD': (None if jsdv is None else float(jsdv))}})
+                    except Exception:
+                        continue
+                pruned_match['all_distances'] = synth2
+        except Exception:
+            pass
+
+        # Ensure metrics_available exists when possible
+        try:
+            if 'metrics_available' not in pruned_match:
+                if isinstance(pruned_match.get('all_distances'), list) and pruned_match['all_distances']:
+                    first = pruned_match['all_distances'][0]
+                    if isinstance(first.get('distances'), dict):
+                        pruned_match['metrics_available'] = list(first.get('distances').keys())
+        except Exception:
+            pass
         return render_template(
             'result.html',
             run_id=run_id,
             species=meta.get('species', ''),
             chromosome=meta.get('chromosome', ''),
             grid=meta.get('grid', ''),
-            match=match or {},
+            match=pruned_match,
             model_path=meta.get('model_path'),
             plot_url=plot_url,   # main plot is the first in `plots`
             report_url=meta.get('report_url') or url_for('runs_file', run_id=run_id, filename=RAISD_REPORT),

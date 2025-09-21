@@ -112,3 +112,25 @@ body.dark .hover-tooltip{ box-shadow:0 4px 16px -2px rgba(0,0,0,.7); }
 .all-matches-scroll::-webkit-scrollbar-thumb{ background:color-mix(in srgb, var(--accent) 18%, var(--card) 82%); border-radius:8px; border:2px solid transparent; background-clip: padding-box; }
 /* Firefox thin scrollbar */
 .all-matches-scroll{ scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--accent) 18%, var(--card) 82%) transparent; }
+
+/* --- Combined metric controls (shared) --- */
+.combined-toggle-btn{ position:relative; font-size:12px; padding:6px 10px; border-radius:8px; border:1px solid var(--border); background:transparent; cursor:pointer; color:var(--fg); }
+.combined-toggle-btn[aria-expanded="true"]{ background: color-mix(in srgb, var(--accent) 10%, var(--card) 90%); }
+.compact-metric-select{ width: calc(100% - 112px) !important; padding-right:96px; max-width:100%; }
+#combined-metric-checkboxes{ display:none; font-size:12px; padding:8px; background:var(--card); border:1px solid var(--border); border-radius:8px; max-width:520px; box-sizing:border-box; }
+#combined-metrics-checkboxes-form{ display:none; gap:8px; flex-wrap:wrap; align-items:center; padding:6px; border:1px solid var(--border); background:var(--card); border-radius:8px; }
+.combined-controls{ display:flex; gap:8px; align-items:center; }
+.combined-control-btn{ background:transparent; border:1px solid var(--border); padding:4px 8px; border-radius:8px; cursor:pointer; font-size:12px; color:var(--fg); }
+.combined-count{ font-size:12px; color:var(--muted); margin-left:auto; }
+.combined-pills{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.combined-pill{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; border:1px solid var(--border); background:transparent; cursor:pointer; font-size:13px; color:var(--fg); }
+.combined-pill.active{ background: linear-gradient(180deg,var(--accent-active, rgba(37,99,235,.55)) 0%, var(--accent-hover, rgba(37,99,235,.30)) 100%); color: #fff; border-color: transparent; box-shadow: 0 6px 16px rgba(2,6,23,0.08); }
+.combined-pill input[type=checkbox]{ display:none; }
+
+/* --- Processing page: log preview styles (shared) --- */
+@keyframes indet { 0%{left:-40%}50%{left:60%}100%{left:120%} }
+.log-preview { margin-top:12px; display:flex; gap:8px; align-items:flex-start; }
+.log-pane { background:var(--card); border:1px solid var(--border); padding:8px; max-height:140px; overflow:auto; white-space:pre-wrap; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, 'Roboto Mono', 'Noto Mono', monospace; font-size:13px; color:var(--muted); }
+.log-controls { display:flex; gap:8px; align-items:center; margin-top:8px; }
+.btn { background:transparent;border:1px solid var(--border);color:inherit;border-radius:6px;padding:6px 8px;cursor:pointer }
+.btn:hover{background:rgba(0,0,0,0.02)}

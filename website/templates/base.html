@@ -24,7 +24,7 @@
   <footer>
     <p class="muted">Upload a VCF, VCF.GZ or BCF, select species & chromosome, then we infer best model and run RAiSD‑AI.</p>
   </footer>
-  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
   <script>
   (function(){
     const pref = localStorage.getItem('theme');

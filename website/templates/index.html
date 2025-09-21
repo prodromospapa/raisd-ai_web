@@ -20,9 +20,49 @@
           </div>
       </label>
       <label>
+        <span>Distance metric</span>
+        <div style="display:flex; align-items:center; gap:6px; position:relative;">
+          <!-- default: full-width; will shrink only when Combined is selected by adding the compact class -->
+          <select id="distance-metric-select-form" name="distance_metric" style="width:100%;">
+            <option value="Combined">Combined</option>
+            {%- set sorted_metrics = (metrics_available|default([])) | sort -%}
+            {%- for m in sorted_metrics %}
+              <option value="{{ m }}">{{ m }}</option>
+            {%- endfor %}
+          </select>
+          <!-- Combined toggle (appears on the right edge of the select when Combined is chosen) -->
+          <button type="button" id="combined-toggle-btn" class="combined-toggle-btn" aria-expanded="true" style="position:absolute; right:8px; top:50%; transform:translateY(-50%); min-width:68px; display:none; z-index:6;">Hide</button>
+        </div>
+      </label>
+      <label>
         <span>Grid</span>
         <input type="number" name="grid" value="300" min="1" required />
       </label>
+      <!-- Combined controls: inserted under Distance metric; hidden by default -->
+      <div id="combined-metrics-wrapper" style="display:none">
+        <!-- Place the combined controls directly under the Distance metric selector, right-aligned -->
+        <div id="combined-metric-container" style="width:100%; display:flex; justify-content:flex-end; margin-top:6px; margin-bottom:8px; gap:8px; align-items:flex-start;">
+          <div id="combined-metric-checkboxes"></div>
+        </div>
+        <!-- legacy fallback container: hidden by default to avoid showing an empty progress-like bar -->
+        <div id="combined-metrics-checkboxes-form" aria-label="Combined metrics picker" role="group">
+          <!-- legacy fallback container used by older logic; app.js will populate the proper combined-metric-checkboxes element when available -->
+        </div>
+      </div>
+      <script>
+        // Sync accent hover/active CSS variables to match result page pills
+        (function syncAccentCssVars(){
+          try{
+            function _hexToRgb(hex){ if(!hex) return [37,99,235]; hex = hex.trim(); if(hex[0]==='#') hex = hex.slice(1); if(hex.length===3) return hex.split('').map(c=>c+c).join(''); if(hex.length!==6) return [37,99,235]; const r = parseInt(hex.slice(0,2),16), g = parseInt(hex.slice(2,4),16), b = parseInt(hex.slice(4,6),16); return [r,g,b]; }
+            const _accentCss = getComputedStyle(document.body).getPropertyValue('--accent').trim() || '#2563eb';
+            const _accentRgb = _hexToRgb(_accentCss.replace(/\s/g,''));
+            function ACCENT_RGBA(a){ return `rgba(${_accentRgb[0]},${_accentRgb[1]},${_accentRgb[2]},${a})`; }
+            const root = document.documentElement;
+            root.style.setProperty('--accent-hover', ACCENT_RGBA(0.30));
+            root.style.setProperty('--accent-active', ACCENT_RGBA(0.55));
+          }catch(_){ }
+        })();
+      </script>
     </div>
 
     <div id="dropzone" class="dropzone">
